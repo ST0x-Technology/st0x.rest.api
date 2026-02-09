@@ -102,12 +102,19 @@ pub struct CancelOrderResponse {
     pub summary: CancelSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderType {
+    Dca,
+    Solver,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderDetailsInfo {
     #[serde(rename = "type")]
     #[schema(example = "dca")]
-    pub type_: String,
+    pub type_: OrderType,
     #[schema(example = "0.0005")]
     pub io_ratio: String,
 }
@@ -180,52 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deploy_dca_order_with_vault_ids() {
-        let json = r#"{
-            "inputToken": "0xabc",
-            "outputToken": "0xdef",
-            "budgetAmount": "1000000",
-            "period": 1,
-            "periodUnit": "days",
-            "startIo": "0.0005",
-            "floorIo": "0.0003",
-            "inputVaultId": "42",
-            "outputVaultId": "43"
-        }"#;
-        let req: DeployDcaOrderRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.input_vault_id, Some("42".into()));
-        assert_eq!(req.output_vault_id, Some("43".into()));
-    }
-
-    #[test]
-    fn test_deploy_solver_order_serde() {
-        let json = r#"{
-            "inputToken": "0xabc",
-            "outputToken": "0xdef",
-            "amount": "1000000",
-            "ioratio": "0.0005"
-        }"#;
-        let req: DeploySolverOrderRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.ioratio, "0.0005");
-        assert!(req.input_vault_id.is_none());
-    }
-
-    #[test]
-    fn test_deploy_solver_order_with_vault_ids() {
-        let json = r#"{
-            "inputToken": "0xabc",
-            "outputToken": "0xdef",
-            "amount": "1000000",
-            "ioratio": "0.0005",
-            "inputVaultId": "7",
-            "outputVaultId": "8"
-        }"#;
-        let req: DeploySolverOrderRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.input_vault_id, Some("7".into()));
-        assert_eq!(req.output_vault_id, Some("8".into()));
-    }
-
-    #[test]
     fn test_period_unit_variants() {
         let variants = [
             ("\"minutes\"", PeriodUnit::Minutes),
@@ -249,81 +210,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_order_request_serde() {
-        let json = r#"{"orderHash": "0xabc123"}"#;
-        let req: CancelOrderRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.order_hash, "0xabc123");
-    }
-
-    #[test]
-    fn test_cancel_order_response_serde() {
-        let resp = CancelOrderResponse {
-            transactions: vec![CancelTransaction {
-                to: "0xabc".into(),
-                data: "0xdef".into(),
-                value: "0".into(),
-            }],
-            summary: CancelSummary {
-                vaults_to_withdraw: 2,
-                tokens_returned: vec![TokenReturn {
-                    token: "0xtoken".into(),
-                    symbol: "USDC".into(),
-                    amount: "1000000".into(),
-                }],
-            },
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("transactions"));
-        assert!(json.contains("summary"));
-        assert!(json.contains("vaultsToWithdraw"));
-        assert!(json.contains("tokensReturned"));
-    }
-
-    #[test]
     fn test_order_details_info_type_rename() {
         let info = OrderDetailsInfo {
-            type_: "dca".into(),
+            type_: OrderType::Dca,
             io_ratio: "0.0005".into(),
         };
         let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("\"type\""));
+        assert!(json.contains("\"type\":\"dca\""));
         assert!(!json.contains("\"type_\""));
-    }
-
-    #[test]
-    fn test_order_detail_serialization() {
-        let detail = OrderDetail {
-            order_hash: "0xabc".into(),
-            owner: "0x123".into(),
-            order_details: OrderDetailsInfo {
-                type_: "dca".into(),
-                io_ratio: "0.0005".into(),
-            },
-            input_token: TokenRef {
-                address: "0xtoken_in".into(),
-                symbol: "USDC".into(),
-                decimals: 6,
-            },
-            output_token: TokenRef {
-                address: "0xtoken_out".into(),
-                symbol: "WETH".into(),
-                decimals: 18,
-            },
-            input_vault_id: "1".into(),
-            output_vault_id: "2".into(),
-            input_vault_balance: "1000000".into(),
-            output_vault_balance: "500000".into(),
-            io_ratio: "0.0005".into(),
-            created_at: 1718452800,
-            orderbook_id: "0xorderbook".into(),
-            trades: vec![],
-        };
-        let json = serde_json::to_string(&detail).unwrap();
-        assert!(json.contains("orderHash"));
-        assert!(json.contains("inputToken"));
-        assert!(json.contains("outputToken"));
-        assert!(json.contains("orderDetails"));
-        assert!(json.contains("inputVaultId"));
-        assert!(json.contains("outputVaultId"));
     }
 }

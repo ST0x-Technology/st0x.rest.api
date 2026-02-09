@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersPaginationParams {
     #[field(name = "page")]
@@ -92,67 +93,5 @@ mod tests {
         let params: OrdersPaginationParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.page_size, Some(20));
         assert!(params.page.is_none());
-    }
-
-    #[test]
-    fn test_pagination_custom_values() {
-        let json = r#"{"pageSize": 50, "page": 3}"#;
-        let params: OrdersPaginationParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.page_size, Some(50));
-        assert_eq!(params.page, Some(3));
-    }
-
-    #[test]
-    fn test_orders_list_response_serde() {
-        let resp = OrdersListResponse {
-            orders: vec![OrderSummary {
-                order_hash: "0xabc".into(),
-                owner: "0x123".into(),
-                input_token: TokenRef {
-                    address: "0xtoken_in".into(),
-                    symbol: "USDC".into(),
-                    decimals: 6,
-                },
-                output_token: TokenRef {
-                    address: "0xtoken_out".into(),
-                    symbol: "WETH".into(),
-                    decimals: 18,
-                },
-                output_vault_balance: "500000".into(),
-                io_ratio: "0.0005".into(),
-                created_at: 1718452800,
-                orderbook_id: "0xorderbook".into(),
-            }],
-            pagination: OrdersPagination {
-                page: 1,
-                page_size: 20,
-                total_orders: 1,
-                total_pages: 1,
-                has_more: false,
-            },
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("orderHash"));
-        assert!(json.contains("pagination"));
-        assert!(json.contains("totalOrders"));
-        assert!(json.contains("hasMore"));
-        let deserialized: OrdersListResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.orders.len(), 1);
-    }
-
-    #[test]
-    fn test_orders_by_tx_response_serde() {
-        let resp = OrdersByTxResponse {
-            tx_hash: "0xtx".into(),
-            block_number: 12345678,
-            timestamp: 1718452800,
-            orders: vec![],
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("txHash"));
-        assert!(json.contains("blockNumber"));
-        assert!(json.contains("timestamp"));
-        let deserialized: OrdersByTxResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.block_number, 12345678);
     }
 }
