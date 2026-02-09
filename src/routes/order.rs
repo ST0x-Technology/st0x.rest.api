@@ -85,5 +85,10 @@ pub async fn post_order_cancel(
 }
 
 pub fn routes() -> Vec<Route> {
-    rocket::routes![post_order_dca, post_order_solver, get_order, post_order_cancel]
+    rocket::routes![
+        post_order_dca,
+        post_order_solver,
+        get_order,
+        post_order_cancel
+    ]
 }

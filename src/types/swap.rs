@@ -1,5 +1,5 @@
-use alloy::primitives::{Address, Bytes, U256};
 use crate::types::common::Approval;
+use alloy::primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 

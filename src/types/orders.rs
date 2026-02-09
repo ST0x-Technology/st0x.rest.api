@@ -1,5 +1,5 @@
-use alloy::primitives::{Address, FixedBytes};
 use crate::types::common::TokenRef;
+use alloy::primitives::{Address, FixedBytes};
 use rocket::form::FromForm;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};

@@ -19,7 +19,9 @@ use rocket::Route;
     )
 )]
 #[get("/tx/<tx_hash>")]
-pub async fn get_trades_by_tx(tx_hash: ValidatedFixedBytes) -> Result<Json<TradesByTxResponse>, ApiError> {
+pub async fn get_trades_by_tx(
+    tx_hash: ValidatedFixedBytes,
+) -> Result<Json<TradesByTxResponse>, ApiError> {
     let _ = tx_hash;
     todo!()
 }

@@ -37,9 +37,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
             ApiError::BadRequest(msg) => (Status::BadRequest, "BAD_REQUEST", msg.clone()),
             ApiError::Unauthorized(msg) => (Status::Unauthorized, "UNAUTHORIZED", msg.clone()),
             ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
-            ApiError::Internal(msg) => {
-                (Status::InternalServerError, "INTERNAL_ERROR", msg.clone())
-            }
+            ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
         };
         let body = ApiErrorResponse {
             error: ApiErrorDetail {
@@ -119,6 +117,12 @@ mod tests {
     #[test]
     fn test_internal_returns_500() {
         let client = error_client();
-        assert_error_response(&client, "/internal", 500, "INTERNAL_ERROR", "something broke");
+        assert_error_response(
+            &client,
+            "/internal",
+            500,
+            "INTERNAL_ERROR",
+            "something broke",
+        );
     }
 }

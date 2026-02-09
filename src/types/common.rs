@@ -34,7 +34,10 @@ impl<'a> rocket::request::FromParam<'a> for ValidatedAddress {
     type Error = &'a str;
 
     fn from_param(param: &'a str) -> Result<Self, Self::Error> {
-        param.parse::<Address>().map(ValidatedAddress).map_err(|_| param)
+        param
+            .parse::<Address>()
+            .map(ValidatedAddress)
+            .map_err(|_| param)
     }
 }
 

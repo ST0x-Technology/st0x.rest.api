@@ -58,7 +58,9 @@ fn configure_cors() -> CorsOptions {
 }
 
 fn rocket() -> rocket::Rocket<rocket::Build> {
-    let cors = configure_cors().to_cors().expect("CORS configuration failed");
+    let cors = configure_cors()
+        .to_cors()
+        .expect("CORS configuration failed");
 
     rocket::build()
         .mount("/", routes::health::routes())
@@ -94,8 +96,8 @@ mod tests {
         let client = client();
         let response = client.get("/health").dispatch();
         assert_eq!(response.status(), Status::Ok);
-        let body: serde_json::Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().unwrap()).unwrap();
         assert_eq!(body["status"], "ok");
     }
-
 }
