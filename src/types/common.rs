@@ -35,10 +35,10 @@ impl<'a> rocket::request::FromParam<'a> for ValidatedAddress {
     type Error = &'a str;
 
     fn from_param(param: &'a str) -> Result<Self, Self::Error> {
-        param
-            .parse::<Address>()
-            .map(ValidatedAddress)
-            .map_err(|_| param)
+        param.parse::<Address>().map(ValidatedAddress).map_err(|e| {
+            tracing::warn!(input = %param, error = %e, "invalid address parameter");
+            param
+        })
     }
 }
 
@@ -52,7 +52,10 @@ impl<'a> rocket::request::FromParam<'a> for ValidatedFixedBytes {
         param
             .parse::<FixedBytes<32>>()
             .map(ValidatedFixedBytes)
-            .map_err(|_| param)
+            .map_err(|e| {
+                tracing::warn!(input = %param, error = %e, "invalid fixed bytes parameter");
+                param
+            })
     }
 }
 

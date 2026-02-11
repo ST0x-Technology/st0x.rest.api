@@ -65,9 +65,14 @@ impl<'r> Responder<'r, 'static> for ApiError {
                 message,
             },
         };
-        Response::build_from(Json(body).respond_to(req)?)
-            .status(status)
-            .ok()
+        let json_response = match Json(body).respond_to(req) {
+            Ok(r) => r,
+            Err(s) => {
+                tracing::error!(status = %s.code, "failed to serialize error response");
+                return Err(s);
+            }
+        };
+        Response::build_from(json_response).status(status).ok()
     }
 }
 

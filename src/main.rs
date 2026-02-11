@@ -49,7 +49,12 @@ struct ApiDoc;
 fn configure_cors() -> CorsOptions {
     let allowed_methods: AllowedMethods = ["Get", "Post", "Options"]
         .iter()
-        .map(|s| std::str::FromStr::from_str(s).unwrap())
+        .map(|s| {
+            std::str::FromStr::from_str(s).unwrap_or_else(|_| {
+                tracing::error!(method = %s, "invalid HTTP method in CORS config");
+                std::process::exit(1);
+            })
+        })
         .collect();
 
     CorsOptions {
