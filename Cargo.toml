@@ -13,3 +13,6 @@ utoipa = { version = "5", features = ["rocket_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["rocket"] }
 tokio = { version = "1", features = ["full"] }
 alloy = { version = "1.0.9", default-features = false, features = ["std", "serde"] }
+rain_orderbook_common = { path = "lib/rain.orderbook/crates/common" }
+rain_orderbook_js_api = { path = "lib/rain.orderbook/crates/js_api" }
+dotenvy = "0.15"

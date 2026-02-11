@@ -5,6 +5,7 @@ mod error;
 mod routes;
 mod types;
 
+use rain_orderbook_js_api::registry::DotrainRegistry;
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -57,12 +58,38 @@ fn configure_cors() -> CorsOptions {
     }
 }
 
-fn rocket() -> rocket::Rocket<rocket::Build> {
+async fn rocket() -> rocket::Rocket<rocket::Build> {
+    dotenvy::dotenv().ok();
+
+    let registry_url = std::env::var("REGISTRY_URL").unwrap_or_else(|_| {
+        eprintln!("REGISTRY_URL environment variable must be set");
+        std::process::exit(1);
+    });
+
+    let registry = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|_| std::process::exit(1));
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            DotrainRegistry::new(registry_url)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to load registry: {e}");
+                    std::process::exit(1);
+                })
+        }))
+    })
+    .await
+    .unwrap_or_else(|_| std::process::exit(1));
+
     let cors = configure_cors()
         .to_cors()
         .expect("CORS configuration failed");
 
     rocket::build()
+        .manage(registry)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -77,8 +104,8 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
 }
 
 #[launch]
-fn launch() -> _ {
-    rocket()
+async fn launch() -> _ {
+    rocket().await
 }
 
 #[cfg(test)]
@@ -88,7 +115,15 @@ mod tests {
     use rocket::local::blocking::Client;
 
     fn client() -> Client {
-        Client::tracked(rocket()).expect("valid rocket instance")
+        let cors = configure_cors()
+            .to_cors()
+            .expect("CORS configuration failed");
+
+        let rocket = rocket::build()
+            .mount("/", routes::health::routes())
+            .attach(cors);
+
+        Client::tracked(rocket).expect("valid rocket instance")
     }
 
     #[test]
