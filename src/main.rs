@@ -100,7 +100,10 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
 #[rocket::main]
 async fn main() {
     let _log_guard = telemetry::init();
-    let _ = rocket().launch().await;
+    if let Err(e) = rocket().launch().await {
+        tracing::error!(error = %e, "Rocket launch failed");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
