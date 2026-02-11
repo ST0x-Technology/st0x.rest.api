@@ -1,4 +1,5 @@
 use crate::error::{ApiError, ApiErrorResponse};
+use crate::fairings::TracingSpan;
 use crate::types::common::ValidatedFixedBytes;
 use crate::types::order::{
     CancelOrderRequest, CancelOrderResponse, DeployDcaOrderRequest, DeployOrderResponse,
@@ -6,6 +7,7 @@ use crate::types::order::{
 };
 use rocket::serde::json::Json;
 use rocket::Route;
+use tracing::Instrument;
 
 #[utoipa::path(
     post,
@@ -20,10 +22,14 @@ use rocket::Route;
 )]
 #[post("/dca", data = "<request>")]
 pub async fn post_order_dca(
+    span: TracingSpan,
     request: Json<DeployDcaOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
-    let _ = request.into_inner();
-    todo!()
+    let req = request.into_inner();
+    async move {
+        tracing::info!(body = ?req, "request received");
+        todo!()
+    }.instrument(span.0).await
 }
 
 #[utoipa::path(
@@ -39,10 +45,14 @@ pub async fn post_order_dca(
 )]
 #[post("/solver", data = "<request>")]
 pub async fn post_order_solver(
+    span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
-    let _ = request.into_inner();
-    todo!()
+    let req = request.into_inner();
+    async move {
+        tracing::info!(body = ?req, "request received");
+        todo!()
+    }.instrument(span.0).await
 }
 
 #[utoipa::path(
@@ -59,9 +69,14 @@ pub async fn post_order_solver(
     )
 )]
 #[get("/<order_hash>")]
-pub async fn get_order(order_hash: ValidatedFixedBytes) -> Result<Json<OrderDetail>, ApiError> {
-    let _ = order_hash;
-    todo!()
+pub async fn get_order(
+    span: TracingSpan,
+    order_hash: ValidatedFixedBytes,
+) -> Result<Json<OrderDetail>, ApiError> {
+    async move {
+        tracing::info!(order_hash = ?order_hash, "request received");
+        todo!()
+    }.instrument(span.0).await
 }
 
 #[utoipa::path(
@@ -78,10 +93,14 @@ pub async fn get_order(order_hash: ValidatedFixedBytes) -> Result<Json<OrderDeta
 )]
 #[post("/cancel", data = "<request>")]
 pub async fn post_order_cancel(
+    span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
-    let _ = request.into_inner();
-    todo!()
+    let req = request.into_inner();
+    async move {
+        tracing::info!(body = ?req, "request received");
+        todo!()
+    }.instrument(span.0).await
 }
 
 pub fn routes() -> Vec<Route> {
