@@ -28,6 +28,7 @@ pub struct Approval {
     pub approval_data: Bytes,
 }
 
+#[derive(Debug)]
 pub struct ValidatedAddress(pub Address);
 
 impl<'a> rocket::request::FromParam<'a> for ValidatedAddress {
@@ -41,6 +42,7 @@ impl<'a> rocket::request::FromParam<'a> for ValidatedAddress {
     }
 }
 
+#[derive(Debug)]
 pub struct ValidatedFixedBytes(pub FixedBytes<32>);
 
 impl<'a> rocket::request::FromParam<'a> for ValidatedFixedBytes {
