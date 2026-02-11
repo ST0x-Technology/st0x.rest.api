@@ -97,10 +97,10 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         .attach(cors)
 }
 
-#[launch]
-fn launch() -> _ {
-    telemetry::init();
-    rocket()
+#[rocket::main]
+async fn main() {
+    let _log_guard = telemetry::init();
+    let _ = rocket().launch().await;
 }
 
 #[cfg(test)]

@@ -28,7 +28,9 @@ pub async fn get_orders_by_tx(
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
         todo!()
-    }.instrument(span.0).await
+    }
+    .instrument(span.0)
+    .await
 }
 
 #[utoipa::path(
@@ -54,7 +56,9 @@ pub async fn get_orders_by_address(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         todo!()
-    }.instrument(span.0).await
+    }
+    .instrument(span.0)
+    .await
 }
 
 pub fn routes() -> Vec<Route> {

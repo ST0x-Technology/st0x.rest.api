@@ -27,7 +27,9 @@ pub async fn post_swap_quote(
     async move {
         tracing::info!(body = ?req, "request received");
         todo!()
-    }.instrument(span.0).await
+    }
+    .instrument(span.0)
+    .await
 }
 
 #[utoipa::path(
@@ -50,7 +52,9 @@ pub async fn post_swap_calldata(
     async move {
         tracing::info!(body = ?req, "request received");
         todo!()
-    }.instrument(span.0).await
+    }
+    .instrument(span.0)
+    .await
 }
 
 pub fn routes() -> Vec<Route> {

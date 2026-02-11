@@ -7,7 +7,9 @@ use rocket::Request;
 #[catch(400)]
 pub fn bad_request(req: &Request<'_>) -> Json<ApiErrorResponse> {
     let span = request_span_for(req);
-    span.in_scope(|| tracing::warn!("bad request (invalid content type, missing headers, or malformed input)"));
+    span.in_scope(|| {
+        tracing::warn!("bad request (invalid content type, missing headers, or malformed input)")
+    });
 
     Json(ApiErrorResponse {
         error: ApiErrorDetail {
@@ -57,5 +59,10 @@ pub fn internal_server_error(req: &Request<'_>) -> Json<ApiErrorResponse> {
 }
 
 pub fn catchers() -> Vec<Catcher> {
-    rocket::catchers![bad_request, not_found, unprocessable_entity, internal_server_error]
+    rocket::catchers![
+        bad_request,
+        not_found,
+        unprocessable_entity,
+        internal_server_error
+    ]
 }
