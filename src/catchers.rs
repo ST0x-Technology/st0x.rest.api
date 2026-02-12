@@ -19,6 +19,19 @@ pub fn bad_request(req: &Request<'_>) -> Json<ApiErrorResponse> {
     })
 }
 
+#[catch(401)]
+pub fn unauthorized(req: &Request<'_>) -> Json<ApiErrorResponse> {
+    let span = request_span_for(req);
+    span.in_scope(|| tracing::warn!("unauthorized (missing or invalid credentials)"));
+
+    Json(ApiErrorResponse {
+        error: ApiErrorDetail {
+            code: "UNAUTHORIZED".to_string(),
+            message: "Missing or invalid credentials".to_string(),
+        },
+    })
+}
+
 #[catch(404)]
 pub fn not_found(req: &Request<'_>) -> Json<ApiErrorResponse> {
     let span = request_span_for(req);
@@ -61,6 +74,7 @@ pub fn internal_server_error(req: &Request<'_>) -> Json<ApiErrorResponse> {
 pub fn catchers() -> Vec<Catcher> {
     rocket::catchers![
         bad_request,
+        unauthorized,
         not_found,
         unprocessable_entity,
         internal_server_error

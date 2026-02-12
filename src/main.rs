@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate rocket;
 
+mod auth;
 mod catchers;
 mod db;
 mod error;
@@ -11,8 +12,23 @@ mod types;
 
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
-use utoipa::OpenApi;
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
+
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            let mut scheme = Http::new(HttpAuthScheme::Basic);
+            scheme.description = Some(
+                "Use your API key as the username and API secret as the password.".to_string(),
+            );
+            components.add_security_scheme("basicAuth", SecurityScheme::Http(scheme));
+        }
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -31,6 +47,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::trades::get_trades_by_address,
     ),
     components(),
+    modifiers(&SecurityAddon),
     tags(
         (name = "Health", description = "Health check endpoints"),
         (name = "Tokens", description = "Token information endpoints"),
@@ -92,7 +109,13 @@ fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, String> {
 
 #[rocket::main]
 async fn main() {
-    let log_guard = telemetry::init();
+    let log_guard = match telemetry::init() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("failed to initialize telemetry: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         tracing::warn!("DATABASE_URL not set, using default: sqlite:./data/st0x.db");
@@ -127,7 +150,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocket::http::Status;
+    use base64::Engine;
+    use rocket::http::{Header, Status};
     use rocket::local::asynchronous::Client;
 
     async fn client() -> Client {
@@ -140,6 +164,35 @@ mod tests {
             .expect("valid client")
     }
 
+    async fn seed_api_key(client: &Client) -> (String, String) {
+        let key_id = uuid::Uuid::new_v4().to_string();
+        let secret = uuid::Uuid::new_v4().to_string();
+        let hash = auth::hash_secret(&secret).expect("hash secret");
+
+        let pool = client
+            .rocket()
+            .state::<db::DbPool>()
+            .expect("pool in state");
+        sqlx::query(
+            "INSERT INTO api_keys (key_id, secret_hash, label, owner) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&key_id)
+        .bind(&hash)
+        .bind("test-key")
+        .bind("test-owner")
+        .execute(pool)
+        .await
+        .expect("insert api key");
+
+        (key_id, secret)
+    }
+
+    fn basic_auth_header(key_id: &str, secret: &str) -> String {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{key_id}:{secret}"));
+        format!("Basic {encoded}")
+    }
+
     #[rocket::async_test]
     async fn test_health_endpoint() {
         let client = client().await;
@@ -148,5 +201,62 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         assert_eq!(body["status"], "ok");
+    }
+
+    #[rocket::async_test]
+    async fn test_protected_route_returns_401_without_auth() {
+        let client = client().await;
+        let response = client.get("/v1/tokens").dispatch().await;
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_protected_route_returns_401_with_wrong_secret() {
+        let client = client().await;
+        let (key_id, _) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, "wrong-secret");
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_protected_route_succeeds_with_valid_auth() {
+        let client = client().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_ne!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_inactive_key_returns_401() {
+        let client = client().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+
+        let pool = client
+            .rocket()
+            .state::<db::DbPool>()
+            .expect("pool in state");
+        sqlx::query("UPDATE api_keys SET active = 0 WHERE key_id = ?")
+            .bind(&key_id)
+            .execute(pool)
+            .await
+            .expect("deactivate key");
+
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
     }
 }
