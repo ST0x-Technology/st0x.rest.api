@@ -76,12 +76,9 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         }
     };
 
-    let config = rocket::Config {
-        log_level: rocket::config::LogLevel::Normal,
-        ..rocket::Config::default()
-    };
+    let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
 
-    rocket::custom(config)
+    rocket::custom(figment)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
