@@ -131,7 +131,8 @@ mod tests {
     use rocket::local::asynchronous::Client;
 
     async fn client() -> Client {
-        let pool = db::init("sqlite::memory:")
+        let id = uuid::Uuid::new_v4();
+        let pool = db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
             .await
             .expect("database init");
         Client::tracked(rocket(pool).expect("valid rocket instance"))
