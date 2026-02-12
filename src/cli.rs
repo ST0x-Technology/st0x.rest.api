@@ -33,13 +33,9 @@ pub enum KeysCommand {
     #[command(about = "List all API keys")]
     List,
     #[command(about = "Revoke an API key (set inactive)")]
-    Revoke {
-        key_id: String,
-    },
+    Revoke { key_id: String },
     #[command(about = "Delete an API key permanently")]
-    Delete {
-        key_id: String,
-    },
+    Delete { key_id: String },
 }
 
 pub fn print_usage() {
@@ -179,16 +175,14 @@ mod tests {
     async fn seed_key(pool: &DbPool) -> String {
         let key_id = uuid::Uuid::new_v4().to_string();
         let hash = auth::hash_secret("test-secret").expect("hash");
-        sqlx::query(
-            "INSERT INTO api_keys (key_id, secret_hash, label, owner) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&key_id)
-        .bind(&hash)
-        .bind("test-label")
-        .bind("test-owner")
-        .execute(pool)
-        .await
-        .expect("seed key");
+        sqlx::query("INSERT INTO api_keys (key_id, secret_hash, label, owner) VALUES (?, ?, ?, ?)")
+            .bind(&key_id)
+            .bind(&hash)
+            .bind("test-label")
+            .bind("test-owner")
+            .execute(pool)
+            .await
+            .expect("seed key");
         key_id
     }
 
@@ -257,12 +251,11 @@ mod tests {
         .await
         .expect("revoke key");
 
-        let active: bool =
-            sqlx::query_scalar("SELECT active FROM api_keys WHERE key_id = ?")
-                .bind(&key_id)
-                .fetch_one(&pool)
-                .await
-                .expect("fetch active");
+        let active: bool = sqlx::query_scalar("SELECT active FROM api_keys WHERE key_id = ?")
+            .bind(&key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch active");
         assert!(!active);
     }
 
@@ -293,12 +286,11 @@ mod tests {
         .await
         .expect("delete key");
 
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE key_id = ?")
-                .bind(&key_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE key_id = ?")
+            .bind(&key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
         assert_eq!(count, 0);
     }
 
