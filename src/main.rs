@@ -46,16 +46,14 @@ use utoipa_swagger_ui::SwaggerUi;
 )]
 struct ApiDoc;
 
-fn configure_cors() -> CorsOptions {
+fn configure_cors() -> Result<rocket_cors::Cors, String> {
     let allowed_methods: AllowedMethods = ["Get", "Post", "Options"]
         .iter()
         .map(|s| {
-            std::str::FromStr::from_str(s).unwrap_or_else(|_| {
-                tracing::error!(method = %s, "invalid HTTP method in CORS config");
-                std::process::exit(1);
-            })
+            std::str::FromStr::from_str(s)
+                .map_err(|_| format!("invalid HTTP method in CORS config: {s}"))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     CorsOptions {
         allowed_origins: AllowedOrigins::all(),
@@ -65,20 +63,16 @@ fn configure_cors() -> CorsOptions {
         expose_headers: HashSet::from(["X-Request-Id".to_string()]),
         ..Default::default()
     }
+    .to_cors()
+    .map_err(|e| format!("CORS configuration failed: {e}"))
 }
 
-fn rocket() -> rocket::Rocket<rocket::Build> {
-    let cors = match configure_cors().to_cors() {
-        Ok(cors) => cors,
-        Err(e) => {
-            tracing::error!(error = %e, "CORS configuration failed");
-            std::process::exit(1);
-        }
-    };
+fn rocket() -> Result<rocket::Rocket<rocket::Build>, String> {
+    let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
 
-    rocket::custom(figment)
+    Ok(rocket::custom(figment)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -91,14 +85,25 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         )
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
-        .attach(cors)
+        .attach(cors))
 }
 
 #[rocket::main]
 async fn main() {
-    let _log_guard = telemetry::init();
-    if let Err(e) = rocket().launch().await {
+    let log_guard = telemetry::init();
+
+    let rocket = match rocket() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build Rocket instance");
+            drop(log_guard);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = rocket.launch().await {
         tracing::error!(error = %e, "Rocket launch failed");
+        drop(log_guard);
         std::process::exit(1);
     }
 }
@@ -110,7 +115,7 @@ mod tests {
     use rocket::local::blocking::Client;
 
     fn client() -> Client {
-        Client::tracked(rocket()).expect("valid rocket instance")
+        Client::tracked(rocket().expect("valid rocket instance")).expect("valid client")
     }
 
     #[test]
