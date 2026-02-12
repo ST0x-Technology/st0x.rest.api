@@ -3753,6 +3753,7 @@ dependencies = [
  "argon2",
  "base64",
  "clap",
+ "rand 0.9.2",
  "rocket",
  "rocket_cors",
  "serde",

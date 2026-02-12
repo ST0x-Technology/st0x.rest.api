@@ -1,6 +1,8 @@
 use crate::auth;
 use crate::db::DbPool;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::{Parser, Subcommand};
+use rand::RngCore;
 
 #[derive(Parser)]
 #[command(name = "st0x_rest_api")]
@@ -66,7 +68,9 @@ async fn create_key(
     owner: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let key_id = uuid::Uuid::new_v4().to_string();
-    let secret = uuid::Uuid::new_v4().to_string();
+    let mut secret_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut secret_bytes);
+    let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
 
     let secret_hash =
         auth::hash_secret(&secret).map_err(|e| format!("failed to hash secret: {e}"))?;
