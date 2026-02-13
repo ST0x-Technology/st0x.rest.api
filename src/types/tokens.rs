@@ -59,5 +59,4 @@ mod tests {
         assert!(json.contains("\"ISIN\""));
         assert!(!json.contains("\"isin\""));
     }
-
 }

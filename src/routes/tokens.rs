@@ -4,11 +4,13 @@ use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::tokens::{RemoteTokenList, TokenInfo, TokenListResponse};
 use rocket::serde::json::Json;
 use rocket::{Route, State};
+use std::time::Duration;
 use tracing::Instrument;
 
 const TOKEN_LIST_URL: &str = "https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/ad1a637a79d5a220ad089aecdc5b7239d3473f6e/src/st0xTokens.json";
 const TARGET_CHAIN_ID: u32 = 8453;
 const HARDCODED_ISIN: &str = "US0000000000";
+const TOKEN_LIST_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) struct TokenListUrl(pub String);
 
@@ -58,19 +60,24 @@ pub async fn get_tokens(
     async move {
         tracing::info!("request received");
 
-        let response = reqwest::get(&url)
-            .await
-            .map_err(TokenError::Fetch)?;
+        tracing::info!(url = %url, timeout_secs = TOKEN_LIST_TIMEOUT_SECS, "fetching token list");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(TOKEN_LIST_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to create token list http client");
+                ApiError::Internal("failed to retrieve token list".into())
+            })?;
+
+        let response = client.get(&url).send().await.map_err(TokenError::Fetch)?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(TokenError::BadStatus(status).into());
         }
 
-        let remote: RemoteTokenList = response
-            .json()
-            .await
-            .map_err(TokenError::Deserialize)?;
+        let remote: RemoteTokenList = response.json().await.map_err(TokenError::Deserialize)?;
 
         let tokens: Vec<TokenInfo> = remote
             .tokens
@@ -108,7 +115,9 @@ mod tests {
             if let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                tokio::io::AsyncWriteExt::write_all(&mut socket, response).await.ok();
+                tokio::io::AsyncWriteExt::write_all(&mut socket, response)
+                    .await
+                    .ok();
             }
         });
         format!("http://{addr}")
