@@ -9,7 +9,6 @@ use tracing::Instrument;
 
 const TOKEN_LIST_URL: &str = "https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/ad1a637a79d5a220ad089aecdc5b7239d3473f6e/src/st0xTokens.json";
 const TARGET_CHAIN_ID: u32 = 8453;
-const HARDCODED_ISIN: &str = "US0000000000";
 const TOKEN_LIST_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) struct TokenListUrl(pub String);
@@ -83,12 +82,19 @@ pub async fn get_tokens(
             .tokens
             .into_iter()
             .filter(|t| t.chain_id == TARGET_CHAIN_ID)
-            .map(|t| TokenInfo {
-                address: t.address,
-                symbol: t.symbol,
-                name: t.name,
-                isin: HARDCODED_ISIN.into(),
-                decimals: t.decimals,
+            .map(|t| {
+                let isin = t
+                    .extensions
+                    .get("isin")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                TokenInfo {
+                    address: t.address,
+                    symbol: t.symbol,
+                    name: t.name,
+                    isin,
+                    decimals: t.decimals,
+                }
             })
             .collect();
 
@@ -105,7 +111,7 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_helpers::{basic_auth_header, client, client_with_token_url, seed_api_key};
+    use crate::test_helpers::{basic_auth_header, client_with_token_url, seed_api_key};
     use rocket::http::{Header, Status};
 
     async fn mock_server(response: &'static [u8]) -> String {
@@ -125,7 +131,16 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_get_tokens_returns_token_list() {
-        let client = client().await;
+        let body = r#"{"tokens":[{"chainId":8453,"address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","name":"USD Coin","symbol":"USDC","decimals":6,"extensions":{"isin":"US1234567890"}}]}"#;
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response_bytes: &'static [u8] =
+            Box::leak(response_bytes.into_bytes().into_boxed_slice());
+        let url = mock_server(response_bytes).await;
+        let client = client_with_token_url(&url).await;
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
         let response = client
@@ -137,13 +152,42 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         let tokens = body["tokens"].as_array().expect("tokens is an array");
-        assert!(!tokens.is_empty());
+        assert_eq!(tokens.len(), 1);
         let first = &tokens[0];
-        assert!(first["address"].is_string());
-        assert!(first["symbol"].is_string());
-        assert!(first["name"].is_string());
-        assert!(first["ISIN"].is_string());
-        assert!(first["decimals"].is_number());
+        assert_eq!(
+            first["address"],
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        );
+        assert_eq!(first["symbol"], "USDC");
+        assert_eq!(first["name"], "USD Coin");
+        assert_eq!(first["decimals"], 6);
+        assert_eq!(first["ISIN"], "US1234567890");
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_omits_isin_when_not_in_extensions() {
+        let body = r#"{"tokens":[{"chainId":8453,"address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","name":"USD Coin","symbol":"USDC","decimals":6}]}"#;
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response_bytes: &'static [u8] =
+            Box::leak(response_bytes.into_bytes().into_boxed_slice());
+        let url = mock_server(response_bytes).await;
+        let client = client_with_token_url(&url).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let first = &body["tokens"][0];
+        assert!(first.get("ISIN").is_none());
     }
 
     #[rocket::async_test]
