@@ -1,5 +1,6 @@
 use crate::db::DbPool;
 use crate::error::ApiError;
+use crate::fairings::rate_limiter::CachedRateLimitInfo;
 use crate::fairings::RateLimiter;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
@@ -8,6 +9,7 @@ use base64::Engine;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
 use rocket::Request;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ApiKeyRow {
@@ -163,8 +165,21 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
         };
 
         match rl.check_per_key(row.id) {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok((true, info)) => {
+                if let Some(info) = info {
+                    let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+                    if let Ok(mut guard) = cache.0.lock() {
+                        *guard = Some(info);
+                    }
+                }
+            }
+            Ok((false, info)) => {
+                if let Some(info) = info {
+                    let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+                    if let Ok(mut guard) = cache.0.lock() {
+                        *guard = Some(info);
+                    }
+                }
                 tracing::warn!(key_id = %row.key_id, "per-key rate limit exceeded");
                 return Outcome::Error((
                     Status::TooManyRequests,

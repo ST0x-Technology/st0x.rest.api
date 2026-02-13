@@ -13,6 +13,16 @@ const PER_KEY_CLEANUP_EVERY: u64 = 1024;
 
 pub struct GlobalRateLimit;
 
+pub struct RateLimitInfo {
+    pub limit: u64,
+    pub remaining: u64,
+    pub reset: u64,
+}
+
+pub struct CachedRateLimitInfo(pub Mutex<Option<RateLimitInfo>>);
+
+pub struct RateLimitHeadersFairing;
+
 pub struct RateLimiter {
     global_rpm: u64,
     per_key_rpm: u64,
@@ -38,9 +48,25 @@ impl RateLimiter {
         }
     }
 
-    pub fn check_global(&self) -> Result<bool, ApiError> {
+    fn compute_reset(window: &VecDeque<Instant>, now: Instant) -> u64 {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match window.front() {
+            Some(&oldest) => {
+                let delta = (oldest + WINDOW_DURATION)
+                    .saturating_duration_since(now)
+                    .as_secs();
+                now_unix + delta
+            }
+            None => now_unix + WINDOW_DURATION.as_secs(),
+        }
+    }
+
+    pub fn check_global(&self) -> Result<(bool, Option<RateLimitInfo>), ApiError> {
         if self.global_rpm == 0 {
-            return Ok(true);
+            return Ok((true, None));
         }
         let mut window = match self.global_window.lock() {
             Ok(w) => w,
@@ -54,15 +80,32 @@ impl RateLimiter {
         Self::prune_window(&mut window, cutoff);
         if (window.len() as u64) < self.global_rpm {
             window.push_back(now);
-            Ok(true)
+            let remaining = self.global_rpm - window.len() as u64;
+            let reset = Self::compute_reset(&window, now);
+            Ok((
+                true,
+                Some(RateLimitInfo {
+                    limit: self.global_rpm,
+                    remaining,
+                    reset,
+                }),
+            ))
         } else {
-            Ok(false)
+            let reset = Self::compute_reset(&window, now);
+            Ok((
+                false,
+                Some(RateLimitInfo {
+                    limit: self.global_rpm,
+                    remaining: 0,
+                    reset,
+                }),
+            ))
         }
     }
 
-    pub fn check_per_key(&self, key_id: i64) -> Result<bool, ApiError> {
+    pub fn check_per_key(&self, key_id: i64) -> Result<(bool, Option<RateLimitInfo>), ApiError> {
         if self.per_key_rpm == 0 {
-            return Ok(true);
+            return Ok((true, None));
         }
         let mut windows = match self.per_key_windows.lock() {
             Ok(w) => w,
@@ -88,9 +131,26 @@ impl RateLimiter {
 
         if (window.len() as u64) < self.per_key_rpm {
             window.push_back(now);
-            Ok(true)
+            let remaining = self.per_key_rpm - window.len() as u64;
+            let reset = Self::compute_reset(window, now);
+            Ok((
+                true,
+                Some(RateLimitInfo {
+                    limit: self.per_key_rpm,
+                    remaining,
+                    reset,
+                }),
+            ))
         } else {
-            Ok(false)
+            let reset = Self::compute_reset(window, now);
+            Ok((
+                false,
+                Some(RateLimitInfo {
+                    limit: self.per_key_rpm,
+                    remaining: 0,
+                    reset,
+                }),
+            ))
         }
     }
 }
@@ -112,8 +172,22 @@ impl<'r> FromRequest<'r> for GlobalRateLimit {
         };
 
         match rl.check_global() {
-            Ok(true) => Outcome::Success(GlobalRateLimit),
-            Ok(false) => {
+            Ok((true, info)) => {
+                if let Some(info) = info {
+                    let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+                    if let Ok(mut guard) = cache.0.lock() {
+                        *guard = Some(info);
+                    }
+                }
+                Outcome::Success(GlobalRateLimit)
+            }
+            Ok((false, info)) => {
+                if let Some(info) = info {
+                    let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+                    if let Ok(mut guard) = cache.0.lock() {
+                        *guard = Some(info);
+                    }
+                }
                 tracing::warn!("global rate limit exceeded");
                 Outcome::Error((
                     Status::TooManyRequests,
@@ -123,6 +197,30 @@ impl<'r> FromRequest<'r> for GlobalRateLimit {
             Err(e) => {
                 tracing::error!(error = %e, "global rate limiter failed");
                 Outcome::Error((Status::InternalServerError, e))
+            }
+        }
+    }
+}
+
+#[rocket::async_trait]
+impl Fairing for RateLimitHeadersFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "Rate Limit Headers",
+            kind: Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
+        let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+        if let Ok(guard) = cache.0.lock() {
+            if let Some(ref info) = *guard {
+                res.set_header(Header::new("X-RateLimit-Limit", info.limit.to_string()));
+                res.set_header(Header::new(
+                    "X-RateLimit-Remaining",
+                    info.remaining.to_string(),
+                ));
+                res.set_header(Header::new("X-RateLimit-Reset", info.reset.to_string()));
             }
         }
     }
@@ -140,7 +238,7 @@ mod tests {
     fn test_global_check_allows_under_limit() {
         let rl = RateLimiter::new(5, 5);
         for _ in 0..5 {
-            assert!(matches!(rl.check_global(), Ok(true)));
+            assert!(matches!(rl.check_global(), Ok((true, _))));
         }
     }
 
@@ -148,9 +246,9 @@ mod tests {
     fn test_global_check_blocks_over_limit() {
         let rl = RateLimiter::new(3, 5);
         for _ in 0..3 {
-            assert!(matches!(rl.check_global(), Ok(true)));
+            assert!(matches!(rl.check_global(), Ok((true, _))));
         }
-        assert!(matches!(rl.check_global(), Ok(false)));
+        assert!(matches!(rl.check_global(), Ok((false, _))));
     }
 
     #[test]
@@ -165,7 +263,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                matches!(rl.check_global(), Ok(true))
+                matches!(rl.check_global(), Ok((true, _)))
             }));
         }
 
@@ -183,16 +281,16 @@ mod tests {
     fn test_per_key_check_allows_under_limit() {
         let rl = RateLimiter::new(100, 3);
         for _ in 0..3 {
-            assert!(matches!(rl.check_per_key(1), Ok(true)));
+            assert!(matches!(rl.check_per_key(1), Ok((true, _))));
         }
     }
 
     #[test]
     fn test_per_key_check_blocks_over_limit() {
         let rl = RateLimiter::new(100, 2);
-        assert!(matches!(rl.check_per_key(1), Ok(true)));
-        assert!(matches!(rl.check_per_key(1), Ok(true)));
-        assert!(matches!(rl.check_per_key(1), Ok(false)));
+        assert!(matches!(rl.check_per_key(1), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1), Ok((false, _))));
     }
 
     #[test]
@@ -207,7 +305,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                matches!(rl.check_per_key(42), Ok(true))
+                matches!(rl.check_per_key(42), Ok((true, _)))
             }));
         }
 
@@ -224,10 +322,10 @@ mod tests {
     #[test]
     fn test_per_key_limits_are_independent() {
         let rl = RateLimiter::new(100, 1);
-        assert!(matches!(rl.check_per_key(1), Ok(true)));
-        assert!(matches!(rl.check_per_key(1), Ok(false)));
-        assert!(matches!(rl.check_per_key(2), Ok(true)));
-        assert!(matches!(rl.check_per_key(2), Ok(false)));
+        assert!(matches!(rl.check_per_key(1), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1), Ok((false, _))));
+        assert!(matches!(rl.check_per_key(2), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(2), Ok((false, _))));
     }
 
     #[test]
@@ -243,7 +341,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                (1_i64, matches!(rl.check_per_key(1), Ok(true)))
+                (1_i64, matches!(rl.check_per_key(1), Ok((true, _))))
             }));
         }
         for _ in 0..workers_per_key {
@@ -251,7 +349,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                (2_i64, matches!(rl.check_per_key(2), Ok(true)))
+                (2_i64, matches!(rl.check_per_key(2), Ok((true, _))))
             }));
         }
 
@@ -276,8 +374,8 @@ mod tests {
     fn test_zero_rps_disables_limiting() {
         let rl = RateLimiter::new(0, 0);
         for _ in 0..1000 {
-            assert!(matches!(rl.check_global(), Ok(true)));
-            assert!(matches!(rl.check_per_key(1), Ok(true)));
+            assert!(matches!(rl.check_global(), Ok((true, _))));
+            assert!(matches!(rl.check_per_key(1), Ok((true, _))));
         }
     }
 
@@ -290,7 +388,7 @@ mod tests {
             window.push_back(stale);
             window.push_back(Instant::now());
         }
-        assert!(matches!(rl.check_global(), Ok(true)));
+        assert!(matches!(rl.check_global(), Ok((true, _))));
     }
 
     #[test]
@@ -303,7 +401,7 @@ mod tests {
             window.push_back(stale);
             window.push_back(Instant::now());
         }
-        assert!(matches!(rl.check_per_key(7), Ok(true)));
+        assert!(matches!(rl.check_per_key(7), Ok((true, _))));
     }
 
     #[test]
@@ -376,6 +474,20 @@ mod tests {
             .expect("Retry-After header");
         assert_eq!(retry_after, "60");
 
+        let limit = r3
+            .headers()
+            .get_one("X-RateLimit-Limit")
+            .expect("X-RateLimit-Limit header");
+        assert_eq!(limit, "2");
+
+        let remaining = r3
+            .headers()
+            .get_one("X-RateLimit-Remaining")
+            .expect("X-RateLimit-Remaining header");
+        assert_eq!(remaining, "0");
+
+        assert!(r3.headers().get_one("X-RateLimit-Reset").is_some());
+
         let body = r3.into_string().await.expect("response body");
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(json["error"]["code"], "RATE_LIMITED");
@@ -424,6 +536,20 @@ mod tests {
             .get_one("Retry-After")
             .expect("Retry-After header");
         assert_eq!(retry_after, "60");
+
+        let limit = response
+            .headers()
+            .get_one("X-RateLimit-Limit")
+            .expect("X-RateLimit-Limit header");
+        assert_eq!(limit, "10000");
+
+        let remaining = response
+            .headers()
+            .get_one("X-RateLimit-Remaining")
+            .expect("X-RateLimit-Remaining header");
+        assert_eq!(remaining, "0");
+
+        assert!(response.headers().get_one("X-RateLimit-Reset").is_some());
 
         let body = response.into_string().await.expect("response body");
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
@@ -499,6 +625,18 @@ mod tests {
             .await;
         assert_ne!(first.status(), Status::TooManyRequests);
 
+        let first_limit = first
+            .headers()
+            .get_one("X-RateLimit-Limit")
+            .expect("X-RateLimit-Limit header");
+        assert_eq!(first_limit, "1");
+
+        let first_remaining = first
+            .headers()
+            .get_one("X-RateLimit-Remaining")
+            .expect("X-RateLimit-Remaining header");
+        assert_eq!(first_remaining, "0");
+
         let second = client
             .get("/v1/tokens")
             .header(HttpHeader::new("Authorization", header))
@@ -512,6 +650,18 @@ mod tests {
             .expect("Retry-After header");
         assert_eq!(retry_after, "60");
 
+        let limit = second
+            .headers()
+            .get_one("X-RateLimit-Limit")
+            .expect("X-RateLimit-Limit header");
+        assert_eq!(limit, "1");
+
+        let remaining = second
+            .headers()
+            .get_one("X-RateLimit-Remaining")
+            .expect("X-RateLimit-Remaining header");
+        assert_eq!(remaining, "0");
+
         let body = second.into_string().await.expect("response body");
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(json["error"]["code"], "RATE_LIMITED");
@@ -519,5 +669,33 @@ mod tests {
             json["error"]["message"],
             "Too many requests, please try again later"
         );
+    }
+
+    #[rocket::async_test]
+    async fn test_rate_limit_headers_on_successful_request() {
+        let client = client().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header_val = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/v1/tokens")
+            .header(HttpHeader::new("Authorization", header_val))
+            .dispatch()
+            .await;
+        assert_ne!(response.status(), Status::TooManyRequests);
+
+        let limit = response
+            .headers()
+            .get_one("X-RateLimit-Limit")
+            .expect("X-RateLimit-Limit header");
+        assert_eq!(limit, "10000");
+
+        let remaining = response
+            .headers()
+            .get_one("X-RateLimit-Remaining")
+            .expect("X-RateLimit-Remaining header");
+        assert_eq!(remaining, "9999");
+
+        assert!(response.headers().get_one("X-RateLimit-Reset").is_some());
     }
 }

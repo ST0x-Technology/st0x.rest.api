@@ -86,6 +86,9 @@ fn configure_cors() -> Result<rocket_cors::Cors, String> {
         expose_headers: HashSet::from([
             "X-Request-Id".to_string(),
             "Retry-After".to_string(),
+            "X-RateLimit-Limit".to_string(),
+            "X-RateLimit-Remaining".to_string(),
+            "X-RateLimit-Reset".to_string(),
         ]),
         ..Default::default()
     }
@@ -117,6 +120,7 @@ pub(crate) fn rocket(
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger)
+        .attach(fairings::RateLimitHeadersFairing)
         .attach(cors))
 }
 
