@@ -95,3 +95,116 @@ pub async fn get_tokens(
 pub fn routes() -> Vec<Route> {
     rocket::routes![get_tokens]
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_helpers::{basic_auth_header, client, client_with_token_url, seed_api_key};
+    use rocket::http::{Header, Status};
+
+    async fn mock_server(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                tokio::io::AsyncWriteExt::write_all(&mut socket, response).await.ok();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_returns_token_list() {
+        let client = client().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let tokens = body["tokens"].as_array().expect("tokens is an array");
+        assert!(!tokens.is_empty());
+        let first = &tokens[0];
+        assert!(first["address"].is_string());
+        assert!(first["symbol"].is_string());
+        assert!(first["name"].is_string());
+        assert!(first["ISIN"].is_string());
+        assert!(first["decimals"].is_number());
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_returns_500_on_upstream_error() {
+        let url = mock_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let client = client_with_token_url(&url).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::InternalServerError);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to retrieve token list"));
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_returns_500_on_invalid_json() {
+        let url = mock_server(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\nnot-json!!!",
+        )
+        .await;
+        let client = client_with_token_url(&url).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::InternalServerError);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to retrieve token list"));
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_returns_500_on_fetch_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = client_with_token_url(&format!("http://{addr}")).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::InternalServerError);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to retrieve token list"));
+    }
+}
