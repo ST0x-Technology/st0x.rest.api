@@ -113,6 +113,7 @@ pub async fn get_tokens(
                 let isin = t
                     .extensions
                     .get("isin")
+                    .or_else(|| t.extensions.get("ISIN"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 TokenInfo {
@@ -215,6 +216,62 @@ mod tests {
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         let first = &body["tokens"][0];
         assert!(first.get("ISIN").is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_reads_uppercase_isin_key() {
+        let body = r#"{"tokens":[{"chainId":8453,"address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","name":"USD Coin","symbol":"USDC","decimals":6,"extensions":{"ISIN":"US1234567890"}}]}"#;
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response_bytes: &'static [u8] =
+            Box::leak(response_bytes.into_bytes().into_boxed_slice());
+        let url = mock_server(response_bytes).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let first = &body["tokens"][0];
+        assert_eq!(first["ISIN"], "US1234567890");
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_filters_non_base_chain_tokens() {
+        let body = r#"{"tokens":[{"chainId":8453,"address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","name":"USD Coin","symbol":"USDC","decimals":6},{"chainId":1,"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","name":"USD Coin","symbol":"USDC","decimals":6}]}"#;
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response_bytes: &'static [u8] =
+            Box::leak(response_bytes.into_bytes().into_boxed_slice());
+        let url = mock_server(response_bytes).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let tokens = body["tokens"].as_array().expect("tokens is an array");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0]["address"],
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        );
     }
 
     #[rocket::async_test]
