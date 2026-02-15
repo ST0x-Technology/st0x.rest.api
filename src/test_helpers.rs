@@ -2,34 +2,51 @@ use base64::Engine;
 use rocket::local::asynchronous::Client;
 
 pub(crate) async fn client() -> Client {
-    let rate_limiter = crate::fairings::RateLimiter::new(10000, 10000);
-    client_with_rate_limiter(rate_limiter).await
+    TestClientBuilder::new().build().await
 }
 
-pub(crate) async fn client_with_token_url(url: &str) -> Client {
-    let rate_limiter = crate::fairings::RateLimiter::new(10000, 10000);
-    client_with_rate_limiter_and_token_url(rate_limiter, url).await
-}
-
-pub(crate) async fn client_with_rate_limiter(rate_limiter: crate::fairings::RateLimiter) -> Client {
-    let url = mock_token_list_url().await;
-    client_with_rate_limiter_and_token_url(rate_limiter, &url).await
-}
-
-async fn client_with_rate_limiter_and_token_url(
+pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
-    url: &str,
-) -> Client {
-    let id = uuid::Uuid::new_v4();
-    let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-        .await
-        .expect("database init");
-    let token_list_url = crate::routes::tokens::TokenListUrl(url.to_string());
-    Client::tracked(
-        crate::rocket(pool, rate_limiter, token_list_url).expect("valid rocket instance"),
-    )
-    .await
-    .expect("valid client")
+    token_list_url: Option<String>,
+}
+
+impl TestClientBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
+            token_list_url: None,
+        }
+    }
+
+    pub(crate) fn rate_limiter(mut self, rate_limiter: crate::fairings::RateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    pub(crate) fn token_list_url(mut self, url: impl Into<String>) -> Self {
+        self.token_list_url = Some(url.into());
+        self
+    }
+
+    pub(crate) async fn build(self) -> Client {
+        let id = uuid::Uuid::new_v4();
+        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
+            .await
+            .expect("database init");
+
+        let token_list_url = match self.token_list_url {
+            Some(url) => url,
+            None => mock_token_list_url().await,
+        };
+
+        let rocket = crate::rocket(pool, self.rate_limiter)
+            .expect("valid rocket instance")
+            .manage(crate::routes::tokens::TokensConfig::with_url(
+                token_list_url,
+            ));
+
+        Client::tracked(rocket).await.expect("valid client")
+    }
 }
 
 async fn mock_token_list_url() -> String {

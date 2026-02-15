@@ -2,6 +2,7 @@ use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::tokens::{RemoteTokenList, TokenInfo, TokenListResponse};
+use rocket::fairing::AdHoc;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
 use std::time::Duration;
@@ -11,14 +12,40 @@ const TOKEN_LIST_URL: &str = "https://raw.githubusercontent.com/S01-Issuer/st0x-
 const TARGET_CHAIN_ID: u32 = 8453;
 const TOKEN_LIST_TIMEOUT_SECS: u64 = 10;
 
-pub(crate) struct TokenListUrl(pub String);
+pub(crate) struct TokensConfig {
+    pub(crate) url: String,
+    pub(crate) client: reqwest::Client,
+}
 
-pub(crate) struct TokenHttpClient(pub reqwest::Client);
-
-impl Default for TokenListUrl {
+impl Default for TokensConfig {
     fn default() -> Self {
-        Self(TOKEN_LIST_URL.to_string())
+        Self {
+            url: TOKEN_LIST_URL.to_string(),
+            client: reqwest::Client::new(),
+        }
     }
+}
+
+impl TokensConfig {
+    #[cfg(test)]
+    pub(crate) fn with_url(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+pub(crate) fn fairing() -> AdHoc {
+    AdHoc::on_ignite("Tokens Config", |rocket| async {
+        if rocket.state::<TokensConfig>().is_some() {
+            tracing::info!("TokensConfig already managed; skipping default initialization");
+            rocket
+        } else {
+            tracing::info!(url = %TOKEN_LIST_URL, "initializing default TokensConfig");
+            rocket.manage(TokensConfig::default())
+        }
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,11 +82,10 @@ pub async fn get_tokens(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
-    token_list_url: &State<TokenListUrl>,
-    http_client: &State<TokenHttpClient>,
+    tokens_config: &State<TokensConfig>,
 ) -> Result<Json<TokenListResponse>, ApiError> {
-    let url = token_list_url.0.clone();
-    let client = http_client.inner().0.clone();
+    let url = tokens_config.url.clone();
+    let client = tokens_config.client.clone();
     async move {
         tracing::info!("request received");
 
@@ -112,7 +138,7 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_helpers::{basic_auth_header, client_with_token_url, seed_api_key};
+    use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use rocket::http::{Header, Status};
 
     async fn mock_server(response: &'static [u8]) -> String {
@@ -141,7 +167,7 @@ mod tests {
         let response_bytes: &'static [u8] =
             Box::leak(response_bytes.into_bytes().into_boxed_slice());
         let url = mock_server(response_bytes).await;
-        let client = client_with_token_url(&url).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
         let response = client
@@ -176,7 +202,7 @@ mod tests {
         let response_bytes: &'static [u8] =
             Box::leak(response_bytes.into_bytes().into_boxed_slice());
         let url = mock_server(response_bytes).await;
-        let client = client_with_token_url(&url).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
         let response = client
@@ -197,7 +223,7 @@ mod tests {
             b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         )
         .await;
-        let client = client_with_token_url(&url).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
         let response = client
@@ -221,7 +247,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\nnot-json!!!",
         )
         .await;
-        let client = client_with_token_url(&url).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
         let response = client
@@ -244,7 +270,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let client = client_with_token_url(&format!("http://{addr}")).await;
+        let client = TestClientBuilder::new()
+            .token_list_url(format!("http://{addr}"))
+            .build()
+            .await;
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
         let response = client

@@ -99,7 +99,6 @@ fn configure_cors() -> Result<rocket_cors::Cors, String> {
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
-    token_list_url: routes::tokens::TokenListUrl,
 ) -> Result<rocket::Rocket<rocket::Build>, String> {
     let cors = configure_cors()?;
 
@@ -108,8 +107,6 @@ pub(crate) fn rocket(
     Ok(rocket::custom(figment)
         .manage(pool)
         .manage(rate_limiter)
-        .manage(token_list_url)
-        .manage(routes::tokens::TokenHttpClient(reqwest::Client::new()))
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -124,6 +121,7 @@ pub(crate) fn rocket(
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger)
         .attach(fairings::RateLimitHeadersFairing)
+        .attach(routes::tokens::fairing())
         .attach(cors))
 }
 
@@ -175,8 +173,7 @@ async fn main() {
     match command {
         cli::Command::Serve => {
             let rate_limiter = fairings::RateLimiter::new(global_rpm, per_key_rpm);
-            let token_list_url = routes::tokens::TokenListUrl::default();
-            let rocket = match rocket(pool, rate_limiter, token_list_url) {
+            let rocket = match rocket(pool, rate_limiter) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");
