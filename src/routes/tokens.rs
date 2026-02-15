@@ -13,6 +13,8 @@ const TOKEN_LIST_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) struct TokenListUrl(pub String);
 
+pub(crate) struct TokenHttpClient(pub reqwest::Client);
+
 impl Default for TokenListUrl {
     fn default() -> Self {
         Self(TOKEN_LIST_URL.to_string())
@@ -54,22 +56,21 @@ pub async fn get_tokens(
     _key: AuthenticatedKey,
     span: TracingSpan,
     token_list_url: &State<TokenListUrl>,
+    http_client: &State<TokenHttpClient>,
 ) -> Result<Json<TokenListResponse>, ApiError> {
     let url = token_list_url.0.clone();
+    let client = http_client.inner().0.clone();
     async move {
         tracing::info!("request received");
 
         tracing::info!(url = %url, timeout_secs = TOKEN_LIST_TIMEOUT_SECS, "fetching token list");
 
-        let client = reqwest::Client::builder()
+        let response = client
+            .get(&url)
             .timeout(Duration::from_secs(TOKEN_LIST_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to create token list http client");
-                ApiError::Internal("failed to retrieve token list".into())
-            })?;
-
-        let response = client.get(&url).send().await.map_err(TokenError::Fetch)?;
+            .send()
+            .await
+            .map_err(TokenError::Fetch)?;
 
         let status = response.status();
         if !status.is_success() {

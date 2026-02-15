@@ -109,6 +109,7 @@ pub(crate) fn rocket(
         .manage(pool)
         .manage(rate_limiter)
         .manage(token_list_url)
+        .manage(routes::tokens::TokenHttpClient(reqwest::Client::new()))
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
