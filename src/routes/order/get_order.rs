@@ -1,69 +1,18 @@
+use super::{OrderDataSource, RaindexOrderDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{TokenRef, ValidatedFixedBytes};
 use crate::types::order::{
-    CancelOrderRequest, CancelOrderResponse, DeployDcaOrderRequest, DeployOrderResponse,
-    DeploySolverOrderRequest, OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType,
+    OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType,
 };
 use alloy::primitives::B256;
-use async_trait::async_trait;
 use rain_orderbook_common::parsed_meta::ParsedMeta;
-use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
-use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
+use rain_orderbook_common::raindex_client::orders::RaindexOrder;
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
-use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::serde::json::Json;
-use rocket::{Route, State};
+use rocket::State;
 use tracing::Instrument;
-
-#[async_trait(?Send)]
-trait OrderDataSource {
-    async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError>;
-    async fn get_order_quotes(&self, order: &RaindexOrder) -> Vec<RaindexOrderQuote>;
-    async fn get_order_trades(&self, order: &RaindexOrder) -> Vec<RaindexTrade>;
-}
-
-struct RaindexOrderDataSource<'a> {
-    client: &'a RaindexClient,
-}
-
-#[async_trait(?Send)]
-impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
-    async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError> {
-        let filters = GetOrdersFilters {
-            order_hash: Some(hash),
-            ..Default::default()
-        };
-        self.client
-            .get_orders(None, Some(filters), None)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to query orders");
-                ApiError::Internal("failed to query orders".into())
-            })
-    }
-
-    async fn get_order_quotes(&self, order: &RaindexOrder) -> Vec<RaindexOrderQuote> {
-        match order.get_quotes(None, None).await {
-            Ok(quotes) => quotes,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to fetch order quotes");
-                vec![]
-            }
-        }
-    }
-
-    async fn get_order_trades(&self, order: &RaindexOrder) -> Vec<RaindexTrade> {
-        match order.get_trades_list(None, None, None).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to fetch order trades");
-                vec![]
-            }
-        }
-    }
-}
 
 async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<OrderDetail, ApiError> {
     let orders = ds.get_orders_by_hash(hash).await?;
@@ -80,74 +29,6 @@ async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<Order
     let trades = ds.get_order_trades(&order).await;
     let order_type = determine_order_type(&order);
     build_order_detail(&order, order_type, &io_ratio, &trades)
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/order/dca",
-    tag = "Order",
-    security(("basicAuth" = [])),
-    request_body = DeployDcaOrderRequest,
-    responses(
-        (status = 200, description = "DCA order deployment result", body = DeployOrderResponse),
-        (status = 400, description = "Bad request", body = ApiErrorResponse),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
-        (status = 429, description = "Rate limited", body = ApiErrorResponse),
-        (status = 500, description = "Internal server error", body = ApiErrorResponse),
-    )
-)]
-#[post("/dca", data = "<request>")]
-pub async fn post_order_dca(
-    _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
-    span: TracingSpan,
-    request: Json<DeployDcaOrderRequest>,
-) -> Result<Json<DeployOrderResponse>, ApiError> {
-    let req = request.into_inner();
-    async move {
-        tracing::info!(body = ?req, "request received");
-        raindex
-            .run_with_client(move |_client| async move { todo!() })
-            .await
-            .map_err(ApiError::from)?
-    }
-    .instrument(span.0)
-    .await
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/order/solver",
-    tag = "Order",
-    security(("basicAuth" = [])),
-    request_body = DeploySolverOrderRequest,
-    responses(
-        (status = 200, description = "Solver order deployment result", body = DeployOrderResponse),
-        (status = 400, description = "Bad request", body = ApiErrorResponse),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
-        (status = 429, description = "Rate limited", body = ApiErrorResponse),
-        (status = 500, description = "Internal server error", body = ApiErrorResponse),
-    )
-)]
-#[post("/solver", data = "<request>")]
-pub async fn post_order_solver(
-    _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
-    span: TracingSpan,
-    request: Json<DeploySolverOrderRequest>,
-) -> Result<Json<DeployOrderResponse>, ApiError> {
-    let req = request.into_inner();
-    async move {
-        tracing::info!(body = ?req, "request received");
-        raindex
-            .run_with_client(move |_client| async move { todo!() })
-            .await
-            .map_err(ApiError::from)?
-    }
-    .instrument(span.0)
-    .await
 }
 
 #[utoipa::path(
@@ -185,41 +66,6 @@ pub async fn get_order(
             .await
             .map_err(ApiError::from)??;
         Ok(Json(detail))
-    }
-    .instrument(span.0)
-    .await
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/order/cancel",
-    tag = "Order",
-    security(("basicAuth" = [])),
-    request_body = CancelOrderRequest,
-    responses(
-        (status = 200, description = "Cancel order result", body = CancelOrderResponse),
-        (status = 400, description = "Bad request", body = ApiErrorResponse),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
-        (status = 429, description = "Rate limited", body = ApiErrorResponse),
-        (status = 404, description = "Order not found", body = ApiErrorResponse),
-        (status = 500, description = "Internal server error", body = ApiErrorResponse),
-    )
-)]
-#[post("/cancel", data = "<request>")]
-pub async fn post_order_cancel(
-    _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
-    span: TracingSpan,
-    request: Json<CancelOrderRequest>,
-) -> Result<Json<CancelOrderResponse>, ApiError> {
-    let req = request.into_inner();
-    async move {
-        tracing::info!(body = ?req, "request received");
-        raindex
-            .run_with_client(move |_client| async move { todo!() })
-            .await
-            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -309,22 +155,18 @@ fn map_trade(trade: &RaindexTrade) -> OrderTradeEntry {
     }
 }
 
-pub fn routes() -> Vec<Route> {
-    rocket::routes![
-        post_order_dca,
-        post_order_solver,
-        get_order,
-        post_order_cancel
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ApiError;
     use crate::test_helpers::{
         basic_auth_header, mock_invalid_raindex_config, seed_api_key, TestClientBuilder,
     };
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, B256};
+    use async_trait::async_trait;
+    use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
+    use rain_orderbook_common::raindex_client::orders::RaindexOrder;
+    use rain_orderbook_common::raindex_client::trades::RaindexTrade;
     use rocket::http::{Header, Status};
     use serde_json::json;
 
@@ -502,6 +344,17 @@ mod tests {
         serde_json::from_value(quote_json(formatted_ratio)).expect("deserialize mock quote")
     }
 
+    fn mock_failed_quote() -> RaindexOrderQuote {
+        serde_json::from_value(json!({
+            "pair": { "pairName": "USDC/WETH", "inputIndex": 0, "outputIndex": 0 },
+            "blockNumber": 1,
+            "data": null,
+            "success": false,
+            "error": "quote failed"
+        }))
+        .expect("deserialize mock failed quote")
+    }
+
     struct MockOrderDataSource {
         orders: Result<Vec<RaindexOrder>, ApiError>,
         trades: Vec<RaindexTrade>,
@@ -581,6 +434,18 @@ mod tests {
         let detail = process_get_order(&ds, test_hash()).await.unwrap();
         assert!(detail.trades.is_empty());
         assert_eq!(detail.io_ratio, "2.0");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_order_failed_quote() {
+        let ds = MockOrderDataSource {
+            orders: Ok(vec![mock_order()]),
+            trades: vec![],
+            quotes: vec![mock_failed_quote()],
+        };
+        let detail = process_get_order(&ds, test_hash()).await.unwrap();
+        assert_eq!(detail.io_ratio, "-");
+        assert_eq!(detail.order_details.io_ratio, "-");
     }
 
     #[rocket::async_test]
