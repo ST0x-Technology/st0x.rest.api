@@ -19,10 +19,7 @@ pub(crate) trait OrderDataSource {
         &self,
         order: &RaindexOrder,
     ) -> Result<Vec<RaindexOrderQuote>, ApiError>;
-    async fn get_order_trades(
-        &self,
-        order: &RaindexOrder,
-    ) -> Result<Vec<RaindexTrade>, ApiError>;
+    async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError>;
 }
 
 pub(crate) struct RaindexOrderDataSource<'a> {
@@ -55,10 +52,7 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
         })
     }
 
-    async fn get_order_trades(
-        &self,
-        order: &RaindexOrder,
-    ) -> Result<Vec<RaindexTrade>, ApiError> {
+    async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError> {
         order.get_trades_list(None, None, None).await.map_err(|e| {
             tracing::error!(error = %e, "failed to query order trades");
             ApiError::Internal("failed to query order trades".into())

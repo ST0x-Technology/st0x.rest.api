@@ -8870,6 +8870,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "argon2",
+ "async-trait",
  "base64 0.22.1",
  "clap",
  "rain_orderbook_common",

@@ -3,9 +3,7 @@ use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{TokenRef, ValidatedFixedBytes};
-use crate::types::order::{
-    OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType,
-};
+use crate::types::order::{OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType};
 use alloy::primitives::B256;
 use rain_orderbook_common::parsed_meta::ParsedMeta;
 use rain_orderbook_common::raindex_client::orders::RaindexOrder;
@@ -74,11 +72,7 @@ async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<Order
 fn determine_order_type(order: &RaindexOrder) -> OrderType {
     for meta in order.parsed_meta() {
         if let ParsedMeta::DotrainGuiStateV1(gui_state) = meta {
-            if gui_state
-                .selected_deployment
-                .to_lowercase()
-                .contains("dca")
-            {
+            if gui_state.selected_deployment.to_lowercase().contains("dca") {
                 return OrderType::Dca;
             }
         }
@@ -109,10 +103,7 @@ fn build_order_detail(
 
     let trade_entries: Vec<OrderTradeEntry> = trades.iter().map(map_trade).collect();
 
-    let created_at: u64 = order
-        .timestamp_added()
-        .try_into()
-        .unwrap_or(0);
+    let created_at: u64 = order.timestamp_added().try_into().unwrap_or(0);
 
     Ok(OrderDetail {
         order_hash: order.order_hash(),

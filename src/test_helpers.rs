@@ -37,7 +37,7 @@ impl TestClientBuilder {
         self
     }
 
-pub(crate) async fn build(self) -> Client {
+    pub(crate) async fn build(self) -> Client {
         let id = uuid::Uuid::new_v4();
         let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
             .await
