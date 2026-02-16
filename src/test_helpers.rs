@@ -8,6 +8,7 @@ pub(crate) async fn client() -> Client {
 pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
     token_list_url: Option<String>,
+    raindex_registry_url: Option<String>,
     raindex_config: Option<crate::raindex::RaindexClientProvider>,
 }
 
@@ -16,6 +17,7 @@ impl TestClientBuilder {
         Self {
             rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
             token_list_url: None,
+            raindex_registry_url: None,
             raindex_config: None,
         }
     }
@@ -35,6 +37,11 @@ impl TestClientBuilder {
         self
     }
 
+    pub(crate) fn raindex_registry_url(mut self, url: impl Into<String>) -> Self {
+        self.raindex_registry_url = Some(url.into());
+        self
+    }
+
     pub(crate) async fn build(self) -> Client {
         let id = uuid::Uuid::new_v4();
         let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
@@ -48,7 +55,15 @@ impl TestClientBuilder {
 
         let raindex_config = match self.raindex_config {
             Some(config) => config,
-            None => mock_raindex_config().await,
+            None => {
+                let registry_url = match self.raindex_registry_url {
+                    Some(url) => url,
+                    None => mock_raindex_registry_url().await,
+                };
+                crate::raindex::RaindexClientProvider::load(&registry_url)
+                    .await
+                    .expect("mock raindex config from registry url")
+            }
         };
 
         let rocket = crate::rocket(pool, self.rate_limiter, raindex_config)
@@ -92,6 +107,20 @@ async fn mock_token_list_url() -> String {
 }
 
 pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexClientProvider {
+    let registry_url = mock_raindex_registry_url().await;
+    crate::raindex::RaindexClientProvider::load(&registry_url)
+        .await
+        .expect("mock raindex config")
+}
+
+pub(crate) async fn mock_invalid_raindex_config() -> crate::raindex::RaindexClientProvider {
+    let registry_url = mock_raindex_registry_url_with_settings("not valid yaml: [").await;
+    crate::raindex::RaindexClientProvider::load(&registry_url)
+        .await
+        .expect("mock invalid raindex config")
+}
+
+pub(crate) async fn mock_raindex_registry_url() -> String {
     let settings = r#"version: 4
 networks:
   base:
@@ -116,6 +145,11 @@ tokens:
     address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
     network: base
 "#;
+    mock_raindex_registry_url_with_settings(settings).await
+}
+
+pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> String {
+    let settings = settings.to_string();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -156,10 +190,7 @@ tokens:
         }
     });
 
-    let registry_url = format!("http://{addr}/registry.txt");
-    crate::raindex::RaindexClientProvider::load(&registry_url)
-        .await
-        .expect("mock raindex config")
+    format!("http://{addr}/registry.txt")
 }
 
 pub(crate) async fn seed_api_key(client: &Client) -> (String, String) {
