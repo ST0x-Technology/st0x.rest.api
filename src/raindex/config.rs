@@ -1,5 +1,7 @@
 use crate::error::ApiError;
+use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_js_api::registry::DotrainRegistry;
+use rain_orderbook_js_api::registry::DotrainRegistryError;
 
 #[derive(Debug)]
 pub(crate) struct RaindexClientProvider {
@@ -9,27 +11,37 @@ pub(crate) struct RaindexClientProvider {
 impl RaindexClientProvider {
     pub(crate) async fn load(registry_url: &str) -> Result<Self, RaindexClientProviderError> {
         let url = registry_url.to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<DotrainRegistry, String>>();
+
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("thread-local runtime");
-            let result = rt.block_on(async {
-                DotrainRegistry::new(url)
-                    .await
-                    .map_err(|e| RaindexClientProviderError::RegistryLoad(e.to_string()))
-            });
-            let _ = tx.send(result);
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.send(Err(format!(
+                        "failed to initialize registry runtime: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            let result = runtime.block_on(async { DotrainRegistry::new(url).await });
+            let _ = tx.send(result.map_err(|error| error.to_string()));
         });
-        let registry = rx.await.map_err(|_| {
+
+        let registry_result = rx.await.map_err(|_| {
             RaindexClientProviderError::RegistryLoad("registry loader thread panicked".into())
-        })??;
+        })?;
+        let registry = registry_result.map_err(RaindexClientProviderError::RegistryLoad)?;
         Ok(Self { registry })
     }
 
-    pub(crate) fn registry(&self) -> &DotrainRegistry {
-        &self.registry
+    pub(crate) fn get_raindex_client(&self) -> Result<RaindexClient, RaindexClientProviderError> {
+        self.registry
+            .get_raindex_client()
+            .map_err(|error| RaindexClientProviderError::ClientCreate(Box::new(error)))
     }
 }
 
@@ -37,8 +49,8 @@ impl RaindexClientProvider {
 pub(crate) enum RaindexClientProviderError {
     #[error("failed to load registry: {0}")]
     RegistryLoad(String),
-    #[error("failed to create raindex client: {0}")]
-    ClientCreate(String),
+    #[error("failed to create raindex client")]
+    ClientCreate(#[source] Box<DotrainRegistryError>),
 }
 
 impl From<RaindexClientProviderError> for ApiError {
@@ -97,7 +109,18 @@ mod tests {
     #[rocket::async_test]
     async fn test_load_succeeds_with_valid_registry() {
         let config = crate::test_helpers::mock_raindex_config().await;
-        assert!(!config.registry().settings().is_empty());
+        let client = config.get_raindex_client();
+        assert!(client.is_ok());
+    }
+
+    #[rocket::async_test]
+    async fn test_get_raindex_client_fails_with_invalid_settings() {
+        let config = crate::test_helpers::mock_invalid_raindex_config().await;
+        let client = config.get_raindex_client();
+        assert!(matches!(
+            client.unwrap_err(),
+            RaindexClientProviderError::ClientCreate(_)
+        ));
     }
 
     #[test]
@@ -108,7 +131,9 @@ mod tests {
             matches!(api_err, ApiError::Internal(msg) if msg == "registry configuration error")
         );
 
-        let err = RaindexClientProviderError::ClientCreate("test".into());
+        let err = RaindexClientProviderError::ClientCreate(Box::new(
+            DotrainRegistryError::InvalidRegistryFormat("test".into()),
+        ));
         let api_err: ApiError = err.into();
         assert!(
             matches!(api_err, ApiError::Internal(msg) if msg == "failed to initialize orderbook client")
