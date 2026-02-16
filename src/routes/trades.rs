@@ -28,12 +28,13 @@ use tracing::Instrument;
 pub async fn get_trades_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)
@@ -61,13 +62,14 @@ pub async fn get_trades_by_tx(
 pub async fn get_trades_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)

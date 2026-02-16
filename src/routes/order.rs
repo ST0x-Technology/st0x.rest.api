@@ -28,13 +28,14 @@ use tracing::Instrument;
 pub async fn post_order_dca(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<DeployDcaOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)
@@ -59,13 +60,14 @@ pub async fn post_order_dca(
 pub async fn post_order_solver(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)
@@ -92,12 +94,13 @@ pub async fn post_order_solver(
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
         tracing::info!(order_hash = ?order_hash, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)
@@ -123,13 +126,14 @@ pub async fn get_order(
 pub async fn post_order_cancel(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)

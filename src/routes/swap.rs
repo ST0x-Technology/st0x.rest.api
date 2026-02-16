@@ -26,13 +26,14 @@ use tracing::Instrument;
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)
@@ -57,13 +58,14 @@ pub async fn post_swap_quote(
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    _raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
         todo!()
     }
     .instrument(span.0)
