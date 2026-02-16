@@ -43,6 +43,54 @@ impl RaindexProvider {
             .get_raindex_client()
             .map_err(|error| RaindexProviderError::ClientCreate(Box::new(error)))
     }
+
+    pub(crate) async fn run_with_client<T, F, Fut>(
+        &self,
+        f: F,
+    ) -> Result<T, RaindexProviderError>
+    where
+        T: Send + 'static,
+        F: FnOnce(RaindexClient) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+    {
+        let registry = self.registry.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<T, String>>();
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to build client runtime");
+                    let _ = tx.send(Err(format!("runtime: {error}")));
+                    return;
+                }
+            };
+
+            let result = runtime.block_on(async {
+                let client = registry
+                    .get_raindex_client()
+                    .map_err(|e| format!("client: {e}"))?;
+                Ok(f(client).await)
+            });
+
+            let _ = tx.send(result);
+        });
+
+        rx.await
+            .map_err(|_| {
+                RaindexProviderError::RuntimeInit("client worker thread panicked".into())
+            })?
+            .map_err(|e| {
+                if e.starts_with("runtime: ") {
+                    RaindexProviderError::RuntimeInit(e)
+                } else {
+                    RaindexProviderError::ClientInit(e)
+                }
+            })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +99,10 @@ pub(crate) enum RaindexProviderError {
     RegistryLoad(String),
     #[error("failed to create raindex client")]
     ClientCreate(#[source] Box<DotrainRegistryError>),
+    #[error("failed to initialize raindex client: {0}")]
+    ClientInit(String),
+    #[error("failed to initialize client runtime: {0}")]
+    RuntimeInit(String),
 }
 
 impl From<RaindexProviderError> for ApiError {
@@ -60,8 +112,11 @@ impl From<RaindexProviderError> for ApiError {
             RaindexProviderError::RegistryLoad(_) => {
                 ApiError::Internal("registry configuration error".into())
             }
-            RaindexProviderError::ClientCreate(_) => {
+            RaindexProviderError::ClientCreate(_) | RaindexProviderError::ClientInit(_) => {
                 ApiError::Internal("failed to initialize orderbook client".into())
+            }
+            RaindexProviderError::RuntimeInit(_) => {
+                ApiError::Internal("failed to initialize client runtime".into())
             }
         }
     }
