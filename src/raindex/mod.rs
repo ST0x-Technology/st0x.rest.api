@@ -1,3 +1,3 @@
 pub(crate) mod config;
 
-pub(crate) use config::RaindexClientProvider;
+pub(crate) use config::RaindexProvider;

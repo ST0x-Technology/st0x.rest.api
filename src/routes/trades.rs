@@ -28,7 +28,7 @@ use tracing::Instrument;
 pub async fn get_trades_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
@@ -62,7 +62,7 @@ pub async fn get_trades_by_tx(
 pub async fn get_trades_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,

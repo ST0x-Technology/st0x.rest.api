@@ -4,12 +4,12 @@ use rain_orderbook_js_api::registry::DotrainRegistry;
 use rain_orderbook_js_api::registry::DotrainRegistryError;
 
 #[derive(Debug)]
-pub(crate) struct RaindexClientProvider {
+pub(crate) struct RaindexProvider {
     registry: DotrainRegistry,
 }
 
-impl RaindexClientProvider {
-    pub(crate) async fn load(registry_url: &str) -> Result<Self, RaindexClientProviderError> {
+impl RaindexProvider {
+    pub(crate) async fn load(registry_url: &str) -> Result<Self, RaindexProviderError> {
         let url = registry_url.to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<DotrainRegistry, String>>();
 
@@ -32,35 +32,35 @@ impl RaindexClientProvider {
         });
 
         let registry_result = rx.await.map_err(|_| {
-            RaindexClientProviderError::RegistryLoad("registry loader thread panicked".into())
+            RaindexProviderError::RegistryLoad("registry loader thread panicked".into())
         })?;
-        let registry = registry_result.map_err(RaindexClientProviderError::RegistryLoad)?;
+        let registry = registry_result.map_err(RaindexProviderError::RegistryLoad)?;
         Ok(Self { registry })
     }
 
-    pub(crate) fn get_raindex_client(&self) -> Result<RaindexClient, RaindexClientProviderError> {
+    pub(crate) fn get_raindex_client(&self) -> Result<RaindexClient, RaindexProviderError> {
         self.registry
             .get_raindex_client()
-            .map_err(|error| RaindexClientProviderError::ClientCreate(Box::new(error)))
+            .map_err(|error| RaindexProviderError::ClientCreate(Box::new(error)))
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RaindexClientProviderError {
+pub(crate) enum RaindexProviderError {
     #[error("failed to load registry: {0}")]
     RegistryLoad(String),
     #[error("failed to create raindex client")]
     ClientCreate(#[source] Box<DotrainRegistryError>),
 }
 
-impl From<RaindexClientProviderError> for ApiError {
-    fn from(e: RaindexClientProviderError) -> Self {
+impl From<RaindexProviderError> for ApiError {
+    fn from(e: RaindexProviderError) -> Self {
         tracing::error!(error = %e, "raindex client provider error");
         match e {
-            RaindexClientProviderError::RegistryLoad(_) => {
+            RaindexProviderError::RegistryLoad(_) => {
                 ApiError::Internal("registry configuration error".into())
             }
-            RaindexClientProviderError::ClientCreate(_) => {
+            RaindexProviderError::ClientCreate(_) => {
                 ApiError::Internal("failed to initialize orderbook client".into())
             }
         }
@@ -73,11 +73,11 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_load_fails_with_unreachable_url() {
-        let result = RaindexClientProvider::load("http://127.0.0.1:1/registry.txt").await;
+        let result = RaindexProvider::load("http://127.0.0.1:1/registry.txt").await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            RaindexClientProviderError::RegistryLoad(_)
+            RaindexProviderError::RegistryLoad(_)
         ));
     }
 
@@ -98,11 +98,11 @@ mod tests {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
 
-        let result = RaindexClientProvider::load(&format!("http://{addr}/registry.txt")).await;
+        let result = RaindexProvider::load(&format!("http://{addr}/registry.txt")).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            RaindexClientProviderError::RegistryLoad(_)
+            RaindexProviderError::RegistryLoad(_)
         ));
     }
 
@@ -119,19 +119,19 @@ mod tests {
         let client = config.get_raindex_client();
         assert!(matches!(
             client.unwrap_err(),
-            RaindexClientProviderError::ClientCreate(_)
+            RaindexProviderError::ClientCreate(_)
         ));
     }
 
     #[test]
     fn test_error_maps_to_api_error() {
-        let err = RaindexClientProviderError::RegistryLoad("test".into());
+        let err = RaindexProviderError::RegistryLoad("test".into());
         let api_err: ApiError = err.into();
         assert!(
             matches!(api_err, ApiError::Internal(msg) if msg == "registry configuration error")
         );
 
-        let err = RaindexClientProviderError::ClientCreate(Box::new(
+        let err = RaindexProviderError::ClientCreate(Box::new(
             DotrainRegistryError::InvalidRegistryFormat("test".into()),
         ));
         let api_err: ApiError = err.into();

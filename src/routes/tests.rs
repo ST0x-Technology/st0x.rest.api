@@ -1,5 +1,5 @@
 use crate::error::ApiError;
-use crate::raindex::RaindexClientProvider;
+use crate::raindex::RaindexProvider;
 use crate::test_helpers::mock_invalid_raindex_config;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
@@ -7,7 +7,7 @@ use rocket::State;
 
 #[get("/raindex-client")]
 async fn get_raindex_client_contract(
-    provider: &State<RaindexClientProvider>,
+    provider: &State<RaindexProvider>,
 ) -> Result<&'static str, ApiError> {
     let _client = provider.get_raindex_client().map_err(ApiError::from)?;
     Ok("ok")

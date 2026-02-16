@@ -9,7 +9,7 @@ pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
     token_list_url: Option<String>,
     raindex_registry_url: Option<String>,
-    raindex_config: Option<crate::raindex::RaindexClientProvider>,
+    raindex_config: Option<crate::raindex::RaindexProvider>,
 }
 
 impl TestClientBuilder {
@@ -32,7 +32,7 @@ impl TestClientBuilder {
         self
     }
 
-    pub(crate) fn raindex_config(mut self, config: crate::raindex::RaindexClientProvider) -> Self {
+    pub(crate) fn raindex_config(mut self, config: crate::raindex::RaindexProvider) -> Self {
         self.raindex_config = Some(config);
         self
     }
@@ -60,7 +60,7 @@ impl TestClientBuilder {
                     Some(url) => url,
                     None => mock_raindex_registry_url().await,
                 };
-                crate::raindex::RaindexClientProvider::load(&registry_url)
+                crate::raindex::RaindexProvider::load(&registry_url)
                     .await
                     .expect("mock raindex config from registry url")
             }
@@ -106,16 +106,16 @@ async fn mock_token_list_url() -> String {
     format!("http://{addr}")
 }
 
-pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexClientProvider {
+pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
     let registry_url = mock_raindex_registry_url().await;
-    crate::raindex::RaindexClientProvider::load(&registry_url)
+    crate::raindex::RaindexProvider::load(&registry_url)
         .await
         .expect("mock raindex config")
 }
 
-pub(crate) async fn mock_invalid_raindex_config() -> crate::raindex::RaindexClientProvider {
+pub(crate) async fn mock_invalid_raindex_config() -> crate::raindex::RaindexProvider {
     let registry_url = mock_raindex_registry_url_with_settings("not valid yaml: [").await;
-    crate::raindex::RaindexClientProvider::load(&registry_url)
+    crate::raindex::RaindexProvider::load(&registry_url)
         .await
         .expect("mock invalid raindex config")
 }

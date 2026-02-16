@@ -26,7 +26,7 @@ use tracing::Instrument;
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
@@ -58,7 +58,7 @@ pub async fn post_swap_quote(
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexClientProvider>,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {

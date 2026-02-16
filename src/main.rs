@@ -100,7 +100,7 @@ fn configure_cors() -> Result<rocket_cors::Cors, String> {
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
-    raindex_config: raindex::RaindexClientProvider,
+    raindex_config: raindex::RaindexProvider,
 ) -> Result<rocket::Rocket<rocket::Build>, String> {
     let cors = configure_cors()?;
 
@@ -184,7 +184,7 @@ async fn main() {
                 }
             };
 
-            let raindex_config = match raindex::RaindexClientProvider::load(&registry_url).await {
+            let raindex_config = match raindex::RaindexProvider::load(&registry_url).await {
                 Ok(config) => {
                     tracing::info!(registry_url = %registry_url, "raindex registry loaded");
                     config
