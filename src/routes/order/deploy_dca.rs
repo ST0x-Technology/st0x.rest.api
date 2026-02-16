@@ -1,10 +1,10 @@
 use super::helpers::map_deployment_to_response;
+use super::{OrderDeployer, RealOrderDeployer};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::order::{DeployDcaOrderRequest, DeployOrderResponse, PeriodUnit};
 use rain_orderbook_app_settings::order::VaultType;
-use rain_orderbook_js_api::registry::DotrainRegistry;
 use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
@@ -46,9 +46,22 @@ pub async fn post_order_dca(
     async move {
         tracing::info!(body = ?req, "request received");
         let response = raindex
-            .run_with_registry(
-                move |registry| async move { process_deploy_dca(registry, req).await },
-            )
+            .run_with_registry(move |registry| async move {
+                let gui = registry
+                    .get_gui(
+                        ORDER_KEY.to_string(),
+                        DEPLOYMENT_KEY.to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "failed to create GUI");
+                        ApiError::Internal("failed to initialize order configuration".into())
+                    })?;
+                let mut gui = RealOrderDeployer { gui };
+                process_deploy_dca(&mut gui, req).await
+            })
             .await
             .map_err(ApiError::from)??;
         Ok(Json(response))
@@ -57,89 +70,40 @@ pub async fn post_order_dca(
     .await
 }
 
-async fn process_deploy_dca(
-    registry: DotrainRegistry,
+pub(crate) async fn process_deploy_dca(
+    gui: &mut dyn OrderDeployer,
     req: DeployDcaOrderRequest,
 ) -> Result<DeployOrderResponse, ApiError> {
-    let mut gui = registry
-        .get_gui(
-            ORDER_KEY.to_string(),
-            DEPLOYMENT_KEY.to_string(),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to create GUI");
-            ApiError::Internal("failed to initialize order configuration".into())
-        })?;
-
     gui.set_select_token(INPUT_TOKEN_KEY.to_string(), req.input_token.to_string())
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set input token");
-            ApiError::BadRequest(format!("invalid input token: {e}"))
-        })?;
+        .await?;
 
     gui.set_select_token(OUTPUT_TOKEN_KEY.to_string(), req.output_token.to_string())
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set output token");
-            ApiError::BadRequest(format!("invalid output token: {e}"))
-        })?;
+        .await?;
 
-    gui.set_field_value(FIELD_BUDGET_AMOUNT.to_string(), req.budget_amount.clone())
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set budget amount");
-            ApiError::BadRequest(format!("invalid budget amount: {e}"))
-        })?;
+    gui.set_field_value(FIELD_BUDGET_AMOUNT.to_string(), req.budget_amount.clone())?;
 
-    gui.set_field_value(FIELD_PERIOD.to_string(), req.period.to_string())
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set period");
-            ApiError::BadRequest(format!("invalid period: {e}"))
-        })?;
+    gui.set_field_value(FIELD_PERIOD.to_string(), req.period.to_string())?;
 
     let period_unit_value = match req.period_unit {
         PeriodUnit::Days => "days",
         PeriodUnit::Hours => "hours",
         PeriodUnit::Minutes => "minutes",
     };
-    gui.set_field_value(FIELD_PERIOD_UNIT.to_string(), period_unit_value.to_string())
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set period unit");
-            ApiError::BadRequest(format!("invalid period unit: {e}"))
-        })?;
+    gui.set_field_value(FIELD_PERIOD_UNIT.to_string(), period_unit_value.to_string())?;
 
-    gui.set_field_value(FIELD_START_IO.to_string(), req.start_io)
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set start io");
-            ApiError::BadRequest(format!("invalid start io: {e}"))
-        })?;
+    gui.set_field_value(FIELD_START_IO.to_string(), req.start_io)?;
 
-    gui.set_field_value(FIELD_FLOOR_IO.to_string(), req.floor_io)
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set floor io");
-            ApiError::BadRequest(format!("invalid floor io: {e}"))
-        })?;
+    gui.set_field_value(FIELD_FLOOR_IO.to_string(), req.floor_io)?;
 
     gui.set_deposit(DEPOSIT_TOKEN_KEY.to_string(), req.budget_amount)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set deposit");
-            ApiError::BadRequest(format!("invalid deposit: {e}"))
-        })?;
+        .await?;
 
     if let Some(vault_id) = req.input_vault_id {
         gui.set_vault_id(
             VaultType::Input,
             INPUT_TOKEN_KEY.to_string(),
             Some(vault_id.to_string()),
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set input vault id");
-            ApiError::BadRequest(format!("invalid input vault id: {e}"))
-        })?;
+        )?;
     }
 
     if let Some(vault_id) = req.output_vault_id {
@@ -147,30 +111,49 @@ async fn process_deploy_dca(
             VaultType::Output,
             OUTPUT_TOKEN_KEY.to_string(),
             Some(vault_id.to_string()),
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to set output vault id");
-            ApiError::BadRequest(format!("invalid output vault id: {e}"))
-        })?;
+        )?;
     }
 
     let args = gui
         .get_deployment_transaction_args(req.owner.to_string())
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to get deployment transaction args");
-            ApiError::Internal(format!("failed to build deployment transaction: {e}"))
-        })?;
+        .await?;
 
     map_deployment_to_response(args)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::routes::order::test_fixtures::{
+        mock_deployment_args, mock_deployment_args_with_approval, MockOrderDeployer, MOCK_ORDERBOOK,
+    };
     use crate::test_helpers::{
         basic_auth_header, mock_invalid_raindex_config, seed_api_key, TestClientBuilder,
     };
+    use alloy::primitives::{Address, U256};
     use rocket::http::{ContentType, Header, Status};
+
+    fn dca_request(
+        input_vault_id: Option<U256>,
+        output_vault_id: Option<U256>,
+    ) -> DeployDcaOrderRequest {
+        DeployDcaOrderRequest {
+            owner: Address::left_padding_from(&[1]),
+            input_token: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+                .parse()
+                .unwrap(),
+            output_token: "0x4200000000000000000000000000000000000006"
+                .parse()
+                .unwrap(),
+            budget_amount: "1000000".to_string(),
+            period: 4,
+            period_unit: PeriodUnit::Hours,
+            start_io: "0.0005".to_string(),
+            floor_io: "0.0003".to_string(),
+            input_vault_id,
+            output_vault_id,
+        }
+    }
 
     #[rocket::async_test]
     async fn test_deploy_dca_401_without_auth() {
@@ -204,5 +187,56 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+    }
+
+    #[rocket::async_test]
+    async fn test_deploy_dca_success() {
+        let args = mock_deployment_args();
+        let mut gui = MockOrderDeployer::success(args);
+        let req = dca_request(None, None);
+        let response = process_deploy_dca(&mut gui, req).await.unwrap();
+        assert_eq!(response.to, MOCK_ORDERBOOK);
+        assert_eq!(
+            response.data,
+            alloy::primitives::Bytes::from(vec![0x01, 0x02, 0x03])
+        );
+        assert_eq!(response.value, U256::ZERO);
+        assert!(response.approvals.is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn test_deploy_dca_success_with_approvals() {
+        let args = mock_deployment_args_with_approval();
+        let mut gui = MockOrderDeployer::success(args);
+        let req = dca_request(None, None);
+        let response = process_deploy_dca(&mut gui, req).await.unwrap();
+        assert_eq!(response.approvals.len(), 1);
+        let approval = &response.approvals[0];
+        assert_eq!(approval.symbol, "USDC");
+        assert_eq!(approval.amount, "1000000");
+        assert_eq!(approval.spender, MOCK_ORDERBOOK);
+    }
+
+    #[rocket::async_test]
+    async fn test_deploy_dca_success_with_vault_ids() {
+        let args = mock_deployment_args();
+        let mut gui = MockOrderDeployer::success(args);
+        let req = dca_request(Some(U256::from(1)), Some(U256::from(2)));
+        let response = process_deploy_dca(&mut gui, req).await.unwrap();
+        assert_eq!(response.to, MOCK_ORDERBOOK);
+        assert!(response.approvals.is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn test_deploy_dca_deployment_args_fails() {
+        let mut gui = MockOrderDeployer {
+            deployment_args_result: Err(ApiError::Internal(
+                "failed to build deployment transaction".into(),
+            )),
+            ..MockOrderDeployer::success(mock_deployment_args())
+        };
+        let req = dca_request(None, None);
+        let result = process_deploy_dca(&mut gui, req).await;
+        assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 }
