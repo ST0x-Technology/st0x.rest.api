@@ -23,6 +23,8 @@ pub struct SwapQuoteResponse {
     pub output_token: Address,
     #[schema(example = "1000000")]
     pub output_amount: String,
+    #[schema(example = "1000000")]
+    pub estimated_output: String,
     #[schema(example = "500000000000000")]
     pub estimated_input: String,
     #[schema(example = "0.0005")]

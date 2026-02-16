@@ -95,6 +95,11 @@ async fn process_swap_quote(
         ApiError::Internal("failed to compute ratio".into())
     })?;
 
+    let formatted_output = sim.total_output.format().map_err(|e| {
+        tracing::error!(error = %e, "failed to format estimated output");
+        ApiError::Internal("failed to format estimated output".into())
+    })?;
+
     let formatted_input = sim.total_input.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated input");
         ApiError::Internal("failed to format estimated input".into())
@@ -109,6 +114,7 @@ async fn process_swap_quote(
         input_token: req.input_token,
         output_token: req.output_token,
         output_amount: req.output_amount,
+        estimated_output: formatted_output,
         estimated_input: formatted_input,
         estimated_io_ratio: formatted_ratio,
     })
@@ -147,6 +153,7 @@ mod tests {
         assert_eq!(result.input_token, USDC);
         assert_eq!(result.output_token, WETH);
         assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "150");
         assert_eq!(result.estimated_io_ratio, "1.5");
     }
@@ -160,6 +167,7 @@ mod tests {
         let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
         assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "250");
         assert_eq!(result.estimated_io_ratio, "2.5");
     }
@@ -172,8 +180,9 @@ mod tests {
         };
         let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
-        assert_eq!(result.estimated_input, "60");
         assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "30");
+        assert_eq!(result.estimated_input, "60");
     }
 
     #[rocket::async_test]
