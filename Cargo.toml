@@ -12,7 +12,7 @@ thiserror = "2"
 utoipa = { version = "5", features = ["rocket_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["rocket"] }
 tokio = { version = "1", features = ["full"] }
-alloy = { version = "1.0.9", default-features = false, features = ["std", "serde"] }
+alloy = { version = "=1.0.12", default-features = false, features = ["std", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
@@ -24,3 +24,6 @@ argon2 = "0.5.3"
 base64 = "0.22.1"
 clap = { version = "4.5.58", features = ["derive"] }
 reqwest = { version = "0.13.2", features = ["json"] }
+rain_orderbook_js_api = { path = "lib/rain.orderbook/crates/js_api", default-features = false }
+rain_orderbook_common = { path = "lib/rain.orderbook/crates/common", default-features = false }
+wasm-bindgen = "=0.2.100"
