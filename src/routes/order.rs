@@ -9,6 +9,7 @@ use crate::types::order::{
 use alloy::primitives::B256;
 use async_trait::async_trait;
 use rain_orderbook_common::parsed_meta::ParsedMeta;
+use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
 use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
 use rain_orderbook_common::raindex_client::RaindexClient;
@@ -19,7 +20,7 @@ use tracing::Instrument;
 #[async_trait(?Send)]
 trait OrderDataSource {
     async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError>;
-    async fn get_order_io_ratio(&self, order: &RaindexOrder) -> String;
+    async fn get_order_quotes(&self, order: &RaindexOrder) -> Vec<RaindexOrderQuote>;
     async fn get_order_trades(&self, order: &RaindexOrder) -> Vec<RaindexTrade>;
 }
 
@@ -43,16 +44,12 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
             })
     }
 
-    async fn get_order_io_ratio(&self, order: &RaindexOrder) -> String {
+    async fn get_order_quotes(&self, order: &RaindexOrder) -> Vec<RaindexOrderQuote> {
         match order.get_quotes(None, None).await {
-            Ok(quotes) => quotes
-                .first()
-                .and_then(|q| q.data.as_ref())
-                .map(|d| d.formatted_ratio.clone())
-                .unwrap_or_default(),
+            Ok(quotes) => quotes,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to fetch order quotes");
-                String::new()
+                vec![]
             }
         }
     }
@@ -74,7 +71,12 @@ async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<Order
         .into_iter()
         .next()
         .ok_or_else(|| ApiError::NotFound("order not found".into()))?;
-    let io_ratio = ds.get_order_io_ratio(&order).await;
+    let quotes = ds.get_order_quotes(&order).await;
+    let io_ratio = quotes
+        .first()
+        .and_then(|q| q.data.as_ref())
+        .map(|d| d.formatted_ratio.clone())
+        .unwrap_or_else(|| "-".into());
     let trades = ds.get_order_trades(&order).await;
     let order_type = determine_order_type(&order);
     build_order_detail(&order, order_type, &io_ratio, &trades)
@@ -477,10 +479,33 @@ mod tests {
         serde_json::from_value(trade_json()).expect("deserialize mock RaindexTrade")
     }
 
+    fn quote_json(formatted_ratio: &str) -> serde_json::Value {
+        json!({
+            "pair": { "pairName": "USDC/WETH", "inputIndex": 0, "outputIndex": 0 },
+            "blockNumber": 1,
+            "data": {
+                "maxOutput": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "formattedMaxOutput": "1",
+                "maxInput": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                "formattedMaxInput": "2",
+                "ratio": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                "formattedRatio": formatted_ratio,
+                "inverseRatio": "0xffffffff00000000000000000000000000000000000000000000000000000005",
+                "formattedInverseRatio": "0.5"
+            },
+            "success": true,
+            "error": null
+        })
+    }
+
+    fn mock_quote(formatted_ratio: &str) -> RaindexOrderQuote {
+        serde_json::from_value(quote_json(formatted_ratio)).expect("deserialize mock quote")
+    }
+
     struct MockOrderDataSource {
         orders: Result<Vec<RaindexOrder>, ApiError>,
         trades: Vec<RaindexTrade>,
-        io_ratio: String,
+        quotes: Vec<RaindexOrderQuote>,
     }
 
     #[async_trait(?Send)]
@@ -491,8 +516,8 @@ mod tests {
                 Err(_) => Err(ApiError::Internal("failed to query orders".into())),
             }
         }
-        async fn get_order_io_ratio(&self, _order: &RaindexOrder) -> String {
-            self.io_ratio.clone()
+        async fn get_order_quotes(&self, _order: &RaindexOrder) -> Vec<RaindexOrderQuote> {
+            self.quotes.clone()
         }
         async fn get_order_trades(&self, _order: &RaindexOrder) -> Vec<RaindexTrade> {
             self.trades.clone()
@@ -510,7 +535,7 @@ mod tests {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
             trades: vec![mock_trade()],
-            io_ratio: "1.5".into(),
+            quotes: vec![mock_quote("1.5")],
         };
         let detail = process_get_order(&ds, test_hash()).await.unwrap();
 
@@ -540,7 +565,7 @@ mod tests {
         let ds = MockOrderDataSource {
             orders: Ok(vec![]),
             trades: vec![],
-            io_ratio: String::new(),
+            quotes: vec![],
         };
         let result = process_get_order(&ds, test_hash()).await;
         assert!(matches!(result, Err(ApiError::NotFound(_))));
@@ -551,7 +576,7 @@ mod tests {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
             trades: vec![],
-            io_ratio: "2.0".into(),
+            quotes: vec![mock_quote("2.0")],
         };
         let detail = process_get_order(&ds, test_hash()).await.unwrap();
         assert!(detail.trades.is_empty());
@@ -563,7 +588,7 @@ mod tests {
         let ds = MockOrderDataSource {
             orders: Err(ApiError::Internal("failed to query orders".into())),
             trades: vec![],
-            io_ratio: String::new(),
+            quotes: vec![],
         };
         let result = process_get_order(&ds, test_hash()).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
