@@ -8,6 +8,7 @@ pub(crate) async fn client() -> Client {
 pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
     token_list_url: Option<String>,
+    raindex_config: Option<crate::raindex::RaindexClientProvider>,
 }
 
 impl TestClientBuilder {
@@ -15,6 +16,7 @@ impl TestClientBuilder {
         Self {
             rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
             token_list_url: None,
+            raindex_config: None,
         }
     }
 
@@ -25,6 +27,11 @@ impl TestClientBuilder {
 
     pub(crate) fn token_list_url(mut self, url: impl Into<String>) -> Self {
         self.token_list_url = Some(url.into());
+        self
+    }
+
+    pub(crate) fn raindex_config(mut self, config: crate::raindex::RaindexClientProvider) -> Self {
+        self.raindex_config = Some(config);
         self
     }
 
@@ -39,7 +46,12 @@ impl TestClientBuilder {
             None => mock_token_list_url().await,
         };
 
-        let rocket = crate::rocket(pool, self.rate_limiter)
+        let raindex_config = match self.raindex_config {
+            Some(config) => config,
+            None => mock_raindex_config().await,
+        };
+
+        let rocket = crate::rocket(pool, self.rate_limiter, raindex_config)
             .expect("valid rocket instance")
             .manage(crate::routes::tokens::TokensConfig::with_url(
                 token_list_url,
@@ -77,6 +89,77 @@ async fn mock_token_list_url() -> String {
     });
 
     format!("http://{addr}")
+}
+
+pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexClientProvider {
+    let settings = r#"version: 4
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+subgraphs:
+  base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
+orderbooks:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+tokens:
+  token1:
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    network: base
+"#;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock registry server");
+    let addr = listener.local_addr().expect("mock registry server address");
+
+    let registry_body = format!("http://{addr}/settings.yaml");
+    let settings_body = settings.to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+
+            let registry_body = registry_body.clone();
+            let settings_body = settings_body.clone();
+
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+
+                let body = if request.contains("/settings.yaml") {
+                    &settings_body
+                } else {
+                    &registry_body
+                };
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            });
+        }
+    });
+
+    let registry_url = format!("http://{addr}/registry.txt");
+    crate::raindex::RaindexClientProvider::load(&registry_url)
+        .await
+        .expect("mock raindex config")
 }
 
 pub(crate) async fn seed_api_key(client: &Client) -> (String, String) {

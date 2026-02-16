@@ -61,7 +61,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_load_fails_with_unreachable_url() {
-        let result = RaindexClientProvider::load("http://192.0.2.1:1/registry.txt").await;
+        let result = RaindexClientProvider::load("http://127.0.0.1:1/registry.txt").await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
