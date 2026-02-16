@@ -42,6 +42,39 @@ impl RaindexProvider {
             })
     }
 
+    pub(crate) async fn run_with_registry<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
+    where
+        T: Send + 'static,
+        F: FnOnce(DotrainRegistry) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+    {
+        let registry = self.registry.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<T, WorkerError>>();
+
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to build registry runtime");
+                    let _ = tx.send(Err(WorkerError::RuntimeInit(error)));
+                    return;
+                }
+            };
+
+            let _ = tx.send(Ok(runtime.block_on(f(registry))));
+        });
+
+        rx.await
+            .map_err(|_| RaindexProviderError::WorkerPanicked)?
+            .map_err(|e| match e {
+                WorkerError::RuntimeInit(e) => RaindexProviderError::RegistryRuntimeInit(e),
+                WorkerError::Api(e) => RaindexProviderError::RegistryLoad(e),
+            })
+    }
+
     pub(crate) async fn run_with_client<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
     where
         T: Send + 'static,

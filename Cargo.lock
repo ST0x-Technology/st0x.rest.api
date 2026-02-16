@@ -8873,6 +8873,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "clap",
+ "rain_orderbook_app_settings",
+ "rain_orderbook_bindings",
  "rain_orderbook_common",
  "rain_orderbook_js_api",
  "rand 0.9.1",

@@ -2,6 +2,7 @@ mod cancel;
 mod deploy_dca;
 mod deploy_solver;
 mod get_order;
+mod helpers;
 
 use crate::error::ApiError;
 use alloy::primitives::{Bytes, B256};
