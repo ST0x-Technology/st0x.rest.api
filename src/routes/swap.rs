@@ -5,7 +5,7 @@ use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapQuoteRequest, SwapQuoteResponse,
 };
 use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, State};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -26,6 +26,7 @@ use tracing::Instrument;
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
@@ -56,6 +57,7 @@ pub async fn post_swap_quote(
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {

@@ -4,7 +4,7 @@ use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{ValidatedAddress, ValidatedFixedBytes};
 use crate::types::orders::{OrdersByTxResponse, OrdersListResponse, OrdersPaginationParams};
 use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, State};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -28,6 +28,7 @@ use tracing::Instrument;
 pub async fn get_orders_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrdersByTxResponse>, ApiError> {
@@ -60,6 +61,7 @@ pub async fn get_orders_by_tx(
 pub async fn get_orders_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,

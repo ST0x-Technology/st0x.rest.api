@@ -7,7 +7,7 @@ use crate::types::order::{
     DeploySolverOrderRequest, OrderDetail,
 };
 use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, State};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -28,6 +28,7 @@ use tracing::Instrument;
 pub async fn post_order_dca(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<DeployDcaOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
@@ -58,6 +59,7 @@ pub async fn post_order_dca(
 pub async fn post_order_solver(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
@@ -90,6 +92,7 @@ pub async fn post_order_solver(
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
@@ -120,6 +123,7 @@ pub async fn get_order(
 pub async fn post_order_cancel(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    _raindex: &State<crate::raindex::RaindexClientProvider>,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
