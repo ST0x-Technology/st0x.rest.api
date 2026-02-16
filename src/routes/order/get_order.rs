@@ -14,23 +14,6 @@ use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
 
-async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<OrderDetail, ApiError> {
-    let orders = ds.get_orders_by_hash(hash).await?;
-    let order = orders
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::NotFound("order not found".into()))?;
-    let quotes = ds.get_order_quotes(&order).await.unwrap_or_default();
-    let io_ratio = quotes
-        .first()
-        .and_then(|q| q.data.as_ref())
-        .map(|d| d.formatted_ratio.clone())
-        .unwrap_or_else(|| "-".into());
-    let trades = ds.get_order_trades(&order).await.unwrap_or_default();
-    let order_type = determine_order_type(&order);
-    build_order_detail(&order, order_type, &io_ratio, &trades)
-}
-
 #[utoipa::path(
     get,
     path = "/v1/order/{order_hash}",
@@ -69,6 +52,23 @@ pub async fn get_order(
     }
     .instrument(span.0)
     .await
+}
+
+async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<OrderDetail, ApiError> {
+    let orders = ds.get_orders_by_hash(hash).await?;
+    let order = orders
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::NotFound("order not found".into()))?;
+    let quotes = ds.get_order_quotes(&order).await.unwrap_or_default();
+    let io_ratio = quotes
+        .first()
+        .and_then(|q| q.data.as_ref())
+        .map(|d| d.formatted_ratio.clone())
+        .unwrap_or_else(|| "-".into());
+    let trades = ds.get_order_trades(&order).await.unwrap_or_default();
+    let order_type = determine_order_type(&order);
+    build_order_detail(&order, order_type, &io_ratio, &trades)
 }
 
 fn determine_order_type(order: &RaindexOrder) -> OrderType {
