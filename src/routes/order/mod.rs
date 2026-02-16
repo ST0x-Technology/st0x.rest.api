@@ -15,8 +15,14 @@ use rocket::Route;
 #[async_trait(?Send)]
 pub(crate) trait OrderDataSource {
     async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError>;
-    async fn get_order_quotes(&self, order: &RaindexOrder) -> Vec<RaindexOrderQuote>;
-    async fn get_order_trades(&self, order: &RaindexOrder) -> Vec<RaindexTrade>;
+    async fn get_order_quotes(
+        &self,
+        order: &RaindexOrder,
+    ) -> Result<Vec<RaindexOrderQuote>, ApiError>;
+    async fn get_order_trades(
+        &self,
+        order: &RaindexOrder,
+    ) -> Result<Vec<RaindexTrade>, ApiError>;
 }
 
 pub(crate) struct RaindexOrderDataSource<'a> {
@@ -39,24 +45,24 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
             })
     }
 
-    async fn get_order_quotes(&self, order: &RaindexOrder) -> Vec<RaindexOrderQuote> {
-        match order.get_quotes(None, None).await {
-            Ok(quotes) => quotes,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to fetch order quotes");
-                vec![]
-            }
-        }
+    async fn get_order_quotes(
+        &self,
+        order: &RaindexOrder,
+    ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
+        order.get_quotes(None, None).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to query order quotes");
+            ApiError::Internal("failed to query order quotes".into())
+        })
     }
 
-    async fn get_order_trades(&self, order: &RaindexOrder) -> Vec<RaindexTrade> {
-        match order.get_trades_list(None, None, None).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to fetch order trades");
-                vec![]
-            }
-        }
+    async fn get_order_trades(
+        &self,
+        order: &RaindexOrder,
+    ) -> Result<Vec<RaindexTrade>, ApiError> {
+        order.get_trades_list(None, None, None).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to query order trades");
+            ApiError::Internal("failed to query order trades".into())
+        })
     }
 }
 
