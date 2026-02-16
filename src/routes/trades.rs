@@ -34,8 +34,10 @@ pub async fn get_trades_by_tx(
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -69,8 +71,10 @@ pub async fn get_trades_by_address(
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await

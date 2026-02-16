@@ -33,8 +33,10 @@ pub async fn post_swap_quote(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -65,8 +67,10 @@ pub async fn post_swap_calldata(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await

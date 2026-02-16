@@ -35,8 +35,10 @@ pub async fn post_order_dca(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -67,8 +69,10 @@ pub async fn post_order_solver(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -100,8 +104,10 @@ pub async fn get_order(
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
         tracing::info!(order_hash = ?order_hash, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -133,8 +139,10 @@ pub async fn post_order_cancel(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let _client = raindex.get_raindex_client().map_err(ApiError::from)?;
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await

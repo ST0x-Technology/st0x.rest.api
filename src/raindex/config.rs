@@ -1,7 +1,6 @@
 use crate::error::ApiError;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_js_api::registry::DotrainRegistry;
-use rain_orderbook_js_api::registry::DotrainRegistryError;
 
 enum WorkerError {
     RuntimeInit(std::io::Error),
@@ -41,12 +40,6 @@ impl RaindexProvider {
                 WorkerError::RuntimeInit(e) => RaindexProviderError::RegistryRuntimeInit(e),
                 WorkerError::Api(e) => RaindexProviderError::RegistryLoad(e),
             })
-    }
-
-    pub(crate) fn get_raindex_client(&self) -> Result<RaindexClient, RaindexProviderError> {
-        self.registry
-            .get_raindex_client()
-            .map_err(|error| RaindexProviderError::ClientCreate(Box::new(error)))
     }
 
     pub(crate) async fn run_with_client<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
@@ -96,8 +89,6 @@ pub(crate) enum RaindexProviderError {
     RegistryLoad(String),
     #[error("failed to initialize registry runtime")]
     RegistryRuntimeInit(#[source] std::io::Error),
-    #[error("failed to create raindex client")]
-    ClientCreate(#[source] Box<DotrainRegistryError>),
     #[error("failed to create raindex client: {0}")]
     ClientInit(String),
     #[error("failed to initialize client runtime")]
@@ -114,7 +105,7 @@ impl From<RaindexProviderError> for ApiError {
             | RaindexProviderError::RegistryRuntimeInit(_) => {
                 ApiError::Internal("registry configuration error".into())
             }
-            RaindexProviderError::ClientCreate(_) | RaindexProviderError::ClientInit(_) => {
+            RaindexProviderError::ClientInit(_) => {
                 ApiError::Internal("failed to initialize orderbook client".into())
             }
             RaindexProviderError::ClientRuntimeInit(_) | RaindexProviderError::WorkerPanicked => {
@@ -166,18 +157,8 @@ mod tests {
     #[rocket::async_test]
     async fn test_load_succeeds_with_valid_registry() {
         let config = crate::test_helpers::mock_raindex_config().await;
-        let client = config.get_raindex_client();
-        assert!(client.is_ok());
-    }
-
-    #[rocket::async_test]
-    async fn test_get_raindex_client_fails_with_invalid_settings() {
-        let config = crate::test_helpers::mock_invalid_raindex_config().await;
-        let client = config.get_raindex_client();
-        assert!(matches!(
-            client.unwrap_err(),
-            RaindexProviderError::ClientCreate(_)
-        ));
+        let result = config.run_with_client(|_client| async { "ok" }).await;
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -188,9 +169,7 @@ mod tests {
             matches!(api_err, ApiError::Internal(msg) if msg == "registry configuration error")
         );
 
-        let err = RaindexProviderError::ClientCreate(Box::new(
-            DotrainRegistryError::InvalidRegistryFormat("test".into()),
-        ));
+        let err = RaindexProviderError::ClientInit("test".into());
         let api_err: ApiError = err.into();
         assert!(
             matches!(api_err, ApiError::Internal(msg) if msg == "failed to initialize orderbook client")
