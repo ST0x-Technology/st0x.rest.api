@@ -3,6 +3,11 @@ use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_js_api::registry::DotrainRegistry;
 use rain_orderbook_js_api::registry::DotrainRegistryError;
 
+enum WorkerError {
+    RuntimeInit(std::io::Error),
+    Api(String),
+}
+
 #[derive(Debug)]
 pub(crate) struct RaindexProvider {
     registry: DotrainRegistry,
@@ -11,7 +16,7 @@ pub(crate) struct RaindexProvider {
 impl RaindexProvider {
     pub(crate) async fn load(registry_url: &str) -> Result<Self, RaindexProviderError> {
         let url = registry_url.to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<DotrainRegistry, String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<DotrainRegistry, WorkerError>>();
 
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -20,22 +25,22 @@ impl RaindexProvider {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = tx.send(Err(format!(
-                        "failed to initialize registry runtime: {error}"
-                    )));
+                    let _ = tx.send(Err(WorkerError::RuntimeInit(error)));
                     return;
                 }
             };
 
             let result = runtime.block_on(async { DotrainRegistry::new(url).await });
-            let _ = tx.send(result.map_err(|error| error.to_string()));
+            let _ = tx.send(result.map_err(|e| WorkerError::Api(e.to_string())));
         });
 
-        let registry_result = rx.await.map_err(|_| {
-            RaindexProviderError::RegistryLoad("registry loader thread panicked".into())
-        })?;
-        let registry = registry_result.map_err(RaindexProviderError::RegistryLoad)?;
-        Ok(Self { registry })
+        rx.await
+            .map_err(|_| RaindexProviderError::WorkerPanicked)?
+            .map(|registry| Self { registry })
+            .map_err(|e| match e {
+                WorkerError::RuntimeInit(e) => RaindexProviderError::RegistryRuntimeInit(e),
+                WorkerError::Api(e) => RaindexProviderError::RegistryLoad(e),
+            })
     }
 
     pub(crate) fn get_raindex_client(&self) -> Result<RaindexClient, RaindexProviderError> {
@@ -44,17 +49,14 @@ impl RaindexProvider {
             .map_err(|error| RaindexProviderError::ClientCreate(Box::new(error)))
     }
 
-    pub(crate) async fn run_with_client<T, F, Fut>(
-        &self,
-        f: F,
-    ) -> Result<T, RaindexProviderError>
+    pub(crate) async fn run_with_client<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
     where
         T: Send + 'static,
         F: FnOnce(RaindexClient) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T>,
     {
         let registry = self.registry.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<T, String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<T, WorkerError>>();
 
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -64,7 +66,7 @@ impl RaindexProvider {
                 Ok(rt) => rt,
                 Err(error) => {
                     tracing::error!(error = %error, "failed to build client runtime");
-                    let _ = tx.send(Err(format!("runtime: {error}")));
+                    let _ = tx.send(Err(WorkerError::RuntimeInit(error)));
                     return;
                 }
             };
@@ -72,7 +74,7 @@ impl RaindexProvider {
             let result = runtime.block_on(async {
                 let client = registry
                     .get_raindex_client()
-                    .map_err(|e| format!("client: {e}"))?;
+                    .map_err(|e| WorkerError::Api(e.to_string()))?;
                 Ok(f(client).await)
             });
 
@@ -80,15 +82,10 @@ impl RaindexProvider {
         });
 
         rx.await
-            .map_err(|_| {
-                RaindexProviderError::RuntimeInit("client worker thread panicked".into())
-            })?
-            .map_err(|e| {
-                if e.starts_with("runtime: ") {
-                    RaindexProviderError::RuntimeInit(e)
-                } else {
-                    RaindexProviderError::ClientInit(e)
-                }
+            .map_err(|_| RaindexProviderError::WorkerPanicked)?
+            .map_err(|e| match e {
+                WorkerError::RuntimeInit(e) => RaindexProviderError::ClientRuntimeInit(e),
+                WorkerError::Api(e) => RaindexProviderError::ClientInit(e),
             })
     }
 }
@@ -97,25 +94,30 @@ impl RaindexProvider {
 pub(crate) enum RaindexProviderError {
     #[error("failed to load registry: {0}")]
     RegistryLoad(String),
+    #[error("failed to initialize registry runtime")]
+    RegistryRuntimeInit(#[source] std::io::Error),
     #[error("failed to create raindex client")]
     ClientCreate(#[source] Box<DotrainRegistryError>),
-    #[error("failed to initialize raindex client: {0}")]
+    #[error("failed to create raindex client: {0}")]
     ClientInit(String),
-    #[error("failed to initialize client runtime: {0}")]
-    RuntimeInit(String),
+    #[error("failed to initialize client runtime")]
+    ClientRuntimeInit(#[source] std::io::Error),
+    #[error("worker thread panicked")]
+    WorkerPanicked,
 }
 
 impl From<RaindexProviderError> for ApiError {
     fn from(e: RaindexProviderError) -> Self {
         tracing::error!(error = %e, "raindex client provider error");
         match e {
-            RaindexProviderError::RegistryLoad(_) => {
+            RaindexProviderError::RegistryLoad(_)
+            | RaindexProviderError::RegistryRuntimeInit(_) => {
                 ApiError::Internal("registry configuration error".into())
             }
             RaindexProviderError::ClientCreate(_) | RaindexProviderError::ClientInit(_) => {
                 ApiError::Internal("failed to initialize orderbook client".into())
             }
-            RaindexProviderError::RuntimeInit(_) => {
+            RaindexProviderError::ClientRuntimeInit(_) | RaindexProviderError::WorkerPanicked => {
                 ApiError::Internal("failed to initialize client runtime".into())
             }
         }

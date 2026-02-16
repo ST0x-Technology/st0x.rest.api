@@ -17,7 +17,8 @@ async fn get_raindex_client_contract(
 async fn run_with_client_contract(
     provider: &State<RaindexProvider>,
 ) -> Result<&'static str, ApiError> {
-    let orderbook_address = alloy::primitives::address!("0xd2938e7c9fe3597f78832ce780feb61945c377d7");
+    let orderbook_address =
+        alloy::primitives::address!("0xd2938e7c9fe3597f78832ce780feb61945c377d7");
 
     provider
         .run_with_client(move |client| async move {
