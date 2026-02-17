@@ -2,11 +2,13 @@ mod calldata;
 mod quote;
 
 use crate::error::ApiError;
-use alloy::primitives::Address;
+use crate::types::swap::SwapCalldataResponse;
+use alloy::primitives::{Address, Bytes, U256};
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::orders::{
     GetOrdersFilters, GetOrdersTokenFilter, RaindexOrder,
 };
+use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::take_orders::{
     build_take_order_candidates_for_pair, TakeOrderCandidate,
@@ -72,6 +74,79 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     }
 }
 
+#[async_trait(?Send)]
+pub(crate) trait SwapCalldataDataSource {
+    async fn get_calldata(
+        &self,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataResponse, ApiError>;
+}
+
+#[async_trait(?Send)]
+impl<'a> SwapCalldataDataSource for RaindexSwapDataSource<'a> {
+    async fn get_calldata(
+        &self,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataResponse, ApiError> {
+        use rain_orderbook_common::raindex_client::RaindexError;
+        let result = self
+            .client
+            .get_take_orders_calldata(request)
+            .await
+            .map_err(|e| match &e {
+                RaindexError::SameTokenPair
+                | RaindexError::NonPositiveAmount
+                | RaindexError::NegativePriceCap
+                | RaindexError::FromHexError(_)
+                | RaindexError::Float(_) => {
+                    tracing::warn!(error = %e, "bad request for calldata");
+                    ApiError::BadRequest(e.to_string())
+                }
+                RaindexError::NoLiquidity | RaindexError::InsufficientLiquidity { .. } => {
+                    tracing::warn!(error = %e, "no liquidity for calldata");
+                    ApiError::NotFound(e.to_string())
+                }
+                _ => {
+                    tracing::error!(error = %e, "failed to generate calldata");
+                    ApiError::Internal("failed to generate calldata".into())
+                }
+            })?;
+
+        if let Some(approval) = result.approval_info() {
+            let formatted = approval.formatted_amount().to_string();
+            Ok(SwapCalldataResponse {
+                to: approval.spender(),
+                data: Bytes::new(),
+                value: U256::ZERO,
+                estimated_input: formatted.clone(),
+                approvals: vec![crate::types::common::Approval {
+                    token: approval.token(),
+                    spender: approval.spender(),
+                    amount: formatted,
+                    symbol: String::new(),
+                    approval_data: approval.calldata().clone(),
+                }],
+            })
+        } else if let Some(info) = result.take_orders_info() {
+            let estimated_input = info.expected_sell().format().map_err(|e| {
+                tracing::error!(error = %e, "failed to format expected sell");
+                ApiError::Internal("failed to format expected sell".into())
+            })?;
+            Ok(SwapCalldataResponse {
+                to: info.orderbook(),
+                data: info.calldata().clone(),
+                value: U256::ZERO,
+                estimated_input,
+                approvals: vec![],
+            })
+        } else {
+            Err(ApiError::Internal(
+                "unexpected calldata result state".into(),
+            ))
+        }
+    }
+}
+
 pub use calldata::*;
 pub use quote::*;
 
@@ -81,13 +156,15 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use super::SwapDataSource;
+    use super::{SwapCalldataDataSource, SwapDataSource};
     use crate::error::ApiError;
+    use crate::types::swap::SwapCalldataResponse;
     use alloy::primitives::{Address, U256};
     use async_trait::async_trait;
     use rain_math_float::Float;
     use rain_orderbook_bindings::IOrderBookV6::{EvaluableV4, OrderV4, IOV2};
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
+    use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
     use rain_orderbook_common::take_orders::TakeOrderCandidate;
 
     pub struct MockSwapDataSource {
@@ -144,6 +221,23 @@ pub(crate) mod test_fixtures {
             output_io_index: 0,
             max_output: Float::parse(max_output.to_string()).unwrap(),
             ratio: Float::parse(ratio.to_string()).unwrap(),
+        }
+    }
+
+    pub struct MockSwapCalldataDataSource {
+        pub result: Result<SwapCalldataResponse, ApiError>,
+    }
+
+    #[async_trait(?Send)]
+    impl SwapCalldataDataSource for MockSwapCalldataDataSource {
+        async fn get_calldata(
+            &self,
+            _request: TakeOrdersRequest,
+        ) -> Result<SwapCalldataResponse, ApiError> {
+            match &self.result {
+                Ok(r) => Ok(r.clone()),
+                Err(e) => Err(e.clone()),
+            }
         }
     }
 }
