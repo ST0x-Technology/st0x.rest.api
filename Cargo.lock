@@ -3139,7 +3139,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-appender",
- "tracing-log",
  "tracing-subscriber",
  "tracing-test",
  "utoipa",
