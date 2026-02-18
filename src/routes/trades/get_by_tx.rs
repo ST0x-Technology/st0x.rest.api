@@ -1,4 +1,4 @@
-use super::{RaindexTradesTxDataSource, TradesTxDataSource};
+use super::{RaindexTradesDataSource, TradesDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -44,7 +44,7 @@ pub async fn get_trades_by_tx(
         tracing::info!(tx_hash = ?tx_hash, "request received");
         raindex
             .run_with_client(move |client| async move {
-                let trades_ds = RaindexTradesTxDataSource { client: &client };
+                let trades_ds = RaindexTradesDataSource { client: &client };
                 let order_ds = crate::routes::order::RaindexOrderDataSource { client: &client };
                 process_get_trades_by_tx(&trades_ds, &order_ds, tx_hash.0).await
             })
@@ -56,7 +56,7 @@ pub async fn get_trades_by_tx(
 }
 
 pub(super) async fn process_get_trades_by_tx(
-    trades_ds: &dyn TradesTxDataSource,
+    trades_ds: &dyn TradesDataSource,
     order_ds: &dyn OrderDataSource,
     tx_hash: B256,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
@@ -238,28 +238,38 @@ mod tests {
     use crate::test_helpers::{
         basic_auth_header, mock_invalid_raindex_config, seed_api_key, TestClientBuilder,
     };
-    use alloy::primitives::{address, Bytes};
+    use alloy::primitives::{address, Address, Bytes};
     use async_trait::async_trait;
-    use rain_orderbook_common::raindex_client::trades::RaindexTrade;
+    use rain_orderbook_common::raindex_client::trades::{RaindexTrade, RaindexTradesListResult};
+    use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
     use rocket::http::{Header, Status};
 
-    struct MockTradesTxDataSource {
+    struct MockTradesDataSource {
         result: Result<Vec<RaindexTrade>, ApiError>,
     }
 
     #[async_trait(?Send)]
-    impl TradesTxDataSource for MockTradesTxDataSource {
+    impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(&self, _tx_hash: B256) -> Result<Vec<RaindexTrade>, ApiError> {
             match &self.result {
                 Ok(trades) => Ok(trades.clone()),
                 Err(e) => Err(e.clone()),
             }
         }
+
+        async fn get_trades_for_owner(
+            &self,
+            _owner: Address,
+            _pagination: PaginationParams,
+            _time_filter: TimeFilter,
+        ) -> Result<RaindexTradesListResult, ApiError> {
+            unimplemented!()
+        }
     }
 
     #[rocket::async_test]
     async fn test_process_success() {
-        let trades_ds = MockTradesTxDataSource {
+        let trades_ds = MockTradesDataSource {
             result: Ok(vec![mock_trade()]),
         };
         let order_ds = MockOrderDataSource {
@@ -294,7 +304,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_process_tx_not_found() {
-        let trades_ds = MockTradesTxDataSource { result: Ok(vec![]) };
+        let trades_ds = MockTradesDataSource { result: Ok(vec![]) };
         let order_ds = MockOrderDataSource {
             orders: Ok(vec![]),
             trades: vec![],
@@ -314,7 +324,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_process_tx_not_indexed() {
-        let trades_ds = MockTradesTxDataSource {
+        let trades_ds = MockTradesDataSource {
             result: Err(ApiError::NotYetIndexed("not indexed".into())),
         };
         let order_ds = MockOrderDataSource {
@@ -336,7 +346,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_process_query_failure() {
-        let trades_ds = MockTradesTxDataSource {
+        let trades_ds = MockTradesDataSource {
             result: Err(ApiError::Internal("subgraph error".into())),
         };
         let order_ds = MockOrderDataSource {

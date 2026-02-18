@@ -11,6 +11,9 @@
   - `nix develop -c cargo fmt`
   - `nix develop -c rainix-rs-static`
 
+## Submodules
+- Never modify submodule code directly; request changes upstream and update the submodule pointer to the new commit
+
 ## Code Rules
 - Never use `expect` or `unwrap` in production code; handle errors gracefully or exit with a message
 - Every route handler must log appropriately using tracing (request received, errors, key decisions)
