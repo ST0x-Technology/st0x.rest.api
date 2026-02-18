@@ -32,6 +32,8 @@ pub enum ApiError {
     Internal(String),
     #[error("Rate limited: {0}")]
     RateLimited(String),
+    #[error("Not yet indexed: {0}")]
+    NotYetIndexed(String),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -42,6 +44,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
             ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
             ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
             ApiError::RateLimited(msg) => (Status::TooManyRequests, "RATE_LIMITED", msg.clone()),
+            ApiError::NotYetIndexed(msg) => (Status::Accepted, "NOT_YET_INDEXED", msg.clone()),
         };
         let span = request_span_for(req);
         span.in_scope(|| {
@@ -51,6 +54,13 @@ impl<'r> Responder<'r, 'static> for ApiError {
                     code = %code,
                     error_message = %message,
                     "request failed"
+                );
+            } else if matches!(self, ApiError::NotYetIndexed(_)) {
+                tracing::info!(
+                    status = status.code,
+                    code = %code,
+                    error_message = %message,
+                    "transaction not yet indexed"
                 );
             } else {
                 tracing::warn!(
