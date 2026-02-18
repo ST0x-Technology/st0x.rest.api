@@ -30,4 +30,5 @@ rain_orderbook_common = { path = "lib/rain.orderbook/crates/common", default-fea
 rain_orderbook_app_settings = { path = "lib/rain.orderbook/crates/settings", default-features = false }
 rain_orderbook_bindings = { path = "lib/rain.orderbook/crates/bindings", default-features = false }
 rain-math-float = { path = "lib/rain.orderbook/lib/rain.interpreter/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
+futures = "0.3"
 wasm-bindgen = "=0.2.100"

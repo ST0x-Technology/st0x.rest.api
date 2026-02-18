@@ -18,3 +18,4 @@
 - All API errors must go through the `ApiError` enum, never return raw status codes
 - Keep OpenAPI annotations (`#[utoipa::path(...)]`) in sync when adding or modifying routes
 - Do not commit `.env` or secrets; use `.env.example` for documenting env vars
+- Use the `address!` macro from `alloy::primitives` for creating `Address` constants instead of parsing from strings
