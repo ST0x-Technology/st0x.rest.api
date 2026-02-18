@@ -2,23 +2,32 @@ pub(crate) mod get_by_address;
 pub(crate) mod get_by_tx;
 
 use crate::error::ApiError;
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
-use rain_orderbook_common::raindex_client::trades::RaindexTrade;
+use rain_orderbook_common::raindex_client::trades::{RaindexTrade, RaindexTradesListResult};
+use rain_orderbook_common::raindex_client::types::{
+    OrderbookIdentifierParams, PaginationParams, TimeFilter,
+};
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::Route;
 
 #[async_trait(?Send)]
-pub(crate) trait TradesTxDataSource {
+pub(crate) trait TradesDataSource {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<Vec<RaindexTrade>, ApiError>;
+    async fn get_trades_for_owner(
+        &self,
+        owner: Address,
+        pagination: PaginationParams,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError>;
 }
 
-pub(crate) struct RaindexTradesTxDataSource<'a> {
+pub(crate) struct RaindexTradesDataSource<'a> {
     pub client: &'a RaindexClient,
 }
 
 #[async_trait(?Send)]
-impl TradesTxDataSource for RaindexTradesTxDataSource<'_> {
+impl TradesDataSource for RaindexTradesDataSource<'_> {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<Vec<RaindexTrade>, ApiError> {
         let orderbooks = self.client.get_all_orderbooks().map_err(|e| {
             tracing::error!(error = %e, "failed to get orderbooks");
@@ -52,6 +61,47 @@ impl TradesTxDataSource for RaindexTradesTxDataSource<'_> {
             }
         }
         Ok(all_trades)
+    }
+
+    async fn get_trades_for_owner(
+        &self,
+        owner: Address,
+        pagination: PaginationParams,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let orderbooks = self.client.get_all_orderbooks().map_err(|e| {
+            tracing::error!(error = %e, "failed to get orderbooks");
+            ApiError::Internal("failed to get orderbooks".into())
+        })?;
+
+        let mut all_trades: Vec<RaindexTrade> = Vec::new();
+        let mut total_count: u64 = 0;
+
+        for ob_cfg in orderbooks.values() {
+            let ob_id_params =
+                OrderbookIdentifierParams::new(ob_cfg.network.chain_id, ob_cfg.address.to_string());
+            match self
+                .client
+                .get_trades_for_owner(
+                    ob_id_params,
+                    owner.to_string(),
+                    pagination.clone(),
+                    time_filter.clone(),
+                )
+                .await
+            {
+                Ok(result) => {
+                    all_trades.extend(result.trades());
+                    total_count += result.total_count();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to query trades for owner");
+                    return Err(ApiError::Internal("failed to query trades".into()));
+                }
+            }
+        }
+
+        Ok(RaindexTradesListResult::new(all_trades, total_count))
     }
 }
 
