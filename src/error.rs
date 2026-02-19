@@ -26,6 +26,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
     #[error("Not found: {0}")]
     NotFound(String),
     #[error("Internal error: {0}")]
@@ -39,6 +41,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
         let (status, code, message) = match &self {
             ApiError::BadRequest(msg) => (Status::BadRequest, "BAD_REQUEST", msg.clone()),
             ApiError::Unauthorized(msg) => (Status::Unauthorized, "UNAUTHORIZED", msg.clone()),
+            ApiError::Forbidden(msg) => (Status::Forbidden, "FORBIDDEN", msg.clone()),
             ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
             ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
             ApiError::RateLimited(msg) => (Status::TooManyRequests, "RATE_LIMITED", msg.clone()),
