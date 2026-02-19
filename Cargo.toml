@@ -16,10 +16,12 @@ alloy = { version = "1.0.9", default-features = false, features = ["std", "serde
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-tracing-log = "0.2"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "migrate"] }
 argon2 = "0.5.3"
 base64 = "0.22.1"
 clap = { version = "4.5.58", features = ["derive"] }
+
+[dev-dependencies]
+tracing-test = "0.2"
