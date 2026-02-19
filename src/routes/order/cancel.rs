@@ -75,15 +75,17 @@ async fn process_cancel_order(
     let mut tokens_returned = Vec::new();
 
     for vault in inputs.iter().chain(outputs.iter()) {
-        let balance_str = vault.formatted_balance();
-        let balance: f64 = balance_str.parse().unwrap_or(0.0);
-        if balance > 0.0 {
+        let balance = vault.balance();
+        let is_zero = balance
+            .is_zero()
+            .map_err(|e| ApiError::Internal(format!("failed to check vault balance: {e}")))?;
+        if !is_zero {
             vaults_to_withdraw += 1;
             let token_info = vault.token();
             tokens_returned.push(TokenReturn {
                 token: token_info.address(),
                 symbol: token_info.symbol().unwrap_or_default(),
-                amount: balance_str,
+                amount: vault.formatted_balance(),
             });
         }
     }
