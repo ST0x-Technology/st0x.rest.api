@@ -30,6 +30,14 @@ impl Modify for SecurityAddon {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum StartupError {
+    #[error("invalid HTTP method in CORS config: {0}")]
+    InvalidMethod(String),
+    #[error("CORS configuration failed: {0}")]
+    Cors(#[from] rocket_cors::Error),
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -64,16 +72,15 @@ impl Modify for SecurityAddon {
 )]
 struct ApiDoc;
 
-fn configure_cors() -> Result<rocket_cors::Cors, String> {
+fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     let allowed_methods: AllowedMethods = ["Get", "Post", "Options"]
         .iter()
         .map(|s| {
-            std::str::FromStr::from_str(s)
-                .map_err(|_| format!("invalid HTTP method in CORS config: {s}"))
+            std::str::FromStr::from_str(s).map_err(|_| StartupError::InvalidMethod(s.to_string()))
         })
         .collect::<Result<_, _>>()?;
 
-    CorsOptions {
+    Ok(CorsOptions {
         allowed_origins: AllowedOrigins::all(),
         allowed_methods,
         allowed_headers: AllowedHeaders::all(),
@@ -81,11 +88,10 @@ fn configure_cors() -> Result<rocket_cors::Cors, String> {
         expose_headers: HashSet::from(["X-Request-Id".to_string()]),
         ..Default::default()
     }
-    .to_cors()
-    .map_err(|e| format!("CORS configuration failed: {e}"))
+    .to_cors()?)
 }
 
-fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, String> {
+fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
