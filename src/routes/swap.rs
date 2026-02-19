@@ -1,3 +1,4 @@
+use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::TracingSpan;
 use crate::types::swap::{
@@ -11,15 +12,18 @@ use tracing::Instrument;
     post,
     path = "/v1/swap/quote",
     tag = "Swap",
+    security(("basicAuth" = [])),
     request_body = SwapQuoteRequest,
     responses(
         (status = 200, description = "Swap quote", body = SwapQuoteResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
 pub async fn post_swap_quote(
+    _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
@@ -36,15 +40,18 @@ pub async fn post_swap_quote(
     post,
     path = "/v1/swap/calldata",
     tag = "Swap",
+    security(("basicAuth" = [])),
     request_body = SwapCalldataRequest,
     responses(
         (status = 200, description = "Swap calldata", body = SwapCalldataResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata(
+    _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {

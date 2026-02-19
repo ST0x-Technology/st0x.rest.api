@@ -1,3 +1,4 @@
+use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::TracingSpan;
 use crate::types::common::ValidatedFixedBytes;
@@ -13,15 +14,18 @@ use tracing::Instrument;
     post,
     path = "/v1/order/dca",
     tag = "Order",
+    security(("basicAuth" = [])),
     request_body = DeployDcaOrderRequest,
     responses(
         (status = 200, description = "DCA order deployment result", body = DeployOrderResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/dca", data = "<request>")]
 pub async fn post_order_dca(
+    _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<DeployDcaOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
@@ -38,15 +42,18 @@ pub async fn post_order_dca(
     post,
     path = "/v1/order/solver",
     tag = "Order",
+    security(("basicAuth" = [])),
     request_body = DeploySolverOrderRequest,
     responses(
         (status = 200, description = "Solver order deployment result", body = DeployOrderResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/solver", data = "<request>")]
 pub async fn post_order_solver(
+    _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
@@ -63,17 +70,20 @@ pub async fn post_order_solver(
     get,
     path = "/v1/order/{order_hash}",
     tag = "Order",
+    security(("basicAuth" = [])),
     params(
         ("order_hash" = String, Path, description = "The order hash"),
     ),
     responses(
         (status = 200, description = "Order details", body = OrderDetail),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "Order not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[get("/<order_hash>")]
 pub async fn get_order(
+    _key: AuthenticatedKey,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
@@ -89,16 +99,19 @@ pub async fn get_order(
     post,
     path = "/v1/order/cancel",
     tag = "Order",
+    security(("basicAuth" = [])),
     request_body = CancelOrderRequest,
     responses(
         (status = 200, description = "Cancel order result", body = CancelOrderResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "Order not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/cancel", data = "<request>")]
 pub async fn post_order_cancel(
+    _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {

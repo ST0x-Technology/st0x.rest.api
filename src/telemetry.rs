@@ -4,7 +4,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 static TELEMETRY_INIT: Once = Once::new();
 
-pub fn init() -> WorkerGuard {
+pub fn init() -> Result<WorkerGuard, String> {
     let mut guard_slot: Option<WorkerGuard> = None;
 
     TELEMETRY_INIT.call_once(|| {
@@ -57,5 +57,5 @@ pub fn init() -> WorkerGuard {
         guard_slot = Some(file_guard);
     });
 
-    guard_slot.expect("telemetry::init() called more than once")
+    guard_slot.ok_or_else(|| "telemetry::init() called more than once".to_string())
 }

@@ -18,6 +18,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "migrate"] }
+argon2 = "0.5.3"
+base64 = "0.22.1"
 
 [dev-dependencies]
 tracing-test = "0.2"
