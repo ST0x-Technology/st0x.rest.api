@@ -51,6 +51,8 @@ impl Modify for SecurityAddon {
         routes::orders::get_orders_by_address,
         routes::trades::get_trades_by_tx,
         routes::trades::get_trades_by_address,
+        routes::registry::get_registry,
+        routes::admin::put_registry,
     ),
     components(),
     modifiers(&SecurityAddon),
@@ -61,6 +63,8 @@ impl Modify for SecurityAddon {
         (name = "Order", description = "Order deployment and management endpoints"),
         (name = "Orders", description = "Order listing and query endpoints"),
         (name = "Trades", description = "Trade listing and query endpoints"),
+        (name = "Registry", description = "Registry information endpoints"),
+        (name = "Admin", description = "Admin management endpoints"),
     ),
     info(
         title = "st0x REST API",
@@ -71,7 +75,7 @@ impl Modify for SecurityAddon {
 struct ApiDoc;
 
 fn configure_cors() -> Result<rocket_cors::Cors, String> {
-    let allowed_methods: AllowedMethods = ["Get", "Post", "Options"]
+    let allowed_methods: AllowedMethods = ["Get", "Post", "Put", "Options"]
         .iter()
         .map(|s| {
             std::str::FromStr::from_str(s)
@@ -100,7 +104,7 @@ fn configure_cors() -> Result<rocket_cors::Cors, String> {
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
-    raindex_config: raindex::RaindexProvider,
+    raindex_config: raindex::SharedRaindexProvider,
 ) -> Result<rocket::Rocket<rocket::Build>, String> {
     let cors = configure_cors()?;
 
@@ -116,6 +120,8 @@ pub(crate) fn rocket(
         .mount("/v1/order", routes::order::routes())
         .mount("/v1/orders", routes::orders::routes())
         .mount("/v1/trades", routes::trades::routes())
+        .mount("/", routes::registry::routes())
+        .mount("/admin", routes::admin::routes())
         .mount(
             "/",
             SwaggerUi::new("/swagger/<tail..>").url("/api-doc/openapi.json", ApiDoc::openapi()),
@@ -175,13 +181,32 @@ async fn main() {
 
     match command {
         cli::Command::Serve => {
-            let registry_url = match std::env::var("REGISTRY_URL") {
-                Ok(url) if !url.is_empty() => url,
-                _ => {
-                    tracing::error!("REGISTRY_URL environment variable is required");
-                    drop(log_guard);
-                    std::process::exit(1);
+            let db_url = db::settings::get_setting(&pool, "registry_url")
+                .await
+                .ok()
+                .flatten();
+
+            let registry_url = match db_url {
+                Some(url) if !url.is_empty() => {
+                    tracing::info!(registry_url = %url, "loaded registry_url from database");
+                    url
                 }
+                _ => match std::env::var("REGISTRY_URL") {
+                    Ok(url) if !url.is_empty() => {
+                        if let Err(e) = db::settings::set_setting(&pool, "registry_url", &url).await
+                        {
+                            tracing::warn!(error = %e, "failed to seed registry_url into database");
+                        }
+                        url
+                    }
+                    _ => {
+                        tracing::error!(
+                            "registry_url not found in database and REGISTRY_URL env var is not set"
+                        );
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                },
             };
 
             let raindex_config = match raindex::RaindexProvider::load(&registry_url).await {
@@ -196,8 +221,9 @@ async fn main() {
                 }
             };
 
+            let shared_raindex = tokio::sync::RwLock::new(raindex_config);
             let rate_limiter = fairings::RateLimiter::new(global_rpm, per_key_rpm);
-            let rocket = match rocket(pool, rate_limiter, raindex_config) {
+            let rocket = match rocket(pool, rate_limiter, shared_raindex) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");
