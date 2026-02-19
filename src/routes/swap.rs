@@ -5,7 +5,7 @@ use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapQuoteRequest, SwapQuoteResponse,
 };
 use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, State};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -26,13 +26,17 @@ use tracing::Instrument;
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -56,13 +60,17 @@ pub async fn post_swap_quote(
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await

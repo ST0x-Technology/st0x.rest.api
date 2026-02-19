@@ -4,7 +4,7 @@ use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{ValidatedAddress, ValidatedFixedBytes};
 use crate::types::trades::{TradesByAddressResponse, TradesByTxResponse, TradesPaginationParams};
 use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, State};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -28,12 +28,16 @@ use tracing::Instrument;
 pub async fn get_trades_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -60,13 +64,17 @@ pub async fn get_trades_by_tx(
 pub async fn get_trades_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await

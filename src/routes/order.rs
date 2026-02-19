@@ -7,7 +7,7 @@ use crate::types::order::{
     DeploySolverOrderRequest, OrderDetail,
 };
 use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, State};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -28,13 +28,17 @@ use tracing::Instrument;
 pub async fn post_order_dca(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<DeployDcaOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -58,13 +62,17 @@ pub async fn post_order_dca(
 pub async fn post_order_solver(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -90,12 +98,16 @@ pub async fn post_order_solver(
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
         tracing::info!(order_hash = ?order_hash, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await
@@ -120,13 +132,17 @@ pub async fn get_order(
 pub async fn post_order_cancel(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    raindex: &State<crate::raindex::RaindexProvider>,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        todo!()
+        raindex
+            .run_with_client(move |_client| async move { todo!() })
+            .await
+            .map_err(ApiError::from)?
     }
     .instrument(span.0)
     .await

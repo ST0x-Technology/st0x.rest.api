@@ -7,6 +7,7 @@ mod cli;
 mod db;
 mod error;
 mod fairings;
+mod raindex;
 mod routes;
 mod telemetry;
 mod types;
@@ -105,6 +106,7 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
+    raindex_config: raindex::RaindexProvider,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
@@ -113,6 +115,7 @@ pub(crate) fn rocket(
     Ok(rocket::custom(figment)
         .manage(pool)
         .manage(rate_limiter)
+        .manage(raindex_config)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -178,8 +181,29 @@ async fn main() {
 
     match command {
         cli::Command::Serve => {
+            let registry_url = match std::env::var("REGISTRY_URL") {
+                Ok(url) if !url.is_empty() => url,
+                _ => {
+                    tracing::error!("REGISTRY_URL environment variable is required");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+
+            let raindex_config = match raindex::RaindexProvider::load(&registry_url).await {
+                Ok(config) => {
+                    tracing::info!(registry_url = %registry_url, "raindex registry loaded");
+                    config
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, registry_url = %registry_url, "failed to load raindex registry");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+
             let rate_limiter = fairings::RateLimiter::new(global_rpm, per_key_rpm);
-            let rocket = match rocket(pool, rate_limiter) {
+            let rocket = match rocket(pool, rate_limiter, raindex_config) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");
