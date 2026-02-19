@@ -3,6 +3,7 @@ extern crate rocket;
 
 mod auth;
 mod catchers;
+mod cli;
 mod db;
 mod error;
 mod fairings;
@@ -10,6 +11,7 @@ mod routes;
 mod telemetry;
 mod types;
 
+use clap::Parser;
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
@@ -115,6 +117,16 @@ fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupErro
 
 #[rocket::main]
 async fn main() {
+    let parsed = cli::Cli::parse();
+
+    let command = match parsed.command {
+        Some(cmd) => cmd,
+        None => {
+            cli::print_usage();
+            return;
+        }
+    };
+
     let log_guard = match telemetry::init() {
         Ok(guard) => guard,
         Err(e) => {
@@ -137,20 +149,33 @@ async fn main() {
         }
     };
 
-    let rocket = match rocket(pool) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to build Rocket instance");
-            drop(log_guard);
-            std::process::exit(1);
-        }
-    };
+    match command {
+        cli::Command::Serve => {
+            let rocket = match rocket(pool) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to build Rocket instance");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
 
-    if let Err(e) = rocket.launch().await {
-        tracing::error!(error = %e, "Rocket launch failed");
-        drop(log_guard);
-        std::process::exit(1);
+            if let Err(e) = rocket.launch().await {
+                tracing::error!(error = %e, "Rocket launch failed");
+                drop(log_guard);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Keys { command } => {
+            if let Err(e) = cli::handle_keys_command(command, pool).await {
+                tracing::error!(error = %e, "keys command failed");
+                drop(log_guard);
+                std::process::exit(1);
+            }
+        }
     }
+
+    drop(log_guard);
 }
 
 #[cfg(test)]
