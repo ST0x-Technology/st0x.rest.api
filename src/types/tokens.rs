@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -11,9 +12,9 @@ pub struct TokenInfo {
     pub symbol: String,
     #[schema(example = "USD Coin")]
     pub name: String,
-    #[serde(rename = "ISIN")]
+    #[serde(rename = "ISIN", skip_serializing_if = "Option::is_none")]
     #[schema(example = "US1234567890")]
-    pub isin: String,
+    pub isin: Option<String>,
     #[schema(example = 6)]
     pub decimals: u8,
 }
@@ -22,6 +23,24 @@ pub struct TokenInfo {
 #[serde(rename_all = "camelCase")]
 pub struct TokenListResponse {
     pub tokens: Vec<TokenInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteTokenList {
+    pub tokens: Vec<RemoteToken>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteToken {
+    pub chain_id: u32,
+    pub address: Address,
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u8,
+    #[serde(default)]
+    pub extensions: HashMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -36,7 +55,7 @@ mod tests {
                 .unwrap(),
             symbol: "USDC".into(),
             name: "USD Coin".into(),
-            isin: "US1234567890".into(),
+            isin: Some("US1234567890".into()),
             decimals: 6,
         };
         let json = serde_json::to_string(&token).unwrap();

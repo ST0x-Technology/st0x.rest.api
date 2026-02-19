@@ -59,7 +59,7 @@ impl Fairing for UsageLogger {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_helpers::{basic_auth_header, client, seed_api_key};
+    use crate::test_helpers::{basic_auth_header, client, seed_api_key, TestClientBuilder};
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -143,14 +143,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_rate_limited_authenticated_request_is_logged() {
         let rl = crate::fairings::RateLimiter::new(10000, 1);
-        let id = uuid::Uuid::new_v4();
-        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-            .await
-            .expect("database init");
-        let rocket = crate::rocket(pool, rl).expect("valid rocket instance");
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid client");
+        let client = TestClientBuilder::new().rate_limiter(rl).build().await;
 
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
@@ -198,14 +191,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_global_rate_limited_unauthenticated_requests_create_no_usage_log() {
         let rl = crate::fairings::RateLimiter::new(1, 10000);
-        let id = uuid::Uuid::new_v4();
-        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-            .await
-            .expect("database init");
-        let rocket = crate::rocket(pool, rl).expect("valid rocket instance");
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid client");
+        let client = TestClientBuilder::new().rate_limiter(rl).build().await;
 
         let first = client.get("/v1/tokens").dispatch().await;
         assert_eq!(first.status(), Status::Unauthorized);

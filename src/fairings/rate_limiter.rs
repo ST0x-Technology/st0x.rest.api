@@ -229,7 +229,7 @@ impl Fairing for RateLimitHeadersFairing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{basic_auth_header, client, seed_api_key};
+    use crate::test_helpers::{basic_auth_header, client, seed_api_key, TestClientBuilder};
     use rocket::http::{Header as HttpHeader, Status};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -450,14 +450,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_global_rate_limit_returns_429() {
         let rl = RateLimiter::new(2, 10000);
-        let id = uuid::Uuid::new_v4();
-        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-            .await
-            .expect("database init");
-        let rocket = crate::rocket(pool, rl).expect("valid rocket instance");
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid client");
+        let client = TestClientBuilder::new().rate_limiter(rl).build().await;
 
         let r1 = client.get("/v1/tokens").dispatch().await;
         assert_eq!(r1.status(), Status::Unauthorized);
@@ -606,14 +599,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_per_key_limit_is_hit_before_global_when_global_is_high() {
         let rl = RateLimiter::new(10000, 1);
-        let id = uuid::Uuid::new_v4();
-        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-            .await
-            .expect("database init");
-        let rocket = crate::rocket(pool, rl).expect("valid rocket instance");
-        let client = rocket::local::asynchronous::Client::tracked(rocket)
-            .await
-            .expect("valid client");
+        let client = TestClientBuilder::new().rate_limiter(rl).build().await;
 
         let (key_id, secret) = seed_api_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
