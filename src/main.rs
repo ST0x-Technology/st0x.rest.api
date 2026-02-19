@@ -11,6 +11,9 @@ mod routes;
 mod telemetry;
 mod types;
 
+#[cfg(test)]
+mod test_helpers;
+
 use clap::Parser;
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
@@ -93,7 +96,7 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     .to_cors()?)
 }
 
-fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
+pub(crate) fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
@@ -112,6 +115,7 @@ fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupErro
         )
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
+        .attach(fairings::UsageLogger)
         .attach(cors))
 }
 
@@ -180,47 +184,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use base64::Engine;
+    use crate::test_helpers::{basic_auth_header, client, seed_api_key};
     use rocket::http::{Header, Status};
-    use rocket::local::asynchronous::Client;
-
-    async fn client() -> Client {
-        let id = uuid::Uuid::new_v4();
-        let pool = db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-            .await
-            .expect("database init");
-        Client::tracked(rocket(pool).expect("valid rocket instance"))
-            .await
-            .expect("valid client")
-    }
-
-    async fn seed_api_key(client: &Client) -> (String, String) {
-        let key_id = uuid::Uuid::new_v4().to_string();
-        let secret = uuid::Uuid::new_v4().to_string();
-        let hash = auth::hash_secret(&secret).expect("hash secret");
-
-        let pool = client
-            .rocket()
-            .state::<db::DbPool>()
-            .expect("pool in state");
-        sqlx::query("INSERT INTO api_keys (key_id, secret_hash, label, owner) VALUES (?, ?, ?, ?)")
-            .bind(&key_id)
-            .bind(&hash)
-            .bind("test-key")
-            .bind("test-owner")
-            .execute(pool)
-            .await
-            .expect("insert api key");
-
-        (key_id, secret)
-    }
-
-    fn basic_auth_header(key_id: &str, secret: &str) -> String {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(format!("{key_id}:{secret}"));
-        format!("Basic {encoded}")
-    }
 
     #[rocket::async_test]
     async fn test_health_endpoint() {
@@ -272,7 +237,7 @@ mod tests {
 
         let pool = client
             .rocket()
-            .state::<db::DbPool>()
+            .state::<crate::db::DbPool>()
             .expect("pool in state");
         sqlx::query("UPDATE api_keys SET active = 0 WHERE key_id = ?")
             .bind(&key_id)
