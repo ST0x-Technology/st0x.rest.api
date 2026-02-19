@@ -2,14 +2,18 @@ mod cancel;
 mod deploy_dca;
 mod deploy_solver;
 mod get_order;
+mod helpers;
 
 use crate::error::ApiError;
 use alloy::primitives::{Bytes, B256};
 use async_trait::async_trait;
+use rain_orderbook_app_settings::order::VaultType;
 use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
 use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
 use rain_orderbook_common::raindex_client::RaindexClient;
+use rain_orderbook_js_api::gui::order_operations::DeploymentTransactionArgs;
+use rain_orderbook_js_api::gui::DotrainOrderGui;
 use rocket::Route;
 
 #[async_trait(?Send)]
@@ -68,6 +72,81 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
     }
 }
 
+#[async_trait(?Send)]
+pub(crate) trait OrderDeployer {
+    async fn set_select_token(&mut self, key: String, address: String) -> Result<(), ApiError>;
+    fn set_field_value(&mut self, field: String, value: String) -> Result<(), ApiError>;
+    async fn set_deposit(&mut self, token: String, amount: String) -> Result<(), ApiError>;
+    fn set_vault_id(
+        &mut self,
+        vault_type: VaultType,
+        token: String,
+        vault_id: Option<String>,
+    ) -> Result<(), ApiError>;
+    async fn get_deployment_transaction_args(
+        &mut self,
+        owner: String,
+    ) -> Result<DeploymentTransactionArgs, ApiError>;
+}
+
+pub(crate) struct RealOrderDeployer {
+    pub gui: DotrainOrderGui,
+}
+
+#[async_trait(?Send)]
+impl OrderDeployer for RealOrderDeployer {
+    async fn set_select_token(&mut self, key: String, address: String) -> Result<(), ApiError> {
+        self.gui
+            .set_select_token(key.clone(), address)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, key = %key, "failed to set select token");
+                ApiError::BadRequest(format!("invalid {key}: {e}"))
+            })
+    }
+
+    fn set_field_value(&mut self, field: String, value: String) -> Result<(), ApiError> {
+        self.gui.set_field_value(field.clone(), value).map_err(|e| {
+            tracing::error!(error = %e, field = %field, "failed to set field value");
+            ApiError::BadRequest(format!("invalid {field}: {e}"))
+        })
+    }
+
+    async fn set_deposit(&mut self, token: String, amount: String) -> Result<(), ApiError> {
+        self.gui.set_deposit(token, amount).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to set deposit");
+            ApiError::BadRequest(format!("invalid deposit: {e}"))
+        })
+    }
+
+    fn set_vault_id(
+        &mut self,
+        vault_type: VaultType,
+        token: String,
+        vault_id: Option<String>,
+    ) -> Result<(), ApiError> {
+        self.gui
+            .set_vault_id(vault_type, token, vault_id)
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to set vault id");
+                ApiError::BadRequest(format!("invalid vault id: {e}"))
+            })
+    }
+
+    async fn get_deployment_transaction_args(
+        &mut self,
+        owner: String,
+    ) -> Result<DeploymentTransactionArgs, ApiError> {
+        self.gui
+            .get_deployment_transaction_args(owner)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to get deployment transaction args");
+                ApiError::Internal(format!("failed to build deployment transaction: {e}"))
+            })
+    }
+}
+
 pub use cancel::*;
 pub use deploy_dca::*;
 pub use deploy_solver::*;
@@ -84,13 +163,19 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use super::OrderDataSource;
+    use super::{OrderDataSource, OrderDeployer};
     use crate::error::ApiError;
-    use alloy::primitives::{Bytes, B256};
+    use alloy::primitives::{address, Address, Bytes, B256};
+    use alloy::sol_types::SolCall;
     use async_trait::async_trait;
+    use rain_orderbook_app_settings::order::VaultType;
+    use rain_orderbook_bindings::IERC20::approveCall;
     use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rain_orderbook_common::raindex_client::trades::RaindexTrade;
+    use rain_orderbook_js_api::gui::order_operations::{
+        DeploymentTransactionArgs, ExtendedApprovalCalldata,
+    };
     use serde_json::json;
 
     pub fn stub_raindex_client() -> serde_json::Value {
@@ -316,6 +401,93 @@ pub(crate) mod test_fixtures {
                 Ok(bytes) => Ok(bytes.clone()),
                 Err(_) => Err(ApiError::Internal("failed to get remove calldata".into())),
             }
+        }
+    }
+
+    pub const MOCK_ORDERBOOK: Address = address!("1234567890abcdef1234567890abcdef12345678");
+    pub const MOCK_USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+
+    fn mock_approve_calldata(spender: Address, amount: alloy::primitives::U256) -> Bytes {
+        Bytes::from(approveCall { spender, amount }.abi_encode())
+    }
+
+    pub fn mock_deployment_args() -> DeploymentTransactionArgs {
+        DeploymentTransactionArgs {
+            approvals: vec![],
+            deployment_calldata: Bytes::from(vec![0x01, 0x02, 0x03]),
+            orderbook_address: MOCK_ORDERBOOK,
+            chain_id: 8453,
+            emit_meta_call: None,
+        }
+    }
+
+    pub fn mock_deployment_args_with_approval() -> DeploymentTransactionArgs {
+        let amount = alloy::primitives::U256::from(1_000_000u64);
+        DeploymentTransactionArgs {
+            approvals: vec![ExtendedApprovalCalldata {
+                token: MOCK_USDC,
+                calldata: mock_approve_calldata(MOCK_ORDERBOOK, amount),
+                symbol: "USDC".to_string(),
+            }],
+            deployment_calldata: Bytes::from(vec![0x01, 0x02, 0x03]),
+            orderbook_address: MOCK_ORDERBOOK,
+            chain_id: 8453,
+            emit_meta_call: None,
+        }
+    }
+
+    pub struct MockOrderDeployer {
+        pub set_select_token_result: Result<(), ApiError>,
+        pub set_field_value_result: Result<(), ApiError>,
+        pub set_deposit_result: Result<(), ApiError>,
+        pub set_vault_id_result: Result<(), ApiError>,
+        pub deployment_args_result: Result<DeploymentTransactionArgs, ApiError>,
+    }
+
+    impl MockOrderDeployer {
+        pub fn success(args: DeploymentTransactionArgs) -> Self {
+            Self {
+                set_select_token_result: Ok(()),
+                set_field_value_result: Ok(()),
+                set_deposit_result: Ok(()),
+                set_vault_id_result: Ok(()),
+                deployment_args_result: Ok(args),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl OrderDeployer for MockOrderDeployer {
+        async fn set_select_token(
+            &mut self,
+            _key: String,
+            _address: String,
+        ) -> Result<(), ApiError> {
+            self.set_select_token_result.clone()
+        }
+
+        fn set_field_value(&mut self, _field: String, _value: String) -> Result<(), ApiError> {
+            self.set_field_value_result.clone()
+        }
+
+        async fn set_deposit(&mut self, _token: String, _amount: String) -> Result<(), ApiError> {
+            self.set_deposit_result.clone()
+        }
+
+        fn set_vault_id(
+            &mut self,
+            _vault_type: VaultType,
+            _token: String,
+            _vault_id: Option<String>,
+        ) -> Result<(), ApiError> {
+            self.set_vault_id_result.clone()
+        }
+
+        async fn get_deployment_transaction_args(
+            &mut self,
+            _owner: String,
+        ) -> Result<DeploymentTransactionArgs, ApiError> {
+            self.deployment_args_result.clone()
         }
     }
 }

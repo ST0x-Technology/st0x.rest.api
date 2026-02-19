@@ -14,6 +14,8 @@ pub enum PeriodUnit {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployDcaOrderRequest {
+    #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub owner: Address,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -37,6 +39,8 @@ pub struct DeployDcaOrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploySolverOrderRequest {
+    #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub owner: Address,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]

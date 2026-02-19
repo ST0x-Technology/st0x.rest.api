@@ -20,7 +20,7 @@ pub struct ApiErrorResponse {
     pub error: ApiErrorDetail,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {
     #[error("Bad request: {0}")]
     BadRequest(String),
