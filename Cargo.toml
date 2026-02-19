@@ -17,7 +17,6 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-tracing-log = "0.2"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "migrate"] }
@@ -28,3 +27,6 @@ reqwest = { version = "0.13.2", features = ["json"] }
 rain_orderbook_js_api = { path = "lib/rain.orderbook/crates/js_api", default-features = false }
 rain_orderbook_common = { path = "lib/rain.orderbook/crates/common", default-features = false }
 wasm-bindgen = "=0.2.100"
+
+[dev-dependencies]
+tracing-test = "0.2"

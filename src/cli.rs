@@ -31,6 +31,8 @@ pub enum KeysCommand {
         label: String,
         #[arg(long)]
         owner: String,
+        #[arg(long, default_value_t = false)]
+        admin: bool,
     },
     #[command(about = "List all API keys")]
     List,
@@ -55,7 +57,11 @@ pub async fn handle_keys_command(
     pool: DbPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        KeysCommand::Create { label, owner } => create_key(&pool, &label, &owner).await,
+        KeysCommand::Create {
+            label,
+            owner,
+            admin,
+        } => create_key(&pool, &label, &owner, admin).await,
         KeysCommand::List => list_keys(&pool).await,
         KeysCommand::Revoke { key_id } => revoke_key(&pool, &key_id).await,
         KeysCommand::Delete { key_id } => delete_key(&pool, &key_id).await,
@@ -66,6 +72,7 @@ async fn create_key(
     pool: &DbPool,
     label: &str,
     owner: &str,
+    admin: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let key_id = uuid::Uuid::new_v4().to_string();
     let mut secret_bytes = [0u8; 32];
@@ -75,16 +82,19 @@ async fn create_key(
     let secret_hash =
         auth::hash_secret(&secret).map_err(|e| format!("failed to hash secret: {e}"))?;
 
-    sqlx::query("INSERT INTO api_keys (key_id, secret_hash, label, owner) VALUES (?, ?, ?, ?)")
-        .bind(&key_id)
-        .bind(&secret_hash)
-        .bind(label)
-        .bind(owner)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("failed to insert API key: {e}"))?;
+    sqlx::query(
+        "INSERT INTO api_keys (key_id, secret_hash, label, owner, is_admin) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&key_id)
+    .bind(&secret_hash)
+    .bind(label)
+    .bind(owner)
+    .bind(admin)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("failed to insert API key: {e}"))?;
 
-    tracing::info!(key_id = %key_id, label = %label, owner = %owner, "API key created");
+    tracing::info!(key_id = %key_id, label = %label, owner = %owner, admin = %admin, "API key created");
 
     println!();
     println!("API key created successfully");
@@ -93,6 +103,7 @@ async fn create_key(
     println!("Secret:  {secret}");
     println!("Label:   {label}");
     println!("Owner:   {owner}");
+    println!("Admin:   {admin}");
     println!();
     println!("IMPORTANT: Store the secret securely. It will not be shown again.");
     println!();
@@ -102,7 +113,7 @@ async fn create_key(
 
 async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
     let rows = sqlx::query_as::<_, auth::ApiKeyRow>(
-        "SELECT id, key_id, secret_hash, label, owner, active, created_at, updated_at \
+        "SELECT id, key_id, secret_hash, label, owner, active, is_admin, created_at, updated_at \
          FROM api_keys ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -116,15 +127,21 @@ async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "{:<38} {:<20} {:<30} {:<8} {:<20} {:<20}",
-        "KEY_ID", "LABEL", "OWNER", "ACTIVE", "CREATED_AT", "UPDATED_AT"
+        "{:<38} {:<20} {:<30} {:<8} {:<8} {:<20} {:<20}",
+        "KEY_ID", "LABEL", "OWNER", "ACTIVE", "ADMIN", "CREATED_AT", "UPDATED_AT"
     );
-    println!("{}", "-".repeat(136));
+    println!("{}", "-".repeat(144));
 
     for row in &rows {
         println!(
-            "{:<38} {:<20} {:<30} {:<8} {:<20} {:<20}",
-            row.key_id, row.label, row.owner, row.active, row.created_at, row.updated_at
+            "{:<38} {:<20} {:<30} {:<8} {:<8} {:<20} {:<20}",
+            row.key_id,
+            row.label,
+            row.owner,
+            row.active,
+            row.is_admin,
+            row.created_at,
+            row.updated_at
         );
     }
     println!();
@@ -204,6 +221,7 @@ mod tests {
             KeysCommand::Create {
                 label: "partner-x".into(),
                 owner: "contact@example.com".into(),
+                admin: false,
             },
             pool.clone(),
         )
@@ -211,7 +229,7 @@ mod tests {
         .expect("create key");
 
         let row = sqlx::query_as::<_, auth::ApiKeyRow>(
-            "SELECT id, key_id, secret_hash, label, owner, active, created_at, updated_at \
+            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, created_at, updated_at \
              FROM api_keys",
         )
         .fetch_one(&pool)
@@ -221,6 +239,7 @@ mod tests {
         assert_eq!(row.label, "partner-x");
         assert_eq!(row.owner, "contact@example.com");
         assert!(row.active);
+        assert!(!row.is_admin);
         assert!(PasswordHash::new(&row.secret_hash).is_ok());
     }
 

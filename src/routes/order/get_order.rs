@@ -32,13 +32,14 @@ use tracing::Instrument;
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
         tracing::info!(order_hash = ?order_hash, "request received");
         let hash = order_hash.0;
+        let raindex = shared_raindex.read().await;
         let detail = raindex
             .run_with_client(move |client| async move {
                 let ds = RaindexOrderDataSource { client: &client };

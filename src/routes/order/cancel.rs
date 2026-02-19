@@ -25,13 +25,14 @@ use tracing::Instrument;
 pub async fn post_order_cancel(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let raindex = shared_raindex.read().await;
         raindex
             .run_with_client(move |_client| async move { todo!() })
             .await
