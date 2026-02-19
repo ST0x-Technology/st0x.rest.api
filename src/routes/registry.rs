@@ -1,6 +1,6 @@
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
-use crate::fairings::TracingSpan;
+use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
@@ -26,6 +26,7 @@ pub struct RegistryResponse {
 )]
 #[get("/registry")]
 pub async fn get_registry(
+    _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<SharedRaindexProvider>,
     span: TracingSpan,

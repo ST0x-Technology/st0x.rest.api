@@ -1,7 +1,7 @@
 use crate::auth::AdminKey;
 use crate::db::{settings, DbPool};
 use crate::error::{ApiError, ApiErrorResponse};
-use crate::fairings::TracingSpan;
+use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::{RaindexProvider, SharedRaindexProvider};
 use crate::routes::registry::RegistryResponse;
 use rocket::serde::json::Json;
@@ -31,6 +31,7 @@ pub struct UpdateRegistryRequest {
 )]
 #[put("/registry", data = "<request>")]
 pub async fn put_registry(
+    _global: GlobalRateLimit,
     _admin: AdminKey,
     shared_raindex: &State<SharedRaindexProvider>,
     pool: &State<DbPool>,
@@ -54,6 +55,8 @@ pub async fn put_registry(
                 ApiError::BadRequest(format!("failed to load registry: {e}"))
             })?;
 
+        let mut guard = shared_raindex.write().await;
+
         settings::set_setting(pool, "registry_url", &req.registry_url)
             .await
             .map_err(|e| {
@@ -61,7 +64,6 @@ pub async fn put_registry(
                 ApiError::Internal("failed to persist setting".into())
             })?;
 
-        let mut guard = shared_raindex.write().await;
         *guard = new_provider;
         drop(guard);
 
