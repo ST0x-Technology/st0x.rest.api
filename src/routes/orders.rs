@@ -1,8 +1,10 @@
 use crate::error::{ApiError, ApiErrorResponse};
+use crate::fairings::TracingSpan;
 use crate::types::common::{ValidatedAddress, ValidatedFixedBytes};
 use crate::types::orders::{OrdersByTxResponse, OrdersListResponse, OrdersPaginationParams};
 use rocket::serde::json::Json;
 use rocket::Route;
+use tracing::Instrument;
 
 #[utoipa::path(
     get,
@@ -20,10 +22,15 @@ use rocket::Route;
 )]
 #[get("/tx/<tx_hash>")]
 pub async fn get_orders_by_tx(
+    span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrdersByTxResponse>, ApiError> {
-    let _ = tx_hash;
-    todo!()
+    async move {
+        tracing::info!(tx_hash = ?tx_hash, "request received");
+        todo!()
+    }
+    .instrument(span.0)
+    .await
 }
 
 #[utoipa::path(
@@ -42,11 +49,16 @@ pub async fn get_orders_by_tx(
 )]
 #[get("/<address>?<params..>", rank = 2)]
 pub async fn get_orders_by_address(
+    span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,
 ) -> Result<Json<OrdersListResponse>, ApiError> {
-    let _ = (address, params);
-    todo!()
+    async move {
+        tracing::info!(address = ?address, params = ?params, "request received");
+        todo!()
+    }
+    .instrument(span.0)
+    .await
 }
 
 pub fn routes() -> Vec<Route> {

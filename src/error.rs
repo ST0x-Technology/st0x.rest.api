@@ -1,3 +1,4 @@
+use crate::fairings::request_span_for;
 use rocket::http::Status;
 use rocket::response::Responder;
 use rocket::serde::json::Json;
@@ -39,15 +40,39 @@ impl<'r> Responder<'r, 'static> for ApiError {
             ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
             ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
         };
+        let span = request_span_for(req);
+        span.in_scope(|| {
+            if status.code >= 500 {
+                tracing::error!(
+                    status = status.code,
+                    code = %code,
+                    error_message = %message,
+                    "request failed"
+                );
+            } else {
+                tracing::warn!(
+                    status = status.code,
+                    code = %code,
+                    error_message = %message,
+                    "request failed"
+                );
+            }
+        });
+
         let body = ApiErrorResponse {
             error: ApiErrorDetail {
                 code: code.to_string(),
                 message,
             },
         };
-        Response::build_from(Json(body).respond_to(req)?)
-            .status(status)
-            .ok()
+        let json_response = match Json(body).respond_to(req) {
+            Ok(r) => r,
+            Err(s) => {
+                tracing::error!(status = %s.code, "failed to serialize error response");
+                return Err(s);
+            }
+        };
+        Response::build_from(json_response).status(status).ok()
     }
 }
 

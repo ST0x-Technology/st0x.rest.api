@@ -28,19 +28,21 @@ pub struct Approval {
     pub approval_data: Bytes,
 }
 
+#[derive(Debug)]
 pub struct ValidatedAddress(pub Address);
 
 impl<'a> rocket::request::FromParam<'a> for ValidatedAddress {
     type Error = &'a str;
 
     fn from_param(param: &'a str) -> Result<Self, Self::Error> {
-        param
-            .parse::<Address>()
-            .map(ValidatedAddress)
-            .map_err(|_| param)
+        param.parse::<Address>().map(ValidatedAddress).map_err(|e| {
+            tracing::warn!(input = %param, error = %e, "invalid address parameter");
+            param
+        })
     }
 }
 
+#[derive(Debug)]
 pub struct ValidatedFixedBytes(pub FixedBytes<32>);
 
 impl<'a> rocket::request::FromParam<'a> for ValidatedFixedBytes {
@@ -50,7 +52,10 @@ impl<'a> rocket::request::FromParam<'a> for ValidatedFixedBytes {
         param
             .parse::<FixedBytes<32>>()
             .map(ValidatedFixedBytes)
-            .map_err(|_| param)
+            .map_err(|e| {
+                tracing::warn!(input = %param, error = %e, "invalid fixed bytes parameter");
+                param
+            })
     }
 }
 

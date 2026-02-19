@@ -1,13 +1,25 @@
 #[macro_use]
 extern crate rocket;
 
+mod catchers;
 mod error;
+mod fairings;
 mod routes;
+mod telemetry;
 mod types;
 
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
+use std::collections::HashSet;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+#[derive(Debug, thiserror::Error)]
+enum StartupError {
+    #[error("invalid HTTP method in CORS config: {0}")]
+    InvalidMethod(String),
+    #[error("CORS configuration failed: {0}")]
+    Cors(#[from] rocket_cors::Error),
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -42,27 +54,31 @@ use utoipa_swagger_ui::SwaggerUi;
 )]
 struct ApiDoc;
 
-fn configure_cors() -> CorsOptions {
+fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     let allowed_methods: AllowedMethods = ["Get", "Post", "Options"]
         .iter()
-        .map(|s| std::str::FromStr::from_str(s).unwrap())
-        .collect();
+        .map(|s| {
+            std::str::FromStr::from_str(s).map_err(|_| StartupError::InvalidMethod(s.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
 
-    CorsOptions {
+    Ok(CorsOptions {
         allowed_origins: AllowedOrigins::all(),
         allowed_methods,
         allowed_headers: AllowedHeaders::all(),
         allow_credentials: false,
+        expose_headers: HashSet::from(["X-Request-Id".to_string()]),
         ..Default::default()
     }
+    .to_cors()?)
 }
 
-fn rocket() -> rocket::Rocket<rocket::Build> {
-    let cors = configure_cors()
-        .to_cors()
-        .expect("CORS configuration failed");
+fn rocket() -> Result<rocket::Rocket<rocket::Build>, StartupError> {
+    let cors = configure_cors()?;
 
-    rocket::build()
+    let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
+
+    Ok(rocket::custom(figment)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -73,12 +89,29 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             "/",
             SwaggerUi::new("/swagger/<tail..>").url("/api-doc/openapi.json", ApiDoc::openapi()),
         )
-        .attach(cors)
+        .register("/", catchers::catchers())
+        .attach(fairings::RequestLogger)
+        .attach(cors))
 }
 
-#[launch]
-fn launch() -> _ {
-    rocket()
+#[rocket::main]
+async fn main() {
+    let log_guard = telemetry::init();
+
+    let rocket = match rocket() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build Rocket instance");
+            drop(log_guard);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = rocket.launch().await {
+        tracing::error!(error = %e, "Rocket launch failed");
+        drop(log_guard);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +121,7 @@ mod tests {
     use rocket::local::blocking::Client;
 
     fn client() -> Client {
-        Client::tracked(rocket()).expect("valid rocket instance")
+        Client::tracked(rocket().expect("valid rocket instance")).expect("valid client")
     }
 
     #[test]
