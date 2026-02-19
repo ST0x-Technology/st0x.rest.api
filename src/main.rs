@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod catchers;
+mod db;
 mod error;
 mod fairings;
 mod routes;
@@ -73,12 +74,13 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     .to_cors()?)
 }
 
-fn rocket() -> Result<rocket::Rocket<rocket::Build>, StartupError> {
+fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
 
     Ok(rocket::custom(figment)
+        .manage(pool)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -98,7 +100,21 @@ fn rocket() -> Result<rocket::Rocket<rocket::Build>, StartupError> {
 async fn main() {
     let log_guard = telemetry::init();
 
-    let rocket = match rocket() {
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        tracing::warn!("DATABASE_URL not set, using default: sqlite:./data/st0x.db");
+        "sqlite:./data/st0x.db".to_string()
+    });
+
+    let pool = match db::init(&database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to initialize database");
+            drop(log_guard);
+            std::process::exit(1);
+        }
+    };
+
+    let rocket = match rocket(pool) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "failed to build Rocket instance");
@@ -118,19 +134,25 @@ async fn main() {
 mod tests {
     use super::*;
     use rocket::http::Status;
-    use rocket::local::blocking::Client;
+    use rocket::local::asynchronous::Client;
 
-    fn client() -> Client {
-        Client::tracked(rocket().expect("valid rocket instance")).expect("valid client")
+    async fn client() -> Client {
+        let id = uuid::Uuid::new_v4();
+        let pool = db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
+            .await
+            .expect("database init");
+        Client::tracked(rocket(pool).expect("valid rocket instance"))
+            .await
+            .expect("valid client")
     }
 
-    #[test]
-    fn test_health_endpoint() {
-        let client = client();
-        let response = client.get("/health").dispatch();
+    #[rocket::async_test]
+    async fn test_health_endpoint() {
+        let client = client().await;
+        let response = client.get("/health").dispatch().await;
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().unwrap()).unwrap();
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         assert_eq!(body["status"], "ok");
     }
 }
