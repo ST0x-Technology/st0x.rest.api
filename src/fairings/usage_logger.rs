@@ -139,4 +139,87 @@ mod tests {
             .expect("query");
         assert_eq!(row.0, 0);
     }
+
+    #[rocket::async_test]
+    async fn test_rate_limited_authenticated_request_is_logged() {
+        let rl = crate::fairings::RateLimiter::new(10000, 1);
+        let id = uuid::Uuid::new_v4();
+        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
+            .await
+            .expect("database init");
+        let rocket = crate::rocket(pool, rl).expect("valid rocket instance");
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid client");
+
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let first = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header.clone()))
+            .dispatch()
+            .await;
+        assert_ne!(first.status(), Status::Unauthorized);
+        assert_ne!(first.status(), Status::TooManyRequests);
+
+        let second = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(second.status(), Status::TooManyRequests);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let pool = client.rocket().state::<crate::db::DbPool>().expect("pool");
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM usage_logs")
+            .fetch_one(pool)
+            .await
+            .expect("query");
+        assert_eq!(row.0, 2);
+
+        let api_key: (i64,) = sqlx::query_as("SELECT id FROM api_keys WHERE key_id = ?")
+            .bind(&key_id)
+            .fetch_one(pool)
+            .await
+            .expect("query");
+
+        let limited_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM usage_logs WHERE api_key_id = ? AND status_code = 429",
+        )
+        .bind(api_key.0)
+        .fetch_one(pool)
+        .await
+        .expect("query");
+        assert_eq!(limited_rows.0, 1);
+    }
+
+    #[rocket::async_test]
+    async fn test_global_rate_limited_unauthenticated_requests_create_no_usage_log() {
+        let rl = crate::fairings::RateLimiter::new(1, 10000);
+        let id = uuid::Uuid::new_v4();
+        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
+            .await
+            .expect("database init");
+        let rocket = crate::rocket(pool, rl).expect("valid rocket instance");
+        let client = rocket::local::asynchronous::Client::tracked(rocket)
+            .await
+            .expect("valid client");
+
+        let first = client.get("/v1/tokens").dispatch().await;
+        assert_eq!(first.status(), Status::Unauthorized);
+
+        let second = client.get("/v1/tokens").dispatch().await;
+        assert_eq!(second.status(), Status::TooManyRequests);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let pool = client.rocket().state::<crate::db::DbPool>().expect("pool");
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM usage_logs")
+            .fetch_one(pool)
+            .await
+            .expect("query");
+        assert_eq!(row.0, 0);
+    }
 }

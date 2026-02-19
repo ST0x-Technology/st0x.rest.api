@@ -1,6 +1,6 @@
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
-use crate::fairings::TracingSpan;
+use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{ValidatedAddress, ValidatedFixedBytes};
 use crate::types::orders::{OrdersByTxResponse, OrdersListResponse, OrdersPaginationParams};
 use rocket::serde::json::Json;
@@ -19,12 +19,14 @@ use tracing::Instrument;
         (status = 200, description = "Orders from transaction", body = OrdersByTxResponse),
         (status = 202, description = "Transaction not yet indexed", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 404, description = "Transaction not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[get("/tx/<tx_hash>")]
 pub async fn get_orders_by_tx(
+    _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
@@ -50,11 +52,13 @@ pub async fn get_orders_by_tx(
         (status = 200, description = "Paginated list of orders", body = OrdersListResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[get("/<address>?<params..>", rank = 2)]
 pub async fn get_orders_by_address(
+    _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     address: ValidatedAddress,

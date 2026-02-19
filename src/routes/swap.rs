@@ -1,6 +1,6 @@
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
-use crate::fairings::TracingSpan;
+use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapQuoteRequest, SwapQuoteResponse,
 };
@@ -18,11 +18,13 @@ use tracing::Instrument;
         (status = 200, description = "Swap quote", body = SwapQuoteResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
 pub async fn post_swap_quote(
+    _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
@@ -46,11 +48,13 @@ pub async fn post_swap_quote(
         (status = 200, description = "Swap calldata", body = SwapCalldataResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata(
+    _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,

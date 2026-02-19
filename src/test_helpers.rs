@@ -6,7 +6,8 @@ pub(crate) async fn client() -> Client {
     let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
         .await
         .expect("database init");
-    Client::tracked(crate::rocket(pool).expect("valid rocket instance"))
+    let rate_limiter = crate::fairings::RateLimiter::new(10000, 10000);
+    Client::tracked(crate::rocket(pool, rate_limiter).expect("valid rocket instance"))
         .await
         .expect("valid client")
 }

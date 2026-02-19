@@ -1,5 +1,7 @@
 use crate::db::DbPool;
 use crate::error::ApiError;
+use crate::fairings::rate_limiter::CachedRateLimitInfo;
+use crate::fairings::RateLimiter;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -7,6 +9,7 @@ use base64::Engine;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
 use rocket::Request;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ApiKeyRow {
@@ -133,6 +136,45 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
         tracing::info!(key_id = %row.key_id, label = %row.label, "authenticated");
 
         req.local_cache(|| AuthKeyId(Some(row.id)));
+
+        let rl = match req.rocket().state::<RateLimiter>() {
+            Some(rl) => rl,
+            None => {
+                tracing::error!("RateLimiter not found in managed state");
+                return Outcome::Error((
+                    Status::InternalServerError,
+                    ApiError::Internal("rate limiter unavailable".into()),
+                ));
+            }
+        };
+
+        match rl.check_per_key(row.id) {
+            Ok((true, info)) => {
+                if let Some(info) = info {
+                    let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+                    if let Ok(mut guard) = cache.0.lock() {
+                        *guard = Some(info);
+                    }
+                }
+            }
+            Ok((false, info)) => {
+                if let Some(info) = info {
+                    let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
+                    if let Ok(mut guard) = cache.0.lock() {
+                        *guard = Some(info);
+                    }
+                }
+                tracing::warn!(key_id = %row.key_id, "per-key rate limit exceeded");
+                return Outcome::Error((
+                    Status::TooManyRequests,
+                    ApiError::RateLimited("Too many requests, please try again later".into()),
+                ));
+            }
+            Err(e) => {
+                tracing::error!(key_id = %row.key_id, error = %e, "per-key rate limiter failed");
+                return Outcome::Error((Status::InternalServerError, e));
+            }
+        }
 
         Outcome::Success(AuthenticatedKey {
             id: row.id,

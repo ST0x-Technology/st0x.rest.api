@@ -90,19 +90,29 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
         allowed_methods,
         allowed_headers: AllowedHeaders::all(),
         allow_credentials: false,
-        expose_headers: HashSet::from(["X-Request-Id".to_string()]),
+        expose_headers: HashSet::from([
+            "X-Request-Id".to_string(),
+            "Retry-After".to_string(),
+            "X-RateLimit-Limit".to_string(),
+            "X-RateLimit-Remaining".to_string(),
+            "X-RateLimit-Reset".to_string(),
+        ]),
         ..Default::default()
     }
     .to_cors()?)
 }
 
-pub(crate) fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
+pub(crate) fn rocket(
+    pool: db::DbPool,
+    rate_limiter: fairings::RateLimiter,
+) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
 
     Ok(rocket::custom(figment)
         .manage(pool)
+        .manage(rate_limiter)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -116,6 +126,7 @@ pub(crate) fn rocket(pool: db::DbPool) -> Result<rocket::Rocket<rocket::Build>, 
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger)
+        .attach(fairings::RateLimitHeadersFairing)
         .attach(cors))
 }
 
@@ -153,9 +164,21 @@ async fn main() {
         }
     };
 
+    let global_rpm: u64 = std::env::var("RATE_LIMIT_GLOBAL_RPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let per_key_rpm: u64 = std::env::var("RATE_LIMIT_PER_KEY_RPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
+    tracing::info!(global_rpm, per_key_rpm, "rate limiter configured");
+
     match command {
         cli::Command::Serve => {
-            let rocket = match rocket(pool) {
+            let rate_limiter = fairings::RateLimiter::new(global_rpm, per_key_rpm);
+            let rocket = match rocket(pool, rate_limiter) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");

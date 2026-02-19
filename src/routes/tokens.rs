@@ -1,6 +1,6 @@
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
-use crate::fairings::TracingSpan;
+use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::tokens::TokenListResponse;
 use rocket::serde::json::Json;
 use rocket::Route;
@@ -14,11 +14,13 @@ use tracing::Instrument;
     responses(
         (status = 200, description = "List of supported tokens", body = TokenListResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
 #[get("/")]
 pub async fn get_tokens(
+    _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
 ) -> Result<Json<TokenListResponse>, ApiError> {

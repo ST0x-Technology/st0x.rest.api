@@ -1,5 +1,7 @@
 use crate::error::{ApiErrorDetail, ApiErrorResponse};
 use crate::fairings::request_span_for;
+use rocket::http::Header;
+use rocket::response::Responder;
 use rocket::serde::json::Json;
 use rocket::Catcher;
 use rocket::Request;
@@ -58,6 +60,29 @@ pub fn unprocessable_entity(req: &Request<'_>) -> Json<ApiErrorResponse> {
     })
 }
 
+pub(crate) struct RateLimitedResponse(Json<ApiErrorResponse>);
+
+impl<'r, 'o: 'r> Responder<'r, 'o> for RateLimitedResponse {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'o> {
+        let mut res = self.0.respond_to(req)?;
+        res.set_header(Header::new("Retry-After", "60"));
+        Ok(res)
+    }
+}
+
+#[catch(429)]
+pub fn too_many_requests(req: &Request<'_>) -> RateLimitedResponse {
+    let span = request_span_for(req);
+    span.in_scope(|| tracing::warn!("rate limit exceeded"));
+
+    RateLimitedResponse(Json(ApiErrorResponse {
+        error: ApiErrorDetail {
+            code: "RATE_LIMITED".to_string(),
+            message: "Too many requests, please try again later".to_string(),
+        },
+    }))
+}
+
 #[catch(500)]
 pub fn internal_server_error(req: &Request<'_>) -> Json<ApiErrorResponse> {
     let span = request_span_for(req);
@@ -76,6 +101,7 @@ pub fn catchers() -> Vec<Catcher> {
         bad_request,
         unauthorized,
         not_found,
+        too_many_requests,
         unprocessable_entity,
         internal_server_error
     ]

@@ -1,5 +1,5 @@
 use crate::fairings::request_span_for;
-use rocket::http::Status;
+use rocket::http::{Header, Status};
 use rocket::response::Responder;
 use rocket::serde::json::Json;
 use rocket::{Request, Response};
@@ -30,6 +30,8 @@ pub enum ApiError {
     NotFound(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -39,6 +41,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
             ApiError::Unauthorized(msg) => (Status::Unauthorized, "UNAUTHORIZED", msg.clone()),
             ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
             ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
+            ApiError::RateLimited(msg) => (Status::TooManyRequests, "RATE_LIMITED", msg.clone()),
         };
         let span = request_span_for(req);
         span.in_scope(|| {
@@ -72,7 +75,13 @@ impl<'r> Responder<'r, 'static> for ApiError {
                 return Err(s);
             }
         };
-        Response::build_from(json_response).status(status).ok()
+        let mut response = Response::build_from(json_response)
+            .status(status)
+            .finalize();
+        if matches!(self, ApiError::RateLimited(_)) {
+            response.set_header(Header::new("Retry-After", "60"));
+        }
+        Ok(response)
     }
 }
 

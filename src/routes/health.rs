@@ -1,6 +1,9 @@
+use crate::error::ApiError;
+use crate::fairings::TracingSpan;
 use crate::types::health::HealthResponse;
 use rocket::serde::json::Json;
 use rocket::Route;
+use tracing::Instrument;
 
 #[utoipa::path(
     get,
@@ -11,10 +14,15 @@ use rocket::Route;
     )
 )]
 #[get("/health")]
-pub async fn get_health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".into(),
-    })
+pub async fn get_health(span: TracingSpan) -> Result<Json<HealthResponse>, ApiError> {
+    async move {
+        tracing::info!("request received");
+        Ok(Json(HealthResponse {
+            status: "ok".into(),
+        }))
+    }
+    .instrument(span.0)
+    .await
 }
 
 pub fn routes() -> Vec<Route> {
