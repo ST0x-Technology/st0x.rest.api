@@ -19,6 +19,7 @@ pub struct ApiKeyRow {
     pub label: String,
     pub owner: String,
     pub active: bool,
+    pub is_admin: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -31,6 +32,7 @@ pub struct AuthenticatedKey {
     pub key_id: String,
     pub label: String,
     pub owner: String,
+    pub is_admin: bool,
 }
 
 #[rocket::async_trait]
@@ -86,7 +88,7 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
         };
 
         let row: Option<ApiKeyRow> = match sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, key_id, secret_hash, label, owner, active, created_at, updated_at \
+            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, created_at, updated_at \
              FROM api_keys WHERE key_id = ? AND active = 1",
         )
         .bind(key_id)
@@ -181,7 +183,27 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
             key_id: row.key_id,
             label: row.label,
             owner: row.owner,
+            is_admin: row.is_admin,
         })
+    }
+}
+
+pub struct AdminKey(pub AuthenticatedKey);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for AdminKey {
+    type Error = ApiError;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        match AuthenticatedKey::from_request(req).await {
+            Outcome::Success(key) if key.is_admin => Outcome::Success(AdminKey(key)),
+            Outcome::Success(_) => Outcome::Error((
+                Status::Forbidden,
+                ApiError::Forbidden("admin access required".into()),
+            )),
+            Outcome::Error(e) => Outcome::Error(e),
+            Outcome::Forward(f) => Outcome::Forward(f),
+        }
     }
 }
 

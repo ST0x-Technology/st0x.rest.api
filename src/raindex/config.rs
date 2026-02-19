@@ -42,6 +42,10 @@ impl RaindexProvider {
             })
     }
 
+    pub(crate) fn registry_url(&self) -> String {
+        self.registry.registry_url()
+    }
+
     pub(crate) async fn run_with_client<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
     where
         T: Send + 'static,
