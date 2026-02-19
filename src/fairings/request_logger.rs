@@ -97,3 +97,125 @@ impl Fairing for RequestLogger {
         res.set_header(Header::new(REQUEST_ID_HEADER, meta.request_id.clone()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocket::http::Status;
+    use rocket::local::blocking::Client;
+    use tracing_test::traced_test;
+
+    #[get("/test")]
+    fn test_route() -> &'static str {
+        "ok"
+    }
+
+    fn client() -> Client {
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![test_route])
+            .attach(RequestLogger);
+        Client::tracked(rocket).expect("valid rocket instance")
+    }
+
+    #[test]
+    fn generates_request_id_when_none_provided() {
+        let client = client();
+        let response = client.get("/test").dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        let id = response.headers().get_one(REQUEST_ID_HEADER);
+        assert!(id.is_some());
+        assert!(Uuid::parse_str(id.unwrap()).is_ok());
+    }
+
+    #[test]
+    fn echoes_valid_client_request_id() {
+        let client = client();
+        let response = client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, "my-custom-id-123"))
+            .dispatch();
+        assert_eq!(
+            response.headers().get_one(REQUEST_ID_HEADER),
+            Some("my-custom-id-123")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_request_id() {
+        let client = client();
+        let response = client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, ""))
+            .dispatch();
+        let id = response.headers().get_one(REQUEST_ID_HEADER).unwrap();
+        assert!(Uuid::parse_str(id).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_request_id() {
+        let client = client();
+        let long_id = "a".repeat(129);
+        let response = client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, long_id))
+            .dispatch();
+        let id = response.headers().get_one(REQUEST_ID_HEADER).unwrap();
+        assert!(Uuid::parse_str(id).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_ascii_request_id() {
+        let client = client();
+        let response = client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, "id-\u{00e9}-test"))
+            .dispatch();
+        let id = response.headers().get_one(REQUEST_ID_HEADER).unwrap();
+        assert!(Uuid::parse_str(id).is_ok());
+    }
+
+    #[test]
+    fn rejects_control_char_request_id() {
+        let client = client();
+        let response = client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, "id\x00test"))
+            .dispatch();
+        let id = response.headers().get_one(REQUEST_ID_HEADER).unwrap();
+        assert!(Uuid::parse_str(id).is_ok());
+    }
+
+    #[test]
+    fn accepts_max_length_request_id() {
+        let client = client();
+        let max_id = "a".repeat(128);
+        let response = client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, max_id.clone()))
+            .dispatch();
+        assert_eq!(
+            response.headers().get_one(REQUEST_ID_HEADER),
+            Some(max_id.as_str())
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn logs_request_lifecycle() {
+        let client = client();
+        client.get("/test").dispatch();
+        assert!(logs_contain("request started"));
+        assert!(logs_contain("request completed"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn logs_contain_request_id_field() {
+        let client = client();
+        client
+            .get("/test")
+            .header(Header::new(REQUEST_ID_HEADER, "trace-me-123"))
+            .dispatch();
+        assert!(logs_contain("trace-me-123"));
+    }
+}

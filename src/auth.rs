@@ -33,64 +33,51 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
     type Error = ApiError;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let pool = match req.rocket().state::<DbPool>() {
-            Some(p) => p,
-            None => {
-                tracing::error!("DbPool not found in managed state");
-                return Outcome::Error((
-                    Status::InternalServerError,
-                    ApiError::Internal("database unavailable".into()),
-                ));
-            }
+        let Some(pool) = req.rocket().state::<DbPool>() else {
+            tracing::error!("DbPool not found in managed state");
+            return Outcome::Error((
+                Status::InternalServerError,
+                ApiError::Internal("database unavailable".into()),
+            ));
         };
 
-        let header = match req.headers().get_one("Authorization") {
-            Some(h) => h,
-            None => {
-                return Outcome::Error((
-                    Status::Unauthorized,
-                    ApiError::Unauthorized("missing Authorization header".into()),
-                ));
-            }
+        let Some(header) = req.headers().get_one("Authorization") else {
+            return Outcome::Error((
+                Status::Unauthorized,
+                ApiError::Unauthorized("missing Authorization header".into()),
+            ));
         };
 
-        let encoded = if header.len() > 6 && header[..6].eq_ignore_ascii_case("Basic ") {
-            &header[6..]
-        } else {
+        const BASIC_PREFIX: &str = "Basic ";
+        if header.len() < BASIC_PREFIX.len()
+            || !header[..BASIC_PREFIX.len()].eq_ignore_ascii_case(BASIC_PREFIX)
+        {
             return Outcome::Error((
                 Status::Unauthorized,
                 ApiError::Unauthorized("invalid Authorization scheme".into()),
             ));
+        }
+        let encoded = &header[BASIC_PREFIX.len()..];
+
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            return Outcome::Error((
+                Status::Unauthorized,
+                ApiError::Unauthorized("invalid base64 encoding".into()),
+            ));
         };
 
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-            Ok(d) => d,
-            Err(_) => {
-                return Outcome::Error((
-                    Status::Unauthorized,
-                    ApiError::Unauthorized("invalid base64 encoding".into()),
-                ));
-            }
+        let Ok(credentials) = String::from_utf8(decoded) else {
+            return Outcome::Error((
+                Status::Unauthorized,
+                ApiError::Unauthorized("invalid credentials encoding".into()),
+            ));
         };
 
-        let credentials = match String::from_utf8(decoded) {
-            Ok(s) => s,
-            Err(_) => {
-                return Outcome::Error((
-                    Status::Unauthorized,
-                    ApiError::Unauthorized("invalid credentials encoding".into()),
-                ));
-            }
-        };
-
-        let (key_id, secret) = match credentials.split_once(':') {
-            Some(pair) => pair,
-            None => {
-                return Outcome::Error((
-                    Status::Unauthorized,
-                    ApiError::Unauthorized("invalid credentials format".into()),
-                ));
-            }
+        let Some((key_id, secret)) = credentials.split_once(':') else {
+            return Outcome::Error((
+                Status::Unauthorized,
+                ApiError::Unauthorized("invalid credentials format".into()),
+            ));
         };
 
         let row: Option<ApiKeyRow> = match sqlx::query_as::<_, ApiKeyRow>(
@@ -111,15 +98,12 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
             }
         };
 
-        let row = match row {
-            Some(r) => r,
-            None => {
-                tracing::warn!(key_id = %key_id, "API key not found or inactive");
-                return Outcome::Error((
-                    Status::Unauthorized,
-                    ApiError::Unauthorized("invalid credentials".into()),
-                ));
-            }
+        let Some(row) = row else {
+            tracing::warn!(key_id = %key_id, "API key not found or inactive");
+            return Outcome::Error((
+                Status::Unauthorized,
+                ApiError::Unauthorized("invalid credentials".into()),
+            ));
         };
 
         let parsed_hash = match PasswordHash::new(&row.secret_hash) {
