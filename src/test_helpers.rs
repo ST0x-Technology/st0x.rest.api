@@ -66,7 +66,8 @@ impl TestClientBuilder {
             }
         };
 
-        let rocket = crate::rocket(pool, self.rate_limiter, raindex_config)
+        let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex)
             .expect("valid rocket instance")
             .manage(crate::routes::tokens::TokensConfig::with_url(
                 token_list_url,
@@ -210,6 +211,29 @@ pub(crate) async fn seed_api_key(client: &Client) -> (String, String) {
         .execute(pool)
         .await
         .expect("insert api key");
+
+    (key_id, secret)
+}
+
+pub(crate) async fn seed_admin_key(client: &Client) -> (String, String) {
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let secret = uuid::Uuid::new_v4().to_string();
+    let hash = crate::auth::hash_secret(&secret).expect("hash secret");
+
+    let pool = client
+        .rocket()
+        .state::<crate::db::DbPool>()
+        .expect("pool in state");
+    sqlx::query(
+        "INSERT INTO api_keys (key_id, secret_hash, label, owner, is_admin) VALUES (?, ?, ?, ?, 1)",
+    )
+    .bind(&key_id)
+    .bind(&hash)
+    .bind("admin-key")
+    .bind("admin-owner")
+    .execute(pool)
+    .await
+    .expect("insert admin api key");
 
     (key_id, secret)
 }
