@@ -34,7 +34,7 @@ pub async fn get_registry(
         tracing::info!("request received");
         let raindex = shared_raindex.read().await;
         Ok(Json(RegistryResponse {
-            registry_url: raindex.registry_url().to_string(),
+            registry_url: raindex.registry_url(),
         }))
     }
     .instrument(span.0)

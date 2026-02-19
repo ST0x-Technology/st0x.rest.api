@@ -10,7 +10,6 @@ enum WorkerError {
 #[derive(Debug)]
 pub(crate) struct RaindexProvider {
     registry: DotrainRegistry,
-    registry_url: String,
 }
 
 impl RaindexProvider {
@@ -36,18 +35,15 @@ impl RaindexProvider {
 
         rx.await
             .map_err(|_| RaindexProviderError::WorkerPanicked)?
-            .map(|registry| Self {
-                registry,
-                registry_url: registry_url.to_string(),
-            })
+            .map(|registry| Self { registry })
             .map_err(|e| match e {
                 WorkerError::RuntimeInit(e) => RaindexProviderError::RegistryRuntimeInit(e),
                 WorkerError::Api(e) => RaindexProviderError::RegistryLoad(e),
             })
     }
 
-    pub(crate) fn registry_url(&self) -> &str {
-        &self.registry_url
+    pub(crate) fn registry_url(&self) -> String {
+        self.registry.registry_url()
     }
 
     pub(crate) async fn run_with_client<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
