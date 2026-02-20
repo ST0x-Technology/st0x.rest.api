@@ -8870,8 +8870,11 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "argon2",
+ "async-trait",
  "base64 0.22.1",
  "clap",
+ "rain-math-float",
+ "rain_orderbook_bindings",
  "rain_orderbook_common",
  "rain_orderbook_js_api",
  "rand 0.9.1",
