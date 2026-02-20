@@ -12,6 +12,8 @@ mod routes;
 mod telemetry;
 mod types;
 
+pub(crate) const CHAIN_ID: u32 = 8453;
+
 #[cfg(test)]
 mod test_helpers;
 
