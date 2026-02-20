@@ -1,0 +1,5 @@
+log_dir = "./logs"
+database_url = "sqlite:./data/st0x.db"
+registry_url = ""
+rate_limit_global_rpm = 600
+rate_limit_per_key_rpm = 60

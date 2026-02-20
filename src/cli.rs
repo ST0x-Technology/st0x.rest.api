@@ -3,6 +3,7 @@ use crate::db::DbPool;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "st0x_rest_api")]
@@ -15,7 +16,10 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     #[command(about = "Start the API server")]
-    Serve,
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
     #[command(about = "Manage API keys")]
     Keys {
         #[command(subcommand)]
