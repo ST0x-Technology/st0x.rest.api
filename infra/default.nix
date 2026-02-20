@@ -132,7 +132,11 @@ in {
       on_exit() { rm -f ${tfVars}; }
       trap on_exit EXIT
 
-      ${decryptVars}
+      if [ -f ${tfVars}.age ]; then
+        ${decryptVars}
+      else
+        cp ${tfVars}.example ${tfVars}
+      fi
       ''${EDITOR:-vi} ${tfVars}
       ${encryptVars}
     '';
