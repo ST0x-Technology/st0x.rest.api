@@ -148,6 +148,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
@@ -164,6 +165,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("50", "2"), mock_candidate("50", "3")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
@@ -178,6 +180,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("30", "2")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
@@ -195,6 +198,7 @@ mod tests {
                 mock_candidate("1000", "1.5"),
                 mock_candidate("1000", "2"),
             ],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("10")).await.unwrap();
 
@@ -207,6 +211,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Ok(vec![]),
             candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
@@ -217,6 +222,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Ok(vec![mock_order()]),
             candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no valid quotes")));
@@ -227,6 +233,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("not-a-number")).await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
@@ -237,6 +244,7 @@ mod tests {
         let ds = MockSwapDataSource {
             orders: Err(ApiError::Internal("failed".into())),
             candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
