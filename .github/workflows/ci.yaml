@@ -17,8 +17,6 @@ jobs:
         task: [rs-test, rainix-rs-static]
       fail-fast: false
     runs-on: ${{ matrix.os }}
-    env:
-      COMMIT_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:

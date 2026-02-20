@@ -8897,6 +8897,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.12",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber 0.3.19",
