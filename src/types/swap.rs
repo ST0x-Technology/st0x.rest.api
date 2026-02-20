@@ -10,7 +10,7 @@ pub struct SwapQuoteRequest {
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
     pub output_token: Address,
-    #[schema(example = "1000000")]
+    #[schema(example = "0.5")]
     pub output_amount: String,
 }
 
@@ -21,11 +21,13 @@ pub struct SwapQuoteResponse {
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
     pub output_token: Address,
-    #[schema(example = "1000000")]
+    #[schema(example = "0.5")]
     pub output_amount: String,
-    #[schema(example = "500000000000000")]
+    #[schema(example = "0.5")]
+    pub estimated_output: String,
+    #[schema(example = "1250.75")]
     pub estimated_input: String,
-    #[schema(example = "0.0005")]
+    #[schema(example = "2501.5")]
     pub estimated_io_ratio: String,
 }
 
@@ -36,9 +38,9 @@ pub struct SwapCalldataRequest {
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
     pub output_token: Address,
-    #[schema(example = "1000000")]
+    #[schema(example = "0.5")]
     pub output_amount: String,
-    #[schema(example = "0.0006")]
+    #[schema(example = "2600")]
     pub maximum_io_ratio: String,
 }
 
@@ -51,7 +53,7 @@ pub struct SwapCalldataResponse {
     pub data: Bytes,
     #[schema(value_type = String, example = "0x0")]
     pub value: U256,
-    #[schema(example = "500000000000000")]
+    #[schema(example = "1250.75")]
     pub estimated_input: String,
     pub approvals: Vec<Approval>,
 }
