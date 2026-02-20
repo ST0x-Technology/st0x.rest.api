@@ -43,11 +43,6 @@ impl TestClientBuilder {
         self
     }
 
-    pub(crate) fn raindex_registry_url(mut self, url: impl Into<String>) -> Self {
-        self.raindex_registry_url = Some(url.into());
-        self
-    }
-
     pub(crate) async fn build(self) -> Client {
         let id = uuid::Uuid::new_v4();
         let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
