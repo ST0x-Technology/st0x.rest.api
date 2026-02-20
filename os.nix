@@ -159,8 +159,8 @@ in {
   };
 
   systemd.tmpfiles.rules = [
-    "d /mnt/data/st0x-rest-api 0755 root root -"
-    "d /mnt/data/st0x-rest-api/logs 0755 root root -"
+    "d /mnt/data/st0x-rest-api 0775 root st0x -"
+    "d /mnt/data/st0x-rest-api/logs 0775 root st0x -"
   ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
