@@ -54,12 +54,8 @@ in {
       deployPreamble = ''
         ${infraPkgs.resolveIp}
         export DEPLOY_HOST="$host_ip"
-
-        ssh_flag=""
-        if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
-          export NIX_SSHOPTS="-i $identity"
-          ssh_flag="--ssh-opts=-i $identity"
-        fi
+        export NIX_SSHOPTS="-i $identity"
+        ssh_flag="--ssh-opts=-i $identity"
       '';
 
       deployFlags = if localSystem == "x86_64-linux" then
