@@ -31,6 +31,8 @@ let
       ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
       [ pkgs.apple-sdk_15 ];
 
+    COMMIT_SHA = builtins.getEnv "COMMIT_SHA";
+
     postUnpack = ''
       rm -rf $sourceRoot/lib
       ln -s ${libDir} $sourceRoot/lib
