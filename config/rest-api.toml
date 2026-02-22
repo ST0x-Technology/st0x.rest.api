@@ -1,5 +1,5 @@
 log_dir = "/mnt/data/st0x-rest-api/logs"
 database_url = "sqlite:///mnt/data/st0x-rest-api/st0x.db"
-registry_url = ""
+registry_url = "https://raw.githubusercontent.com/rainlanguage/rain.strategies/aeaf8d5eaac90b08fe01b9a5d69089d1a0cc1a8f/registry"
 rate_limit_global_rpm = 600
 rate_limit_per_key_rpm = 60
