@@ -1,4 +1,4 @@
-{ pkgs, lib, modulesPath, ... }:
+{ pkgs, lib, modulesPath, docsRoot, ... }:
 
 let
   inherit (import ./keys.nix) roles;
@@ -105,6 +105,11 @@ in {
         locations."/" = {
           proxyPass = "http://127.0.0.1:8000";
         };
+      };
+      virtualHosts."docs.st0x.io" = {
+        enableACME = true;
+        forceSSL = true;
+        root = docsRoot;
       };
     };
   };

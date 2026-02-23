@@ -45,3 +45,15 @@ jobs:
 
       - name: Run ${{ matrix.task }}
         run: nix develop -c ${{ matrix.task }}
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: nixbuild/nix-quick-install-action@v30
+
+      - name: Build docs
+        run: nix build .#st0x-docs
