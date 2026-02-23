@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::Instrument;
 
 const TOKEN_LIST_URL: &str = "https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/ad1a637a79d5a220ad089aecdc5b7239d3473f6e/src/st0xTokens.json";
-const TARGET_CHAIN_ID: u32 = 8453;
+const TARGET_CHAIN_ID: u32 = crate::CHAIN_ID;
 const TOKEN_LIST_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) struct TokensConfig {

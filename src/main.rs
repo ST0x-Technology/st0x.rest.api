@@ -4,6 +4,7 @@ extern crate rocket;
 mod auth;
 mod catchers;
 mod cli;
+mod config;
 mod db;
 mod error;
 mod fairings;
@@ -11,6 +12,8 @@ mod raindex;
 mod routes;
 mod telemetry;
 mod types;
+
+pub(crate) const CHAIN_ID: u32 = 8453;
 
 #[cfg(test)]
 mod test_helpers;
@@ -152,7 +155,19 @@ async fn main() {
         }
     };
 
-    let log_guard = match telemetry::init() {
+    let config_path = match &command {
+        cli::Command::Serve { config } | cli::Command::Keys { config, .. } => config.clone(),
+    };
+
+    let cfg = match config::Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load config from {}: {e}", config_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let log_guard = match telemetry::init(&cfg.log_dir) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("failed to initialize telemetry: {e}");
@@ -160,12 +175,7 @@ async fn main() {
         }
     };
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        tracing::warn!("DATABASE_URL not set, using default: sqlite:./data/st0x.db");
-        "sqlite:./data/st0x.db".to_string()
-    });
-
-    let pool = match db::init(&database_url).await {
+    let pool = match db::init(&cfg.database_url).await {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize database");
@@ -174,19 +184,14 @@ async fn main() {
         }
     };
 
-    let global_rpm: u64 = std::env::var("RATE_LIMIT_GLOBAL_RPM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(600);
-    let per_key_rpm: u64 = std::env::var("RATE_LIMIT_PER_KEY_RPM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-
-    tracing::info!(global_rpm, per_key_rpm, "rate limiter configured");
+    tracing::info!(
+        global_rpm = cfg.rate_limit_global_rpm,
+        per_key_rpm = cfg.rate_limit_per_key_rpm,
+        "rate limiter configured"
+    );
 
     match command {
-        cli::Command::Serve => {
+        cli::Command::Serve { .. } => {
             let db_url = db::settings::get_setting(&pool, "registry_url")
                 .await
                 .ok()
@@ -197,22 +202,21 @@ async fn main() {
                     tracing::info!(registry_url = %url, "loaded registry_url from database");
                     url
                 }
-                _ => match std::env::var("REGISTRY_URL") {
-                    Ok(url) if !url.is_empty() => {
-                        if let Err(e) = db::settings::set_setting(&pool, "registry_url", &url).await
-                        {
-                            tracing::warn!(error = %e, "failed to seed registry_url into database");
-                        }
-                        url
+                _ if !cfg.registry_url.is_empty() => {
+                    if let Err(e) =
+                        db::settings::set_setting(&pool, "registry_url", &cfg.registry_url).await
+                    {
+                        tracing::warn!(error = %e, "failed to seed registry_url into database");
                     }
-                    _ => {
-                        tracing::error!(
-                            "registry_url not found in database and REGISTRY_URL env var is not set"
-                        );
-                        drop(log_guard);
-                        std::process::exit(1);
-                    }
-                },
+                    cfg.registry_url
+                }
+                _ => {
+                    tracing::error!(
+                        "registry_url not found in database and not set in config file"
+                    );
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
             };
 
             let raindex_config = match raindex::RaindexProvider::load(&registry_url).await {
@@ -228,7 +232,8 @@ async fn main() {
             };
 
             let shared_raindex = tokio::sync::RwLock::new(raindex_config);
-            let rate_limiter = fairings::RateLimiter::new(global_rpm, per_key_rpm);
+            let rate_limiter =
+                fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
             let rocket = match rocket(pool, rate_limiter, shared_raindex) {
                 Ok(r) => r,
                 Err(e) => {
@@ -244,7 +249,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Keys { command } => {
+        cli::Command::Keys { command, .. } => {
             if let Err(e) = cli::handle_keys_command(command, pool).await {
                 tracing::error!(error = %e, "keys command failed");
                 drop(log_guard);
