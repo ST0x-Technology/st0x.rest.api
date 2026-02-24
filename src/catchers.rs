@@ -34,6 +34,19 @@ pub fn unauthorized(req: &Request<'_>) -> Json<ApiErrorResponse> {
     })
 }
 
+#[catch(403)]
+pub fn forbidden(req: &Request<'_>) -> Json<ApiErrorResponse> {
+    let span = request_span_for(req);
+    span.in_scope(|| tracing::warn!("forbidden (insufficient permissions)"));
+
+    Json(ApiErrorResponse {
+        error: ApiErrorDetail {
+            code: "FORBIDDEN".to_string(),
+            message: "Insufficient permissions".to_string(),
+        },
+    })
+}
+
 #[catch(404)]
 pub fn not_found(req: &Request<'_>) -> Json<ApiErrorResponse> {
     let span = request_span_for(req);
@@ -100,6 +113,7 @@ pub fn catchers() -> Vec<Catcher> {
     rocket::catchers![
         bad_request,
         unauthorized,
+        forbidden,
         not_found,
         too_many_requests,
         unprocessable_entity,

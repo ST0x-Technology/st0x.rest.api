@@ -371,8 +371,8 @@ pub(crate) mod test_fixtures {
 
     pub struct MockOrderDataSource {
         pub orders: Result<Vec<RaindexOrder>, ApiError>,
-        pub trades: Vec<RaindexTrade>,
-        pub quotes: Vec<RaindexOrderQuote>,
+        pub trades: Result<Vec<RaindexTrade>, ApiError>,
+        pub quotes: Result<Vec<RaindexOrderQuote>, ApiError>,
         pub calldata: Result<Bytes, ApiError>,
     }
 
@@ -388,13 +388,19 @@ pub(crate) mod test_fixtures {
             &self,
             _order: &RaindexOrder,
         ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
-            Ok(self.quotes.clone())
+            match &self.quotes {
+                Ok(quotes) => Ok(quotes.clone()),
+                Err(_) => Err(ApiError::Internal("failed to query order quotes".into())),
+            }
         }
         async fn get_order_trades(
             &self,
             _order: &RaindexOrder,
         ) -> Result<Vec<RaindexTrade>, ApiError> {
-            Ok(self.trades.clone())
+            match &self.trades {
+                Ok(trades) => Ok(trades.clone()),
+                Err(_) => Err(ApiError::Internal("failed to query order trades".into())),
+            }
         }
         async fn get_remove_calldata(&self, _order: &RaindexOrder) -> Result<Bytes, ApiError> {
             match &self.calldata {

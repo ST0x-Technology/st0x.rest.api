@@ -35,13 +35,14 @@ const FIELD_IO_RATIO: &str = "io-ratio";
 pub async fn post_order_solver(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let raindex = shared_raindex.read().await;
         let response = raindex
             .run_with_registry(move |registry| async move {
                 let gui = registry

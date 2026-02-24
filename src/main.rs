@@ -4,6 +4,7 @@ extern crate rocket;
 mod auth;
 mod catchers;
 mod cli;
+mod config;
 mod db;
 mod error;
 mod fairings;
@@ -11,6 +12,8 @@ mod raindex;
 mod routes;
 mod telemetry;
 mod types;
+
+pub(crate) const CHAIN_ID: u32 = 8453;
 
 #[cfg(test)]
 mod test_helpers;
@@ -36,6 +39,14 @@ impl Modify for SecurityAddon {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum StartupError {
+    #[error("invalid HTTP method in CORS config: {0}")]
+    InvalidMethod(String),
+    #[error("CORS configuration failed: {0}")]
+    Cors(#[from] rocket_cors::Error),
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -51,6 +62,8 @@ impl Modify for SecurityAddon {
         routes::orders::get_orders_by_address,
         routes::trades::get_trades_by_tx,
         routes::trades::get_trades_by_address,
+        routes::registry::get_registry,
+        routes::admin::put_registry,
     ),
     components(),
     modifiers(&SecurityAddon),
@@ -61,6 +74,8 @@ impl Modify for SecurityAddon {
         (name = "Order", description = "Order deployment and management endpoints"),
         (name = "Orders", description = "Order listing and query endpoints"),
         (name = "Trades", description = "Trade listing and query endpoints"),
+        (name = "Registry", description = "Registry information endpoints"),
+        (name = "Admin", description = "Admin management endpoints"),
     ),
     info(
         title = "st0x REST API",
@@ -70,16 +85,15 @@ impl Modify for SecurityAddon {
 )]
 struct ApiDoc;
 
-fn configure_cors() -> Result<rocket_cors::Cors, String> {
-    let allowed_methods: AllowedMethods = ["Get", "Post", "Options"]
+fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
+    let allowed_methods: AllowedMethods = ["Get", "Post", "Put", "Options"]
         .iter()
         .map(|s| {
-            std::str::FromStr::from_str(s)
-                .map_err(|_| format!("invalid HTTP method in CORS config: {s}"))
+            std::str::FromStr::from_str(s).map_err(|_| StartupError::InvalidMethod(s.to_string()))
         })
         .collect::<Result<_, _>>()?;
 
-    CorsOptions {
+    Ok(CorsOptions {
         allowed_origins: AllowedOrigins::all(),
         allowed_methods,
         allowed_headers: AllowedHeaders::all(),
@@ -93,15 +107,14 @@ fn configure_cors() -> Result<rocket_cors::Cors, String> {
         ]),
         ..Default::default()
     }
-    .to_cors()
-    .map_err(|e| format!("CORS configuration failed: {e}"))
+    .to_cors()?)
 }
 
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
-    raindex_config: raindex::RaindexProvider,
-) -> Result<rocket::Rocket<rocket::Build>, String> {
+    raindex_config: raindex::SharedRaindexProvider,
+) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
@@ -116,6 +129,8 @@ pub(crate) fn rocket(
         .mount("/v1/order", routes::order::routes())
         .mount("/v1/orders", routes::orders::routes())
         .mount("/v1/trades", routes::trades::routes())
+        .mount("/", routes::registry::routes())
+        .mount("/admin", routes::admin::routes())
         .mount(
             "/",
             SwaggerUi::new("/swagger/<tail..>").url("/api-doc/openapi.json", ApiDoc::openapi()),
@@ -140,7 +155,19 @@ async fn main() {
         }
     };
 
-    let log_guard = match telemetry::init() {
+    let config_path = match &command {
+        cli::Command::Serve { config } | cli::Command::Keys { config, .. } => config.clone(),
+    };
+
+    let cfg = match config::Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load config from {}: {e}", config_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let log_guard = match telemetry::init(&cfg.log_dir) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("failed to initialize telemetry: {e}");
@@ -148,12 +175,7 @@ async fn main() {
         }
     };
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        tracing::warn!("DATABASE_URL not set, using default: sqlite:./data/st0x.db");
-        "sqlite:./data/st0x.db".to_string()
-    });
-
-    let pool = match db::init(&database_url).await {
+    let pool = match db::init(&cfg.database_url).await {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize database");
@@ -162,23 +184,36 @@ async fn main() {
         }
     };
 
-    let global_rpm: u64 = std::env::var("RATE_LIMIT_GLOBAL_RPM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(600);
-    let per_key_rpm: u64 = std::env::var("RATE_LIMIT_PER_KEY_RPM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-
-    tracing::info!(global_rpm, per_key_rpm, "rate limiter configured");
+    tracing::info!(
+        global_rpm = cfg.rate_limit_global_rpm,
+        per_key_rpm = cfg.rate_limit_per_key_rpm,
+        "rate limiter configured"
+    );
 
     match command {
-        cli::Command::Serve => {
-            let registry_url = match std::env::var("REGISTRY_URL") {
-                Ok(url) if !url.is_empty() => url,
+        cli::Command::Serve { .. } => {
+            let db_url = db::settings::get_setting(&pool, "registry_url")
+                .await
+                .ok()
+                .flatten();
+
+            let registry_url = match db_url {
+                Some(url) if !url.is_empty() => {
+                    tracing::info!(registry_url = %url, "loaded registry_url from database");
+                    url
+                }
+                _ if !cfg.registry_url.is_empty() => {
+                    if let Err(e) =
+                        db::settings::set_setting(&pool, "registry_url", &cfg.registry_url).await
+                    {
+                        tracing::warn!(error = %e, "failed to seed registry_url into database");
+                    }
+                    cfg.registry_url
+                }
                 _ => {
-                    tracing::error!("REGISTRY_URL environment variable is required");
+                    tracing::error!(
+                        "registry_url not found in database and not set in config file"
+                    );
                     drop(log_guard);
                     std::process::exit(1);
                 }
@@ -196,8 +231,10 @@ async fn main() {
                 }
             };
 
-            let rate_limiter = fairings::RateLimiter::new(global_rpm, per_key_rpm);
-            let rocket = match rocket(pool, rate_limiter, raindex_config) {
+            let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+            let rate_limiter =
+                fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
+            let rocket = match rocket(pool, rate_limiter, shared_raindex) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");
@@ -212,7 +249,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Keys { command } => {
+        cli::Command::Keys { command, .. } => {
             if let Err(e) = cli::handle_keys_command(command, pool).await {
                 tracing::error!(error = %e, "keys command failed");
                 drop(log_guard);

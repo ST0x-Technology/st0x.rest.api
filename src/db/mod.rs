@@ -1,5 +1,6 @@
 mod migrate;
 mod pool;
+pub(crate) mod settings;
 
 pub type DbPool = sqlx::Pool<sqlx::Sqlite>;
 

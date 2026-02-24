@@ -32,13 +32,14 @@ use tracing::Instrument;
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
         tracing::info!(order_hash = ?order_hash, "request received");
         let hash = order_hash.0;
+        let raindex = shared_raindex.read().await;
         let detail = raindex
             .run_with_client(move |client| async move {
                 let ds = RaindexOrderDataSource { client: &client };
@@ -58,13 +59,13 @@ async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<Order
         .into_iter()
         .next()
         .ok_or_else(|| ApiError::NotFound("order not found".into()))?;
-    let quotes = ds.get_order_quotes(&order).await.unwrap_or_default();
+    let quotes = ds.get_order_quotes(&order).await?;
     let io_ratio = quotes
         .first()
         .and_then(|q| q.data.as_ref())
         .map(|d| d.formatted_ratio.clone())
         .unwrap_or_else(|| "-".into());
-    let trades = ds.get_order_trades(&order).await.unwrap_or_default();
+    let trades = ds.get_order_trades(&order).await?;
     let order_type = determine_order_type(&order);
     build_order_detail(&order, order_type, &io_ratio, &trades)
 }
@@ -86,6 +87,7 @@ fn build_order_detail(
     io_ratio: &str,
     trades: &[RaindexTrade],
 ) -> Result<OrderDetail, ApiError> {
+    // The current application only supports single-pair orders (one input vault, one output vault).
     let inputs = order.inputs_list().items();
     let outputs = order.outputs_list().items();
 
@@ -161,8 +163,8 @@ mod tests {
     async fn test_process_get_order_success() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
-            trades: vec![mock_trade()],
-            quotes: vec![mock_quote("1.5")],
+            trades: Ok(vec![mock_trade()]),
+            quotes: Ok(vec![mock_quote("1.5")]),
             calldata: Ok(Bytes::new()),
         };
         let detail = process_get_order(&ds, test_hash()).await.unwrap();
@@ -192,8 +194,8 @@ mod tests {
     async fn test_process_get_order_not_found() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![]),
-            trades: vec![],
-            quotes: vec![],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![]),
             calldata: Ok(Bytes::new()),
         };
         let result = process_get_order(&ds, test_hash()).await;
@@ -204,8 +206,8 @@ mod tests {
     async fn test_process_get_order_empty_trades() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
-            trades: vec![],
-            quotes: vec![mock_quote("2.0")],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![mock_quote("2.0")]),
             calldata: Ok(Bytes::new()),
         };
         let detail = process_get_order(&ds, test_hash()).await.unwrap();
@@ -217,8 +219,8 @@ mod tests {
     async fn test_process_get_order_failed_quote() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
-            trades: vec![],
-            quotes: vec![mock_failed_quote()],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![mock_failed_quote()]),
             calldata: Ok(Bytes::new()),
         };
         let detail = process_get_order(&ds, test_hash()).await.unwrap();
@@ -230,8 +232,32 @@ mod tests {
     async fn test_process_get_order_query_failure() {
         let ds = MockOrderDataSource {
             orders: Err(ApiError::Internal("failed to query orders".into())),
-            trades: vec![],
-            quotes: vec![],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![]),
+            calldata: Ok(Bytes::new()),
+        };
+        let result = process_get_order(&ds, test_hash()).await;
+        assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_order_quotes_failure() {
+        let ds = MockOrderDataSource {
+            orders: Ok(vec![mock_order()]),
+            trades: Ok(vec![]),
+            quotes: Err(ApiError::Internal("failed to query order quotes".into())),
+            calldata: Ok(Bytes::new()),
+        };
+        let result = process_get_order(&ds, test_hash()).await;
+        assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_order_trades_failure() {
+        let ds = MockOrderDataSource {
+            orders: Ok(vec![mock_order()]),
+            trades: Err(ApiError::Internal("failed to query order trades".into())),
+            quotes: Ok(vec![mock_quote("1.5")]),
             calldata: Ok(Bytes::new()),
         };
         let result = process_get_order(&ds, test_hash()).await;

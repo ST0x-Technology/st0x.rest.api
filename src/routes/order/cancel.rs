@@ -29,7 +29,7 @@ use tracing::Instrument;
 pub async fn post_order_cancel(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
@@ -37,6 +37,7 @@ pub async fn post_order_cancel(
     async move {
         tracing::info!(body = ?req, "request received");
         let hash: B256 = req.order_hash;
+        let raindex = shared_raindex.read().await;
         let response = raindex
             .run_with_client(move |client| async move {
                 let ds = RaindexOrderDataSource { client: &client };
@@ -75,15 +76,17 @@ async fn process_cancel_order(
     let mut tokens_returned = Vec::new();
 
     for vault in inputs.iter().chain(outputs.iter()) {
-        let balance_str = vault.formatted_balance();
-        let balance: f64 = balance_str.parse().unwrap_or(0.0);
-        if balance > 0.0 {
+        let balance = vault.balance();
+        let is_zero = balance
+            .is_zero()
+            .map_err(|e| ApiError::Internal(format!("failed to check vault balance: {e}")))?;
+        if !is_zero {
             vaults_to_withdraw += 1;
             let token_info = vault.token();
             tokens_returned.push(TokenReturn {
                 token: token_info.address(),
                 symbol: token_info.symbol().unwrap_or_default(),
-                amount: balance_str,
+                amount: vault.formatted_balance(),
             });
         }
     }
@@ -117,8 +120,8 @@ mod tests {
     async fn test_cancel_order_success() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
-            trades: vec![],
-            quotes: vec![],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![]),
             calldata: Ok(mock_calldata()),
         };
         let result = process_cancel_order(&ds, test_hash()).await.unwrap();
@@ -163,8 +166,8 @@ mod tests {
     async fn test_cancel_order_not_found() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![]),
-            trades: vec![],
-            quotes: vec![],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![]),
             calldata: Ok(mock_calldata()),
         };
         let result = process_cancel_order(&ds, test_hash()).await;
@@ -175,8 +178,8 @@ mod tests {
     async fn test_cancel_order_calldata_error() {
         let ds = MockOrderDataSource {
             orders: Ok(vec![mock_order()]),
-            trades: vec![],
-            quotes: vec![],
+            trades: Ok(vec![]),
+            quotes: Ok(vec![]),
             calldata: Err(ApiError::Internal("failed".into())),
         };
         let result = process_cancel_order(&ds, test_hash()).await;

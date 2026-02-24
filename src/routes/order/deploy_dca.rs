@@ -11,14 +11,13 @@ use tracing::Instrument;
 
 const ORDER_KEY: &str = "st0x-dca";
 const DEPLOYMENT_KEY: &str = "base";
-const INPUT_TOKEN_KEY: &str = "input-token";
-const OUTPUT_TOKEN_KEY: &str = "output-token";
-const DEPOSIT_TOKEN_KEY: &str = "output-token";
-const FIELD_BUDGET_AMOUNT: &str = "budget-amount";
-const FIELD_PERIOD: &str = "period";
-const FIELD_PERIOD_UNIT: &str = "period-unit";
-const FIELD_START_IO: &str = "start-io";
-const FIELD_FLOOR_IO: &str = "floor-io";
+const INPUT_TOKEN_KEY: &str = "input";
+const OUTPUT_TOKEN_KEY: &str = "output";
+const DEPOSIT_TOKEN_KEY: &str = "output";
+const FIELD_AMOUNT_PER_EPOCH: &str = "amount-per-epoch";
+const FIELD_TIME_PER_AMOUNT_EPOCH: &str = "time-per-amount-epoch";
+const FIELD_INITIAL_IO: &str = "initial-io";
+const FIELD_BASELINE: &str = "baseline";
 
 #[utoipa::path(
     post,
@@ -38,13 +37,14 @@ const FIELD_FLOOR_IO: &str = "floor-io";
 pub async fn post_order_dca(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     request: Json<DeployDcaOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let raindex = shared_raindex.read().await;
         let response = raindex
             .run_with_registry(move |registry| async move {
                 let gui = registry
@@ -80,20 +80,25 @@ pub(crate) async fn process_deploy_dca(
     gui.set_select_token(OUTPUT_TOKEN_KEY.to_string(), req.output_token.to_string())
         .await?;
 
-    gui.set_field_value(FIELD_BUDGET_AMOUNT.to_string(), req.budget_amount.clone())?;
+    gui.set_field_value(
+        FIELD_AMOUNT_PER_EPOCH.to_string(),
+        req.budget_amount.clone(),
+    )?;
 
-    gui.set_field_value(FIELD_PERIOD.to_string(), req.period.to_string())?;
-
-    let period_unit_value = match req.period_unit {
-        PeriodUnit::Days => "days",
-        PeriodUnit::Hours => "hours",
-        PeriodUnit::Minutes => "minutes",
+    let unit_seconds: u64 = match req.period_unit {
+        PeriodUnit::Days => 86400,
+        PeriodUnit::Hours => 3600,
+        PeriodUnit::Minutes => 60,
     };
-    gui.set_field_value(FIELD_PERIOD_UNIT.to_string(), period_unit_value.to_string())?;
+    let time_per_epoch = u64::from(req.period) * unit_seconds;
+    gui.set_field_value(
+        FIELD_TIME_PER_AMOUNT_EPOCH.to_string(),
+        time_per_epoch.to_string(),
+    )?;
 
-    gui.set_field_value(FIELD_START_IO.to_string(), req.start_io)?;
+    gui.set_field_value(FIELD_INITIAL_IO.to_string(), req.start_io)?;
 
-    gui.set_field_value(FIELD_FLOOR_IO.to_string(), req.floor_io)?;
+    gui.set_field_value(FIELD_BASELINE.to_string(), req.floor_io)?;
 
     gui.set_deposit(DEPOSIT_TOKEN_KEY.to_string(), req.budget_amount)
         .await?;

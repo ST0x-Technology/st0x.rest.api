@@ -28,12 +28,13 @@ use tracing::Instrument;
 pub async fn get_orders_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrdersByTxResponse>, ApiError> {
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
+        let raindex = shared_raindex.read().await;
         raindex
             .run_with_client(move |_client| async move { todo!() })
             .await
@@ -64,13 +65,14 @@ pub async fn get_orders_by_tx(
 pub async fn get_orders_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
-    raindex: &State<crate::raindex::RaindexProvider>,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,
 ) -> Result<Json<OrdersListResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
+        let raindex = shared_raindex.read().await;
         raindex
             .run_with_client(move |_client| async move { todo!() })
             .await
