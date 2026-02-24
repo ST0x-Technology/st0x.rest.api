@@ -106,11 +106,6 @@ in {
           proxyPass = "http://127.0.0.1:8000";
         };
       };
-      virtualHosts."docs.st0x.io" = {
-        enableACME = true;
-        forceSSL = true;
-        root = docsRoot;
-      };
     };
   };
 
@@ -180,6 +175,10 @@ in {
 
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";
+
+  system.activationScripts.st0x-docs.text = ''
+    ln -sfn ${docsRoot} /var/lib/st0x-docs
+  '';
 
   system.stateVersion = "24.11";
 }

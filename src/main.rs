@@ -23,6 +23,7 @@ use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi};
+use rocket::fs::{FileServer, Options};
 use utoipa_swagger_ui::SwaggerUi;
 
 struct SecurityAddon;
@@ -112,10 +113,13 @@ pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
+    docs_dir: String,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
+
+    let options = Options::Index | Options::NormalizeDirs;
 
     Ok(rocket::custom(figment)
         .manage(pool)
@@ -129,6 +133,7 @@ pub(crate) fn rocket(
         .mount("/v1/trades", routes::trades::routes())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
+        .mount("/docs", FileServer::new(docs_dir, options))
         .mount(
             "/",
             SwaggerUi::new("/swagger/<tail..>").url("/api-doc/openapi.json", ApiDoc::openapi()),
@@ -232,7 +237,15 @@ async fn main() {
             let shared_raindex = tokio::sync::RwLock::new(raindex_config);
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
-            let rocket = match rocket(pool, rate_limiter, shared_raindex) {
+
+            if !std::path::Path::new(&cfg.docs_dir).is_dir() {
+                tracing::error!(docs_dir = %cfg.docs_dir, "docs_dir is not a valid directory");
+                drop(log_guard);
+                std::process::exit(1);
+            }
+            tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
+
+            let rocket = match rocket(pool, rate_limiter, shared_raindex, cfg.docs_dir) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");

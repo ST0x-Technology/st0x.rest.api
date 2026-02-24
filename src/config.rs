@@ -8,6 +8,7 @@ pub struct Config {
     pub registry_url: String,
     pub rate_limit_global_rpm: u64,
     pub rate_limit_per_key_rpm: u64,
+    pub docs_dir: String,
 }
 
 impl Config {
