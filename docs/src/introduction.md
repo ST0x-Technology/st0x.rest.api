@@ -11,4 +11,4 @@ The st0x API powers the [st0x platform](https://platform.st0x.io/), providing pr
 
 **Full API Reference:** The interactive Swagger UI is available at [https://api.st0x.io/swagger/](https://api.st0x.io/swagger/) with complete request/response schemas for every endpoint.
 
-This guide focuses on the typical workflows and how the endpoints connect together.
+This guide focuses on the typical workflows and how the endpoints connect.

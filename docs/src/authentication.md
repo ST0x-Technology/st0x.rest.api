@@ -37,6 +37,7 @@ curl -u "abc123:mysecret" https://api.st0x.io/v1/tokens
 | Status | Code | When |
 |--------|------|------|
 | 401 | `UNAUTHORIZED` | Missing or invalid credentials |
+
 ```json
 {
   "error": {
@@ -44,3 +45,4 @@ curl -u "abc123:mysecret" https://api.st0x.io/v1/tokens
     "message": "Invalid API key or secret"
   }
 }
+```

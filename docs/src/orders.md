@@ -215,6 +215,8 @@ GET /v1/orders/tx/{tx_hash}
 
 Get all orders created in a specific transaction.
 
+### Request
+
 ```bash
 curl https://api.st0x.io/v1/orders/tx/0xTxHash... \
   -H "Authorization: Basic <credentials>"

@@ -71,4 +71,4 @@ curl https://api.st0x.io/v1/order/0xinvalidhash \
 }
 ```
 
-Rate limited responses include a `Retry-After: 60` header indicating how many seconds to wait.
+Rate-limited responses include a `Retry-After: 60` header indicating how many seconds to wait.
