@@ -19,11 +19,11 @@ pub(crate) const CHAIN_ID: u32 = 8453;
 mod test_helpers;
 
 use clap::Parser;
+use rocket::fs::{FileServer, Options};
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi};
-use rocket::fs::{FileServer, Options};
 use utoipa_swagger_ui::SwaggerUi;
 
 struct SecurityAddon;
