@@ -19,6 +19,7 @@ pub(crate) const CHAIN_ID: u32 = 8453;
 mod test_helpers;
 
 use clap::Parser;
+use rocket::fs::{FileServer, Options};
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
@@ -63,7 +64,6 @@ enum StartupError {
         routes::trades::get_trades_by_tx,
         routes::trades::get_trades_by_address,
         routes::registry::get_registry,
-        routes::admin::put_registry,
     ),
     components(),
     modifiers(&SecurityAddon),
@@ -75,7 +75,6 @@ enum StartupError {
         (name = "Orders", description = "Order listing and query endpoints"),
         (name = "Trades", description = "Trade listing and query endpoints"),
         (name = "Registry", description = "Registry information endpoints"),
-        (name = "Admin", description = "Admin management endpoints"),
     ),
     info(
         title = "st0x REST API",
@@ -114,10 +113,13 @@ pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
+    docs_dir: String,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
+
+    let options = Options::Index | Options::NormalizeDirs;
 
     Ok(rocket::custom(figment)
         .manage(pool)
@@ -131,6 +133,7 @@ pub(crate) fn rocket(
         .mount("/v1/trades", routes::trades::routes())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
+        .mount("/docs", FileServer::new(docs_dir, options))
         .mount(
             "/",
             SwaggerUi::new("/swagger/<tail..>").url("/api-doc/openapi.json", ApiDoc::openapi()),
@@ -234,7 +237,15 @@ async fn main() {
             let shared_raindex = tokio::sync::RwLock::new(raindex_config);
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
-            let rocket = match rocket(pool, rate_limiter, shared_raindex) {
+
+            if !std::path::Path::new(&cfg.docs_dir).is_dir() {
+                tracing::error!(docs_dir = %cfg.docs_dir, "docs_dir is not a valid directory");
+                drop(log_guard);
+                std::process::exit(1);
+            }
+            tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
+
+            let rocket = match rocket(pool, rate_limiter, shared_raindex, cfg.docs_dir) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");

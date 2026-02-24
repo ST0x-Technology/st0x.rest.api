@@ -1,4 +1,4 @@
-{ pkgs, lib, modulesPath, ... }:
+{ pkgs, lib, modulesPath, docsRoot, ... }:
 
 let
   inherit (import ./keys.nix) roles;
@@ -175,6 +175,10 @@ in {
 
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";
+
+  system.activationScripts.st0x-docs.text = ''
+    ln -sfn ${docsRoot} /var/lib/st0x-docs
+  '';
 
   system.stateVersion = "24.11";
 }

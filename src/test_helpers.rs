@@ -68,7 +68,8 @@ impl TestClientBuilder {
         };
 
         let shared_raindex = tokio::sync::RwLock::new(raindex_config);
-        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex)
+        let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir)
             .expect("valid rocket instance")
             .manage(crate::routes::tokens::TokensConfig::with_url(
                 token_list_url,

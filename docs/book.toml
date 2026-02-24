@@ -1,0 +1,13 @@
+[book]
+title = "st0x API Documentation"
+authors = ["st0x Technology"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "light"
+git-repository-url = "https://github.com/ST0x-Technology/st0x-rest-api"
+site-url = "/docs/"

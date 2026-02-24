@@ -23,6 +23,10 @@
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
 
+          specialArgs = {
+            docsRoot = self.packages.x86_64-linux.st0x-docs;
+          };
+
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
@@ -55,7 +59,17 @@
             inherit craneLib;
             inherit (pkgs) sqlx-cli;
           };
+          st0x-docs = pkgs.stdenv.mkDerivation {
+            pname = "st0x-docs";
+            version = "0.1.0";
+            src = ./docs;
+            nativeBuildInputs = [ pkgs.mdbook ];
+            buildPhase = "mdbook build";
+            installPhase = "cp -r book $out";
+          };
+
         in rainixPkgs // deployPkgs // {
+          inherit st0x-docs;
           rs-test = rainix.mkTask.${system} {
             name = "rs-test";
             body = ''
@@ -158,6 +172,7 @@
             [
               sqlx-cli
               terraform
+              mdbook
               ragenix.packages.${system}.default
               packages.rs-test
               packages.prepSolArtifacts
