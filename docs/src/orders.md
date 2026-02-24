@@ -10,7 +10,7 @@ The order endpoints return transaction calldata — the API does not execute tra
 POST /v1/order/dca
 ```
 
-Returns calldata to deploy a DCA order that periodically buys a token at a set interval, with optional price bounds.
+Returns calldata to deploy a DCA order that periodically buys a token at a set interval, with price bounds.
 
 ### Request
 
