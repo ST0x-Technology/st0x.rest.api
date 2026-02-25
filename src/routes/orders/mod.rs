@@ -12,6 +12,7 @@ use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
+pub(crate) const MAX_PAGE_SIZE: u16 = 50;
 
 #[async_trait(?Send)]
 pub(crate) trait OrdersListDataSource {
