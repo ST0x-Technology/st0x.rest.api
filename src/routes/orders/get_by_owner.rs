@@ -1,6 +1,6 @@
 use super::{
     build_order_summary, build_pagination, OrdersListDataSource, RaindexOrdersListDataSource,
-    DEFAULT_PAGE_SIZE,
+    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
@@ -27,7 +27,9 @@ pub(crate) async fn process_get_orders_by_owner(
     };
 
     let page_num = page.unwrap_or(1);
-    let effective_page_size = page_size.unwrap_or(DEFAULT_PAGE_SIZE as u16);
+    let effective_page_size = page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE as u16)
+        .min(MAX_PAGE_SIZE);
     let (orders, total_count) = ds
         .get_orders_list(filters, Some(page_num), Some(effective_page_size))
         .await?;
