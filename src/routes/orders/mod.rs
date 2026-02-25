@@ -19,6 +19,7 @@ pub(crate) trait OrdersListDataSource {
         &self,
         filters: GetOrdersFilters,
         page: Option<u16>,
+        page_size: Option<u16>,
     ) -> Result<(Vec<RaindexOrder>, u32), ApiError>;
 
     async fn get_order_quotes(
@@ -37,10 +38,11 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         &self,
         filters: GetOrdersFilters,
         page: Option<u16>,
+        page_size: Option<u16>,
     ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
         let result = self
             .client
-            .get_orders(None, Some(filters), page)
+            .get_orders(None, Some(filters), page, page_size)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
@@ -148,6 +150,7 @@ pub(crate) mod test_fixtures {
             &self,
             _filters: GetOrdersFilters,
             _page: Option<u16>,
+            _page_size: Option<u16>,
         ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
             match &self.orders {
                 Ok(orders) => Ok((orders.clone(), self.total_count)),

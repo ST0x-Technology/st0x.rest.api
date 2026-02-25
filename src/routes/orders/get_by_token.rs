@@ -19,7 +19,8 @@ pub(crate) async fn process_get_orders_by_token(
     ds: &dyn OrdersListDataSource,
     address: Address,
     side: Option<OrderSide>,
-    page: Option<u32>,
+    page: Option<u16>,
+    page_size: Option<u16>,
 ) -> Result<OrdersListResponse, ApiError> {
     let token_filter = match side {
         Some(OrderSide::Input) => GetOrdersTokenFilter {
@@ -43,22 +44,35 @@ pub(crate) async fn process_get_orders_by_token(
     };
 
     let page_num = page.unwrap_or(1);
-    let (orders, total_count) = ds.get_orders_list(filters, Some(page_num as u16)).await?;
+    let effective_page_size = page_size.unwrap_or(DEFAULT_PAGE_SIZE as u16);
+    let (orders, total_count) = ds
+        .get_orders_list(filters, Some(page_num), Some(effective_page_size))
+        .await?;
 
     let quote_futures: Vec<_> = orders.iter().map(|o| ds.get_order_quotes(o)).collect();
     let quote_results = join_all(quote_futures).await;
 
     let mut summaries = Vec::with_capacity(orders.len());
     for (order, quotes_result) in orders.iter().zip(quote_results) {
-        let io_ratio = quotes_result
-            .ok()
-            .and_then(|quotes| quotes.first().and_then(|q| q.data.as_ref()).cloned())
-            .map(|d| d.formatted_ratio)
-            .unwrap_or_else(|| "-".into());
+        let io_ratio = match quotes_result {
+            Ok(quotes) => quotes
+                .first()
+                .and_then(|q| q.data.as_ref())
+                .map(|d| d.formatted_ratio.clone())
+                .unwrap_or_else(|| "-".into()),
+            Err(err) => {
+                tracing::warn!(
+                    order_hash = ?order.order_hash(),
+                    error = ?err,
+                    "quote fetch failed; using fallback io_ratio"
+                );
+                "-".into()
+            }
+        };
         summaries.push(build_order_summary(order, &io_ratio)?);
     }
 
-    let pagination = build_pagination(total_count, page_num, DEFAULT_PAGE_SIZE);
+    let pagination = build_pagination(total_count, page_num.into(), effective_page_size.into());
     Ok(OrdersListResponse {
         orders: summaries,
         pagination,
@@ -77,6 +91,7 @@ pub(crate) async fn process_get_orders_by_token(
     responses(
         (status = 200, description = "Paginated list of orders for token", body = OrdersListResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 422, description = "Unprocessable entity", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -96,11 +111,12 @@ pub async fn get_orders_by_token(
         let addr = address.0;
         let side = params.side;
         let page = params.page;
+        let page_size = params.page_size;
         let raindex = shared_raindex.read().await;
         let response = raindex
             .run_with_client(move |client| async move {
                 let ds = RaindexOrdersListDataSource { client: &client };
-                process_get_orders_by_token(&ds, addr, side, page).await
+                process_get_orders_by_token(&ds, addr, side, page, page_size).await
             })
             .await
             .map_err(ApiError::from)??;
@@ -130,7 +146,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(&ds, addr, None, None)
+        let result = process_get_orders_by_token(&ds, addr, None, None, None)
             .await
             .unwrap();
 
@@ -153,7 +169,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(&ds, addr, Some(OrderSide::Input), None)
+        let result = process_get_orders_by_token(&ds, addr, Some(OrderSide::Input), None, None)
             .await
             .unwrap();
 
@@ -172,7 +188,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(&ds, addr, None, None)
+        let result = process_get_orders_by_token(&ds, addr, None, None, None)
             .await
             .unwrap();
 
@@ -189,7 +205,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(&ds, addr, None, None).await;
+        let result = process_get_orders_by_token(&ds, addr, None, None, None).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 

@@ -36,7 +36,7 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
         };
         let result = self
             .client
-            .get_orders(None, Some(filters), None)
+            .get_orders(None, Some(filters), None, None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
