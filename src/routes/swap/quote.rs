@@ -1,4 +1,4 @@
-use super::{RaindexSwapDataSource, SwapDataSource};
+use super::{RaindexSwapDataSource, SwapDataSource, SwapQuoteCache};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -32,18 +32,26 @@ pub async fn post_swap_quote(
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
+    swap_cache: &State<SwapQuoteCache>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let raindex = shared_raindex.read().await;
-        let response = raindex
-            .run_with_client(move |client| async move {
-                let ds = RaindexSwapDataSource { client: &client };
-                process_swap_quote(&ds, req).await
+
+        let cache_key = (req.input_token, req.output_token, req.output_amount.clone());
+        let response = swap_cache
+            .get_or_try_insert(cache_key, || async {
+                let raindex = shared_raindex.read().await;
+                raindex
+                    .run_with_client(move |client| async move {
+                        let ds = RaindexSwapDataSource { client: &client };
+                        process_swap_quote(&ds, req).await
+                    })
+                    .await
+                    .map_err(ApiError::from)?
             })
-            .await
-            .map_err(ApiError::from)??;
+            .await?;
+
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -286,5 +294,47 @@ mod tests {
             body["error"]["message"],
             "failed to initialize orderbook client"
         );
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_quote_returns_cached_entry() {
+        use super::SwapQuoteCache;
+        use crate::types::swap::SwapQuoteResponse;
+
+        let config = mock_invalid_raindex_config().await;
+        let client = TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let dummy = SwapQuoteResponse {
+            input_token: USDC,
+            output_token: WETH,
+            output_amount: "100".into(),
+            estimated_output: "100".into(),
+            estimated_input: "250".into(),
+            estimated_io_ratio: "2.5".into(),
+        };
+
+        let cache = client
+            .rocket()
+            .state::<SwapQuoteCache>()
+            .expect("SwapQuoteCache in state");
+        cache.insert((USDC, WETH, "100".to_string()), dummy).await;
+
+        let response = client
+            .post("/v1/swap/quote")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::JSON)
+            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["estimatedInput"], "250");
+        assert_eq!(body["estimatedIoRatio"], "2.5");
     }
 }

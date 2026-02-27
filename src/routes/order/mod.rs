@@ -3,7 +3,9 @@ mod deploy_dca;
 mod deploy_solver;
 mod get_order;
 
+use crate::cache::AppCache;
 use crate::error::ApiError;
+use crate::types::order::OrderDetail;
 use alloy::primitives::{Bytes, B256};
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
@@ -11,6 +13,16 @@ use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrd
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
+use std::time::Duration;
+
+const ORDER_CACHE_TTL: Duration = Duration::from_secs(60);
+const ORDER_CACHE_CAPACITY: u64 = 1_000;
+
+pub(crate) type OrderDetailCache = AppCache<B256, OrderDetail>;
+
+pub(crate) fn order_detail_cache() -> OrderDetailCache {
+    AppCache::new(ORDER_CACHE_CAPACITY, ORDER_CACHE_TTL)
+}
 
 #[async_trait(?Send)]
 pub(crate) trait OrderDataSource {
