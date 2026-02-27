@@ -8884,6 +8884,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "clap",
+ "futures",
  "rain-math-float",
  "rain_orderbook_bindings",
  "rain_orderbook_common",
