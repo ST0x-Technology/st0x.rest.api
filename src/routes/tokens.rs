@@ -1,4 +1,5 @@
 use crate::auth::AuthenticatedKey;
+use crate::cache::AppCache;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::tokens::{RemoteTokenList, TokenInfo, TokenListResponse};
@@ -11,6 +12,9 @@ use tracing::Instrument;
 const TOKEN_LIST_URL: &str = "https://raw.githubusercontent.com/S01-Issuer/st0x-tokens/ad1a637a79d5a220ad089aecdc5b7239d3473f6e/src/st0xTokens.json";
 const TARGET_CHAIN_ID: u32 = crate::CHAIN_ID;
 const TOKEN_LIST_TIMEOUT_SECS: u64 = 10;
+const TOKEN_CACHE_TTL: Duration = Duration::from_secs(600);
+
+pub(crate) type TokenCache = AppCache<(), TokenListResponse>;
 
 pub(crate) struct TokensConfig {
     pub(crate) url: String,
@@ -38,12 +42,17 @@ impl TokensConfig {
 
 pub(crate) fn fairing() -> AdHoc {
     AdHoc::on_ignite("Tokens Config", |rocket| async {
-        if rocket.state::<TokensConfig>().is_some() {
+        let rocket = if rocket.state::<TokensConfig>().is_some() {
             tracing::info!("TokensConfig already managed; skipping default initialization");
             rocket
         } else {
             tracing::info!(url = %TOKEN_LIST_URL, "initializing default TokensConfig");
             rocket.manage(TokensConfig::default())
+        };
+        if rocket.state::<TokenCache>().is_some() {
+            rocket
+        } else {
+            rocket.manage(TokenCache::new(1, TOKEN_CACHE_TTL))
         }
     })
 }
@@ -83,51 +92,63 @@ pub async fn get_tokens(
     _key: AuthenticatedKey,
     span: TracingSpan,
     tokens_config: &State<TokensConfig>,
+    token_cache: &State<TokenCache>,
 ) -> Result<Json<TokenListResponse>, ApiError> {
     let url = tokens_config.url.clone();
     let client = tokens_config.client.clone();
     async move {
         tracing::info!("request received");
 
-        tracing::info!(url = %url, timeout_secs = TOKEN_LIST_TIMEOUT_SECS, "fetching token list");
+        let result = token_cache
+            .get_or_try_insert((), || async {
+                tracing::info!(url = %url, timeout_secs = TOKEN_LIST_TIMEOUT_SECS, "fetching token list");
 
-        let response = client
-            .get(&url)
-            .timeout(Duration::from_secs(TOKEN_LIST_TIMEOUT_SECS))
-            .send()
-            .await
-            .map_err(TokenError::Fetch)?;
+                let response = client
+                    .get(&url)
+                    .timeout(Duration::from_secs(TOKEN_LIST_TIMEOUT_SECS))
+                    .send()
+                    .await
+                    .map_err(TokenError::Fetch)
+                    .map_err(ApiError::from)?;
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(TokenError::BadStatus(status).into());
-        }
-
-        let remote: RemoteTokenList = response.json().await.map_err(TokenError::Deserialize)?;
-
-        let tokens: Vec<TokenInfo> = remote
-            .tokens
-            .into_iter()
-            .filter(|t| t.chain_id == TARGET_CHAIN_ID)
-            .map(|t| {
-                let isin = t
-                    .extensions
-                    .get("isin")
-                    .or_else(|| t.extensions.get("ISIN"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                TokenInfo {
-                    address: t.address,
-                    symbol: t.symbol,
-                    name: t.name,
-                    isin,
-                    decimals: t.decimals,
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(ApiError::from(TokenError::BadStatus(status)));
                 }
-            })
-            .collect();
 
-        tracing::info!(count = tokens.len(), "returning tokens");
-        Ok(Json(TokenListResponse { tokens }))
+                let remote: RemoteTokenList = response
+                    .json()
+                    .await
+                    .map_err(TokenError::Deserialize)
+                    .map_err(ApiError::from)?;
+
+                let tokens: Vec<TokenInfo> = remote
+                    .tokens
+                    .into_iter()
+                    .filter(|t| t.chain_id == TARGET_CHAIN_ID)
+                    .map(|t| {
+                        let isin = t
+                            .extensions
+                            .get("isin")
+                            .or_else(|| t.extensions.get("ISIN"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        TokenInfo {
+                            address: t.address,
+                            symbol: t.symbol,
+                            name: t.name,
+                            isin,
+                            decimals: t.decimals,
+                        }
+                    })
+                    .collect();
+
+                Ok(TokenListResponse { tokens })
+            })
+            .await?;
+
+        tracing::info!(count = result.tokens.len(), "returning tokens");
+        Ok(Json(result))
     }
     .instrument(span.0)
     .await
@@ -346,5 +367,66 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("failed to retrieve token list"));
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_cache_hit_on_second_request() {
+        let body = r#"{"tokens":[{"chainId":8453,"address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","name":"USD Coin","symbol":"USDC","decimals":6}]}"#;
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response_bytes: &'static [u8] =
+            Box::leak(response_bytes.into_bytes().into_boxed_slice());
+        let url = mock_server(response_bytes).await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let first = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(first.status(), Status::Ok);
+
+        let second = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(second.status(), Status::Ok);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&second.into_string().await.unwrap()).unwrap();
+        let tokens = body["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0]["symbol"], "USDC");
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_error_response_is_not_cached() {
+        let url = mock_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let client = TestClientBuilder::new().token_list_url(&url).build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::InternalServerError);
+
+        let token_cache = client
+            .rocket()
+            .state::<super::TokenCache>()
+            .expect("TokenCache in state");
+        let cached = token_cache.get(&()).await;
+        assert!(cached.is_none(), "error response must not be cached");
     }
 }
