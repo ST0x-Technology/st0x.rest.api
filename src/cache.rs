@@ -30,18 +30,13 @@ where
         self.0.insert(key, value).await
     }
 
-    pub(crate) async fn get_or_try_insert<F, Fut, E>(&self, key: K, fetch: F) -> Result<V, E>
+    pub(crate) async fn get_or_try_insert<F, Fut, E>(&self, key: K, fetch: F) -> Result<V, Arc<E>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
+        E: Send + Sync + 'static,
     {
-        if let Some(cached) = self.0.get(&key).await {
-            tracing::info!("cache hit");
-            return Ok(cached);
-        }
-        let value = fetch().await?;
-        self.0.insert(key, value.clone()).await;
-        Ok(value)
+        self.0.try_get_with(key, fetch()).await
     }
 
     pub(crate) fn invalidate_all(&self) {
@@ -118,7 +113,8 @@ mod tests {
     #[rocket::async_test]
     async fn test_get_or_try_insert_calls_fetch_on_miss() {
         let cache: AppCache<&str, u32> = AppCache::new(10, Duration::from_secs(60));
-        let result: Result<u32, &str> = cache.get_or_try_insert("key", || async { Ok(42) }).await;
+        let result: Result<u32, Arc<String>> =
+            cache.get_or_try_insert("key", || async { Ok(42) }).await;
         assert_eq!(result.unwrap(), 42);
         assert_eq!(cache.get(&"key").await, Some(42));
     }
@@ -127,7 +123,7 @@ mod tests {
     async fn test_get_or_try_insert_returns_cached_on_hit() {
         let cache: AppCache<&str, u32> = AppCache::new(10, Duration::from_secs(60));
         cache.insert("key", 42).await;
-        let result: Result<u32, &str> = cache
+        let result: Result<u32, Arc<String>> = cache
             .get_or_try_insert("key", || async { panic!("fetch should not be called") })
             .await;
         assert_eq!(result.unwrap(), 42);
@@ -136,8 +132,8 @@ mod tests {
     #[rocket::async_test]
     async fn test_get_or_try_insert_does_not_cache_errors() {
         let cache: AppCache<&str, u32> = AppCache::new(10, Duration::from_secs(60));
-        let result: Result<u32, &str> = cache
-            .get_or_try_insert("key", || async { Err("fail") })
+        let result: Result<u32, Arc<String>> = cache
+            .get_or_try_insert("key", || async { Err("fail".to_string()) })
             .await;
         assert!(result.is_err());
         assert!(cache.get(&"key").await.is_none());
