@@ -4,7 +4,6 @@ use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::order::{DeployOrderResponse, DeploySolverOrderRequest};
 use rocket::serde::json::Json;
 use rocket::State;
-use tracing::Instrument;
 
 #[utoipa::path(
     post,
@@ -28,15 +27,6 @@ pub async fn post_order_solver(
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
-    let req = request.into_inner();
-    async move {
-        tracing::info!(body = ?req, "request received");
-        let raindex = shared_raindex.read().await;
-        raindex
-            .run_with_client(move |_client| async move { todo!() })
-            .await
-            .map_err(ApiError::from)?
-    }
-    .instrument(span.0)
-    .await
+    let _ = (shared_raindex, span, request);
+    todo!()
 }
