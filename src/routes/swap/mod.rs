@@ -138,6 +138,10 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
             tracing::warn!(error = %e, "invalid request parameters");
             ApiError::BadRequest(e.to_string())
         }
+        RaindexError::PreflightError(_) => {
+            tracing::warn!(error = %e, "preflight simulation failed");
+            ApiError::BadRequest(e.to_readable_msg())
+        }
         _ => {
             tracing::error!(error = %e, "calldata generation failed");
             ApiError::Internal("failed to generate calldata".into())
