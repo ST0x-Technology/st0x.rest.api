@@ -36,6 +36,12 @@ pub enum ApiError {
     RateLimited(String),
 }
 
+impl From<std::sync::Arc<ApiError>> for ApiError {
+    fn from(arc: std::sync::Arc<ApiError>) -> Self {
+        (*arc).clone()
+    }
+}
+
 impl<'r> Responder<'r, 'static> for ApiError {
     fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
         let (status, code, message) = match &self {
