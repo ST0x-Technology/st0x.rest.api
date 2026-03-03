@@ -31,11 +31,8 @@ pub async fn post_order_dca(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let raindex = shared_raindex.read().await;
-        raindex
-            .run_with_client(move |_client| async move { todo!() })
-            .await
-            .map_err(ApiError::from)?
+        let _raindex = shared_raindex.read().await;
+        todo!()
     }
     .instrument(span.0)
     .await

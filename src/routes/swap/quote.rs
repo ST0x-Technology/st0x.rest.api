@@ -37,13 +37,10 @@ pub async fn post_swap_quote(
     async move {
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
-        let response = raindex
-            .run_with_client(move |client| async move {
-                let ds = RaindexSwapDataSource { client: &client };
-                process_swap_quote(&ds, req).await
-            })
-            .await
-            .map_err(ApiError::from)??;
+        let ds = RaindexSwapDataSource {
+            client: raindex.client(),
+        };
+        let response = process_swap_quote(&ds, req).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -125,12 +122,9 @@ async fn process_swap_quote(
 mod tests {
     use super::*;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
-    use crate::test_helpers::{
-        basic_auth_header, mock_candidate, mock_invalid_raindex_config, mock_order, seed_api_key,
-        TestClientBuilder,
-    };
+    use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
     use alloy::primitives::address;
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Status};
 
     const USDC: alloy::primitives::Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: alloy::primitives::Address = address!("4200000000000000000000000000000000000006");
@@ -260,31 +254,5 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[rocket::async_test]
-    async fn test_swap_quote_500_when_client_init_fails() {
-        let config = mock_invalid_raindex_config().await;
-        let client = TestClientBuilder::new()
-            .raindex_config(config)
-            .build()
-            .await;
-        let (key_id, secret) = seed_api_key(&client).await;
-        let header = basic_auth_header(&key_id, &secret);
-        let response = client
-            .post("/v1/swap/quote")
-            .header(Header::new("Authorization", header))
-            .header(ContentType::JSON)
-            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::InternalServerError);
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
-        assert_eq!(
-            body["error"]["message"],
-            "failed to initialize orderbook client"
-        );
     }
 }
