@@ -61,7 +61,7 @@ impl TestClientBuilder {
                     Some(url) => url,
                     None => mock_raindex_registry_url().await,
                 };
-                crate::raindex::RaindexProvider::load(&registry_url)
+                crate::raindex::RaindexProvider::load(&registry_url, None)
                     .await
                     .expect("mock raindex config from registry url")
             }
@@ -111,16 +111,9 @@ async fn mock_token_list_url() -> String {
 
 pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
     let registry_url = mock_raindex_registry_url().await;
-    crate::raindex::RaindexProvider::load(&registry_url)
+    crate::raindex::RaindexProvider::load(&registry_url, None)
         .await
         .expect("mock raindex config")
-}
-
-pub(crate) async fn mock_invalid_raindex_config() -> crate::raindex::RaindexProvider {
-    let registry_url = mock_raindex_registry_url_with_settings("not valid yaml: [").await;
-    crate::raindex::RaindexProvider::load(&registry_url)
-        .await
-        .expect("mock invalid raindex config")
 }
 
 pub(crate) async fn mock_raindex_registry_url() -> String {
