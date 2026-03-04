@@ -94,7 +94,7 @@ mod tests {
         let client = TestClientBuilder::new().build().await;
         let (key_id, secret) = seed_admin_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
-        let new_url = mock_raindex_registry_url().await;
+        let new_url = mock_raindex_registry_url(None).await;
 
         let response = client
             .put("/admin/registry")
@@ -189,7 +189,7 @@ mod tests {
         let client = TestClientBuilder::new().build().await;
         let (key_id, secret) = seed_admin_key(&client).await;
         let header = basic_auth_header(&key_id, &secret);
-        let new_url = mock_raindex_registry_url().await;
+        let new_url = mock_raindex_registry_url(None).await;
 
         client
             .put("/admin/registry")
