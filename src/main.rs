@@ -143,7 +143,6 @@ pub(crate) fn rocket(
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger)
         .attach(fairings::RateLimitHeadersFairing)
-        .attach(routes::tokens::fairing())
         .attach(cors))
 }
 

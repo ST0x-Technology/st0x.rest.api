@@ -61,6 +61,19 @@ impl RaindexProvider {
         self.registry.registry_url()
     }
 
+    pub(crate) fn get_remote_token_urls(&self) -> Result<Vec<String>, RaindexProviderError> {
+        let client = self
+            .registry
+            .get_raindex_client()
+            .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
+        let urls = client
+            .get_remote_tokens()
+            .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?
+            .map(|cfg| cfg.urls.into_iter().map(|u| u.to_string()).collect())
+            .unwrap_or_default();
+        Ok(urls)
+    }
+
     pub(crate) async fn run_with_client<T, F, Fut>(&self, f: F) -> Result<T, RaindexProviderError>
     where
         T: Send + 'static,
