@@ -10,7 +10,6 @@ mod error;
 mod fairings;
 mod raindex;
 mod routes;
-mod sync;
 mod telemetry;
 mod types;
 
@@ -223,18 +222,6 @@ async fn main() {
                 }
             };
 
-            let mut raindex_config = match raindex::RaindexProvider::load(&registry_url).await {
-                Ok(config) => {
-                    tracing::info!(registry_url = %registry_url, "raindex registry loaded");
-                    config
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, registry_url = %registry_url, "failed to load raindex registry");
-                    drop(log_guard);
-                    std::process::exit(1);
-                }
-            };
-
             let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
             if let Some(parent) = local_db_path.parent() {
                 if !parent.exists() {
@@ -246,17 +233,22 @@ async fn main() {
                 }
             }
 
-            let settings_yaml = raindex_config.registry().settings();
-            let _sync_handle = match sync::start_sync(settings_yaml, local_db_path.clone()) {
-                Ok(handle) => handle,
+            let raindex_config = match raindex::RaindexProvider::load(
+                &registry_url,
+                Some(local_db_path),
+            )
+            .await
+            {
+                Ok(config) => {
+                    tracing::info!(registry_url = %registry_url, "raindex registry loaded");
+                    config
+                }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to start local db sync");
+                    tracing::error!(error = %e, registry_url = %registry_url, "failed to load raindex registry");
                     drop(log_guard);
                     std::process::exit(1);
                 }
             };
-
-            raindex_config.set_db_path(local_db_path);
 
             let shared_raindex = tokio::sync::RwLock::new(raindex_config);
             let rate_limiter =
