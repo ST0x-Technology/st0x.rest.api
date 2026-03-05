@@ -38,7 +38,8 @@ impl RaindexProvider {
                     .map_err(|e| RaindexProviderError::RegistryLoad(e.to_string()))?;
 
                 let client = registry
-                    .get_raindex_client_native(db.clone())
+                    .get_raindex_client(db.clone())
+                    .await
                     .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
 
                 Ok(RaindexProvider {
