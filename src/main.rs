@@ -10,7 +10,6 @@ mod error;
 mod fairings;
 mod raindex;
 mod routes;
-mod sync;
 mod telemetry;
 mod types;
 
