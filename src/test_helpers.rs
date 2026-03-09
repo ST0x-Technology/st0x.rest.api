@@ -13,7 +13,6 @@ pub(crate) async fn client() -> Client {
 
 pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
-    token_list_url: Option<String>,
     raindex_registry_url: Option<String>,
     raindex_config: Option<crate::raindex::RaindexProvider>,
 }
@@ -22,7 +21,6 @@ impl TestClientBuilder {
     pub(crate) fn new() -> Self {
         Self {
             rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
-            token_list_url: None,
             raindex_registry_url: None,
             raindex_config: None,
         }
@@ -30,11 +28,6 @@ impl TestClientBuilder {
 
     pub(crate) fn rate_limiter(mut self, rate_limiter: crate::fairings::RateLimiter) -> Self {
         self.rate_limiter = rate_limiter;
-        self
-    }
-
-    pub(crate) fn token_list_url(mut self, url: impl Into<String>) -> Self {
-        self.token_list_url = Some(url.into());
         self
     }
 
@@ -48,11 +41,6 @@ impl TestClientBuilder {
         let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
             .await
             .expect("database init");
-
-        let token_list_url = match self.token_list_url {
-            Some(url) => url,
-            None => mock_token_list_url().await,
-        };
 
         let raindex_config = match self.raindex_config {
             Some(config) => config,
@@ -70,43 +58,10 @@ impl TestClientBuilder {
         let shared_raindex = tokio::sync::RwLock::new(raindex_config);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
         let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir)
-            .expect("valid rocket instance")
-            .manage(crate::routes::tokens::TokensConfig::with_url(
-                token_list_url,
-            ));
+            .expect("valid rocket instance");
 
         Client::tracked(rocket).await.expect("valid client")
     }
-}
-
-async fn mock_token_list_url() -> String {
-    const BODY: &str = r#"{"tokens":[{"chainId":8453,"address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","name":"USD Coin","symbol":"USDC","decimals":6}]}"#;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock token server");
-    let addr = listener.local_addr().expect("mock token server address");
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{BODY}",
-        BODY.len()
-    );
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-
-            let response = response.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
-            });
-        }
-    });
-
-    format!("http://{addr}")
 }
 
 pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
