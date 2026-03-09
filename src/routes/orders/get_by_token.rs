@@ -113,13 +113,10 @@ pub async fn get_orders_by_token(
         let page = params.page;
         let page_size = params.page_size;
         let raindex = shared_raindex.read().await;
-        let response = raindex
-            .run_with_client(move |client| async move {
-                let ds = RaindexOrdersListDataSource { client: &client };
-                process_get_orders_by_token(&ds, addr, side, page, page_size).await
-            })
-            .await
-            .map_err(ApiError::from)??;
+        let ds = RaindexOrdersListDataSource {
+            client: raindex.client(),
+        };
+        let response = process_get_orders_by_token(&ds, addr, side, page, page_size).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -131,9 +128,7 @@ mod tests {
     use super::*;
     use crate::routes::order::test_fixtures::{mock_order, mock_quote};
     use crate::routes::orders::test_fixtures::MockOrdersListDataSource;
-    use crate::test_helpers::{
-        basic_auth_header, mock_invalid_raindex_config, seed_api_key, TestClientBuilder,
-    };
+    use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -243,23 +238,6 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[rocket::async_test]
-    async fn test_get_orders_by_token_500_when_client_init_fails() {
-        let config = mock_invalid_raindex_config().await;
-        let client = TestClientBuilder::new()
-            .raindex_config(config)
-            .build()
-            .await;
-        let (key_id, secret) = seed_api_key(&client).await;
-        let header = basic_auth_header(&key_id, &secret);
-        let response = client
-            .get("/v1/orders/token/0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
-            .header(Header::new("Authorization", header))
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::InternalServerError);
     }
 
     #[rocket::async_test]

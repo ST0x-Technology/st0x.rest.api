@@ -167,7 +167,9 @@
 
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
-          inherit (rainix.devShells.${system}.default) shellHook;
+          shellHook = rainix.devShells.${system}.default.shellHook + ''
+            export COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo "dev")"
+          '';
           buildInputs = with pkgs;
             [
               sqlx-cli

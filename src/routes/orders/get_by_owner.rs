@@ -35,11 +35,8 @@ pub async fn get_orders_by_address(
 ) -> Result<Json<OrdersListResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
-        let raindex = shared_raindex.read().await;
-        raindex
-            .run_with_client(move |_client| async move { todo!() })
-            .await
-            .map_err(ApiError::from)?
+        let _raindex = shared_raindex.read().await;
+        todo!()
     }
     .instrument(span.0)
     .await

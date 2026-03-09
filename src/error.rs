@@ -1,4 +1,4 @@
-use crate::fairings::request_span_for;
+use crate::fairings::{request_id_for, request_span_for};
 use rocket::http::{Header, Status};
 use rocket::response::Responder;
 use rocket::serde::json::Json;
@@ -15,8 +15,9 @@ pub struct ApiErrorDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[schema(example = json!({"error": {"code": "BAD_REQUEST", "message": "Something went wrong"}}))]
+#[schema(example = json!({"request_id": "550e8400-e29b-41d4-a716-446655440000", "error": {"code": "BAD_REQUEST", "message": "Something went wrong"}}))]
 pub struct ApiErrorResponse {
+    pub request_id: String,
     pub error: ApiErrorDetail,
 }
 
@@ -65,7 +66,9 @@ impl<'r> Responder<'r, 'static> for ApiError {
             }
         });
 
+        let request_id = request_id_for(req);
         let body = ApiErrorResponse {
+            request_id,
             error: ApiErrorDetail {
                 code: code.to_string(),
                 message,
@@ -129,6 +132,7 @@ mod tests {
         assert_eq!(response.status().code, expected_status);
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        assert!(body["request_id"].is_string());
         assert_eq!(body["error"]["code"], expected_code);
         assert_eq!(body["error"]["message"], expected_message);
     }

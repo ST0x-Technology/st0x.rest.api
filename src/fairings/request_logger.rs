@@ -45,6 +45,10 @@ pub(crate) fn request_span_for(req: &Request<'_>) -> tracing::Span {
     req.local_cache(fallback_meta).span.clone()
 }
 
+pub(crate) fn request_id_for(req: &Request<'_>) -> String {
+    req.local_cache(fallback_meta).request_id.clone()
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for TracingSpan {
     type Error = ();

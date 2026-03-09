@@ -1,5 +1,5 @@
 use crate::error::{ApiErrorDetail, ApiErrorResponse};
-use crate::fairings::request_span_for;
+use crate::fairings::{request_id_for, request_span_for};
 use rocket::http::Header;
 use rocket::response::Responder;
 use rocket::serde::json::Json;
@@ -14,6 +14,7 @@ pub fn bad_request(req: &Request<'_>) -> Json<ApiErrorResponse> {
     });
 
     Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "BAD_REQUEST".to_string(),
             message: "The request was invalid or malformed".to_string(),
@@ -27,6 +28,7 @@ pub fn unauthorized(req: &Request<'_>) -> Json<ApiErrorResponse> {
     span.in_scope(|| tracing::warn!("unauthorized (missing or invalid credentials)"));
 
     Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "UNAUTHORIZED".to_string(),
             message: "Missing or invalid credentials".to_string(),
@@ -40,6 +42,7 @@ pub fn forbidden(req: &Request<'_>) -> Json<ApiErrorResponse> {
     span.in_scope(|| tracing::warn!("forbidden (insufficient permissions)"));
 
     Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "FORBIDDEN".to_string(),
             message: "Insufficient permissions".to_string(),
@@ -53,6 +56,7 @@ pub fn not_found(req: &Request<'_>) -> Json<ApiErrorResponse> {
     span.in_scope(|| tracing::warn!("route not found"));
 
     Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "NOT_FOUND".to_string(),
             message: "The requested resource was not found".to_string(),
@@ -66,6 +70,7 @@ pub fn unprocessable_entity(req: &Request<'_>) -> Json<ApiErrorResponse> {
     span.in_scope(|| tracing::warn!("unprocessable entity (likely malformed request body)"));
 
     Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "UNPROCESSABLE_ENTITY".to_string(),
             message: "Request body could not be parsed".to_string(),
@@ -89,6 +94,7 @@ pub fn too_many_requests(req: &Request<'_>) -> RateLimitedResponse {
     span.in_scope(|| tracing::warn!("rate limit exceeded"));
 
     RateLimitedResponse(Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "RATE_LIMITED".to_string(),
             message: "Too many requests, please try again later".to_string(),
@@ -102,6 +108,7 @@ pub fn internal_server_error(req: &Request<'_>) -> Json<ApiErrorResponse> {
     span.in_scope(|| tracing::error!("unhandled internal server error"));
 
     Json(ApiErrorResponse {
+        request_id: request_id_for(req),
         error: ApiErrorDetail {
             code: "INTERNAL_ERROR".to_string(),
             message: "Internal server error".to_string(),

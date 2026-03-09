@@ -9,6 +9,7 @@ pub struct Config {
     pub rate_limit_global_rpm: u64,
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,
+    pub local_db_path: String,
 }
 
 impl Config {

@@ -16,8 +16,8 @@ use rain_orderbook_common::take_orders::{
 };
 use rocket::Route;
 
-#[async_trait(?Send)]
-pub(crate) trait SwapDataSource {
+#[async_trait]
+pub(crate) trait SwapDataSource: Send + Sync {
     async fn get_orders_for_pair(
         &self,
         input_token: Address,
@@ -41,7 +41,7 @@ pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     async fn get_orders_for_pair(
         &self,
@@ -140,6 +140,10 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
             tracing::warn!(error = %e, "invalid request parameters");
             ApiError::BadRequest(e.to_string())
         }
+        RaindexError::PreflightError(_) => {
+            tracing::warn!(error = %e, "preflight simulation failed");
+            ApiError::BadRequest(e.to_readable_msg())
+        }
         _ => {
             tracing::error!(error = %e, "calldata generation failed");
             ApiError::Internal("failed to generate calldata".into())
@@ -171,7 +175,7 @@ pub(crate) mod test_fixtures {
         pub calldata_result: Result<SwapCalldataResponse, ApiError>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl SwapDataSource for MockSwapDataSource {
         async fn get_orders_for_pair(
             &self,

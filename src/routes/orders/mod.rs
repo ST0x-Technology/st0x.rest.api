@@ -13,8 +13,8 @@ use rocket::Route;
 
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
 
-#[async_trait(?Send)]
-pub(crate) trait OrdersListDataSource {
+#[async_trait]
+pub(crate) trait OrdersListDataSource: Send + Sync {
     async fn get_orders_list(
         &self,
         filters: GetOrdersFilters,
@@ -32,7 +32,7 @@ pub(crate) struct RaindexOrdersListDataSource<'a> {
     pub client: &'a RaindexClient,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
     async fn get_orders_list(
         &self,
@@ -144,7 +144,7 @@ pub(crate) mod test_fixtures {
         pub quotes: Result<Vec<RaindexOrderQuote>, ApiError>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl OrdersListDataSource for MockOrdersListDataSource {
         async fn get_orders_list(
             &self,
