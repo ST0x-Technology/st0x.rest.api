@@ -34,13 +34,15 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
             order_hash: Some(hash),
             ..Default::default()
         };
-        self.client
-            .get_orders(None, Some(filters), None)
+        let result = self
+            .client
+            .get_orders(None, Some(filters), None, None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
                 ApiError::Internal("failed to query orders".into())
-            })
+            })?;
+        Ok(result.orders().to_vec())
     }
 
     async fn get_order_quotes(

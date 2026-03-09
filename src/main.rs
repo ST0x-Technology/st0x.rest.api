@@ -61,6 +61,7 @@ enum StartupError {
         routes::order::post_order_cancel,
         routes::orders::get_orders_by_tx,
         routes::orders::get_orders_by_address,
+        routes::orders::get_orders_by_token,
         routes::trades::get_trades_by_tx,
         routes::trades::get_trades_by_address,
         routes::registry::get_registry,
