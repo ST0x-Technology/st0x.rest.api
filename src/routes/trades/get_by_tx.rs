@@ -81,6 +81,7 @@ pub(super) async fn process_get_trades_by_tx(
             let input_vc = trade.input_vault_balance_change();
             let output_vc = trade.output_vault_balance_change();
             let io_ratio = trade.formatted_io_ratio().to_string();
+            let input_amount = input_vc.formatted_amount();
 
             TradeByTxEntry {
                 order_hash: trade.order_hash(),
@@ -88,11 +89,11 @@ pub(super) async fn process_get_trades_by_tx(
                 request: TradeRequest {
                     input_token: input_vc.token().address(),
                     output_token: output_vc.token().address(),
-                    maximum_input: input_vc.formatted_amount(),
+                    maximum_input: input_amount.clone(),
                     maximum_io_ratio: io_ratio.clone(),
                 },
                 result: TradeResult {
-                    input_amount: input_vc.formatted_amount(),
+                    input_amount,
                     output_amount: output_vc.formatted_amount(),
                     actual_io_ratio: io_ratio,
                 },
