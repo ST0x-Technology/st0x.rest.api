@@ -59,6 +59,13 @@ impl<'r> Responder<'r, 'static> for ApiError {
                     error_message = %message,
                     "request failed"
                 );
+            } else if status == Status::Accepted {
+                tracing::info!(
+                    status = status.code,
+                    code = %code,
+                    error_message = %message,
+                    "request accepted"
+                );
             } else {
                 tracing::warn!(
                     status = status.code,

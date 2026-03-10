@@ -74,6 +74,7 @@ async fn query_add_orders_across_chains(
 
     let mut all_orders = Vec::new();
     let mut had_timeout = false;
+    let mut had_hard_failure = false;
 
     for chain_id in &chain_ids {
         match client
@@ -87,11 +88,22 @@ async fn query_add_orders_across_chains(
             }
             Err(e) => {
                 tracing::warn!(chain_id, error = %e, "failed to query chain");
+                had_hard_failure = true;
             }
         }
     }
 
-    if all_orders.is_empty() && had_timeout {
+    if !all_orders.is_empty() {
+        return Ok(all_orders);
+    }
+
+    if had_hard_failure {
+        return Err(ApiError::Internal(
+            "one or more chains failed to query".into(),
+        ));
+    }
+
+    if had_timeout {
         return Err(ApiError::Accepted(
             "transaction not yet indexed, try again later".into(),
         ));
