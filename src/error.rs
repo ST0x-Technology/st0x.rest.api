@@ -35,6 +35,8 @@ pub enum ApiError {
     Internal(String),
     #[error("Rate limited: {0}")]
     RateLimited(String),
+    #[error("Accepted: {0}")]
+    Accepted(String),
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -46,6 +48,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
             ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
             ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
             ApiError::RateLimited(msg) => (Status::TooManyRequests, "RATE_LIMITED", msg.clone()),
+            ApiError::Accepted(msg) => (Status::Accepted, "ACCEPTED", msg.clone()),
         };
         let span = request_span_for(req);
         span.in_scope(|| {
@@ -55,6 +58,13 @@ impl<'r> Responder<'r, 'static> for ApiError {
                     code = %code,
                     error_message = %message,
                     "request failed"
+                );
+            } else if status == Status::Accepted {
+                tracing::info!(
+                    status = status.code,
+                    code = %code,
+                    error_message = %message,
+                    "request accepted"
                 );
             } else {
                 tracing::warn!(
