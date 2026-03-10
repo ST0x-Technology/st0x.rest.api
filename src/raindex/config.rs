@@ -70,7 +70,8 @@ impl RaindexProvider {
 
             let result = runtime.block_on(async {
                 let client = registry
-                    .get_raindex_client()
+                    .get_raindex_client(None)
+                    .await
                     .map_err(|e| WorkerError::Api(e.to_string()))?;
                 Ok(f(client).await)
             });

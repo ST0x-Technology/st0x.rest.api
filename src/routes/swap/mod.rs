@@ -57,8 +57,9 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ..Default::default()
         };
         self.client
-            .get_orders(None, Some(filters), None)
+            .get_orders(None, Some(filters), None, None)
             .await
+            .map(|r| r.orders().to_vec())
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders for pair");
                 ApiError::Internal("failed to query orders".into())
