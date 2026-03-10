@@ -61,6 +61,7 @@ enum StartupError {
         routes::order::post_order_cancel,
         routes::orders::get_orders_by_tx,
         routes::orders::get_orders_by_address,
+        routes::orders::get_orders_by_token,
         routes::trades::get_by_tx::get_trades_by_tx,
         routes::trades::get_by_address::get_trades_by_address,
         routes::registry::get_registry,
@@ -142,7 +143,6 @@ pub(crate) fn rocket(
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger)
         .attach(fairings::RateLimitHeadersFairing)
-        .attach(routes::tokens::fairing())
         .attach(cors))
 }
 
@@ -222,7 +222,23 @@ async fn main() {
                 }
             };
 
-            let raindex_config = match raindex::RaindexProvider::load(&registry_url).await {
+            let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
+            if let Some(parent) = local_db_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::error!(error = %e, path = %parent.display(), "failed to create local db directory");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let raindex_config = match raindex::RaindexProvider::load(
+                &registry_url,
+                Some(local_db_path),
+            )
+            .await
+            {
                 Ok(config) => {
                     tracing::info!(registry_url = %registry_url, "raindex registry loaded");
                     config

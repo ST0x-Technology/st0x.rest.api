@@ -40,13 +40,10 @@ pub async fn get_order(
         tracing::info!(order_hash = ?order_hash, "request received");
         let hash = order_hash.0;
         let raindex = shared_raindex.read().await;
-        let detail = raindex
-            .run_with_client(move |client| async move {
-                let ds = RaindexOrderDataSource { client: &client };
-                process_get_order(&ds, hash).await
-            })
-            .await
-            .map_err(ApiError::from)??;
+        let ds = RaindexOrderDataSource {
+            client: raindex.client(),
+        };
+        let detail = process_get_order(&ds, hash).await?;
         Ok(Json(detail))
     }
     .instrument(span.0)
@@ -153,11 +150,9 @@ mod tests {
     use super::*;
     use crate::error::ApiError;
     use crate::routes::order::test_fixtures::*;
-    use crate::test_helpers::{
-        basic_auth_header, mock_invalid_raindex_config, seed_api_key, TestClientBuilder,
-    };
+    use crate::test_helpers::TestClientBuilder;
     use alloy::primitives::{Address, Bytes};
-    use rocket::http::{Header, Status};
+    use rocket::http::Status;
 
     #[rocket::async_test]
     async fn test_process_get_order_success() {
@@ -278,29 +273,5 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[rocket::async_test]
-    async fn test_get_order_500_when_client_init_fails() {
-        let config = mock_invalid_raindex_config().await;
-        let client = TestClientBuilder::new()
-            .raindex_config(config)
-            .build()
-            .await;
-        let (key_id, secret) = seed_api_key(&client).await;
-        let header = basic_auth_header(&key_id, &secret);
-        let response = client
-            .get("/v1/order/0x000000000000000000000000000000000000000000000000000000000000abcd")
-            .header(Header::new("Authorization", header))
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::InternalServerError);
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
-        assert_eq!(
-            body["error"]["message"],
-            "failed to initialize orderbook client"
-        );
     }
 }

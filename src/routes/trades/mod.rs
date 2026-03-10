@@ -8,8 +8,8 @@ use rain_orderbook_common::raindex_client::trades::RaindexTradesListResult;
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::Route;
 
-#[async_trait(?Send)]
-pub(crate) trait TradesDataSource {
+#[async_trait]
+pub(crate) trait TradesDataSource: Send + Sync {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError>;
 }
 
@@ -17,7 +17,7 @@ pub(crate) struct RaindexTradesDataSource<'a> {
     pub client: &'a RaindexClient,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl TradesDataSource for RaindexTradesDataSource<'_> {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError> {
         self.client

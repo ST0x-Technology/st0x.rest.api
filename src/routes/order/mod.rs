@@ -12,8 +12,8 @@ use rain_orderbook_common::raindex_client::trades::RaindexTrade;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 
-#[async_trait(?Send)]
-pub(crate) trait OrderDataSource {
+#[async_trait]
+pub(crate) trait OrderDataSource: Send + Sync {
     async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError>;
     async fn get_order_quotes(
         &self,
@@ -27,21 +27,22 @@ pub(crate) struct RaindexOrderDataSource<'a> {
     pub client: &'a RaindexClient,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
     async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError> {
         let filters = GetOrdersFilters {
             order_hash: Some(hash),
             ..Default::default()
         };
-        self.client
+        let result = self
+            .client
             .get_orders(None, Some(filters), None, None)
             .await
-            .map(|r| r.orders().to_vec())
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
                 ApiError::Internal("failed to query orders".into())
-            })
+            })?;
+        Ok(result.orders().to_vec())
     }
 
     async fn get_order_quotes(
@@ -330,7 +331,7 @@ pub(crate) mod test_fixtures {
         pub calldata: Result<Bytes, ApiError>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl OrderDataSource for MockOrderDataSource {
         async fn get_orders_by_hash(&self, _hash: B256) -> Result<Vec<RaindexOrder>, ApiError> {
             match &self.orders {

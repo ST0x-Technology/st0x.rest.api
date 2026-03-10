@@ -39,13 +39,10 @@ pub async fn get_trades_by_tx(
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
         let raindex = shared_raindex.read().await;
-        raindex
-            .run_with_client(move |client| async move {
-                let trades_ds = RaindexTradesDataSource { client: &client };
-                process_get_trades_by_tx(&trades_ds, tx_hash.0).await
-            })
-            .await
-            .map_err(ApiError::from)?
+        let trades_ds = RaindexTradesDataSource {
+            client: raindex.client(),
+        };
+        process_get_trades_by_tx(&trades_ds, tx_hash.0).await
     }
     .instrument(span.0)
     .await
@@ -125,9 +122,7 @@ mod tests {
     use super::*;
     use crate::error::ApiError;
     use crate::routes::order::test_fixtures::*;
-    use crate::test_helpers::{
-        basic_auth_header, mock_invalid_raindex_config, seed_api_key, TestClientBuilder,
-    };
+    use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use alloy::primitives::address;
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::trades::RaindexTradesListResult;
@@ -137,7 +132,7 @@ mod tests {
         result: Result<RaindexTradesListResult, ApiError>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
@@ -231,25 +226,5 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-    }
-
-    #[rocket::async_test]
-    async fn test_get_trades_by_tx_500_on_bad_raindex_config() {
-        let config = mock_invalid_raindex_config().await;
-        let client = TestClientBuilder::new()
-            .raindex_config(config)
-            .build()
-            .await;
-        let (key_id, secret) = seed_api_key(&client).await;
-        let header = basic_auth_header(&key_id, &secret);
-        let response = client
-            .get("/v1/trades/tx/0x0000000000000000000000000000000000000000000000000000000000000088")
-            .header(Header::new("Authorization", header))
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::InternalServerError);
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
     }
 }
