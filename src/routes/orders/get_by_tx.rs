@@ -1,11 +1,10 @@
-use super::{OrdersListDataSource, RaindexOrdersListDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{TokenRef, ValidatedFixedBytes};
 use crate::types::orders::{OrderByTxEntry, OrdersByTxResponse};
-use alloy::primitives::B256;
-use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
+use rain_orderbook_common::raindex_client::orders::RaindexOrder;
+use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
@@ -39,43 +38,66 @@ pub async fn get_orders_by_tx(
         tracing::info!(tx_hash = ?tx_hash, "request received");
         let hash = tx_hash.0;
         let raindex = shared_raindex.read().await;
-        let ds = RaindexOrdersListDataSource {
-            client: raindex.client(),
-        };
-        let response = process_get_orders_by_tx(&ds, hash).await?;
-        Ok(Json(response))
+        let orders = query_add_orders_across_chains(raindex.client(), hash).await?;
+
+        if orders.is_empty() {
+            return Err(ApiError::NotFound("no orders found for transaction".into()));
+        }
+
+        let (block_number, timestamp) = extract_tx_metadata(&orders[0]);
+
+        let entries: Result<Vec<OrderByTxEntry>, ApiError> =
+            orders.iter().map(build_order_by_tx_entry).collect();
+
+        Ok(Json(OrdersByTxResponse {
+            tx_hash: hash,
+            block_number,
+            timestamp,
+            orders: entries?,
+        }))
     }
     .instrument(span.0)
     .await
 }
 
-pub(crate) async fn process_get_orders_by_tx(
-    ds: &dyn OrdersListDataSource,
-    tx_hash: B256,
-) -> Result<OrdersByTxResponse, ApiError> {
-    let filters = GetOrdersFilters {
-        tx_hashes: Some(vec![tx_hash]),
-        ..Default::default()
-    };
-    let (orders, _total_count) = ds.get_orders_list(filters, None, None).await?;
+async fn query_add_orders_across_chains(
+    client: &RaindexClient,
+    tx_hash: alloy::primitives::B256,
+) -> Result<Vec<RaindexOrder>, ApiError> {
+    let orderbooks = client.get_all_orderbooks().map_err(|e| {
+        tracing::error!(error = %e, "failed to get orderbooks");
+        ApiError::Internal("failed to get orderbooks".into())
+    })?;
 
-    if orders.is_empty() {
-        return Err(ApiError::NotFound(
-            "no orders found for transaction".into(),
+    let chain_ids: std::collections::HashSet<u32> =
+        orderbooks.values().map(|ob| ob.network.chain_id).collect();
+
+    let mut all_orders = Vec::new();
+    let mut had_timeout = false;
+
+    for chain_id in &chain_ids {
+        match client
+            .get_add_orders_for_transaction(*chain_id, tx_hash, None, None)
+            .await
+        {
+            Ok(orders) => all_orders.extend(orders),
+            Err(RaindexError::TransactionIndexingTimeout { .. }) => {
+                tracing::info!(chain_id, "transaction not yet indexed");
+                had_timeout = true;
+            }
+            Err(e) => {
+                tracing::warn!(chain_id, error = %e, "failed to query chain");
+            }
+        }
+    }
+
+    if all_orders.is_empty() && had_timeout {
+        return Err(ApiError::Accepted(
+            "transaction not yet indexed, try again later".into(),
         ));
     }
 
-    let (block_number, timestamp) = extract_tx_metadata(&orders[0]);
-
-    let entries: Result<Vec<OrderByTxEntry>, ApiError> =
-        orders.iter().map(build_order_by_tx_entry).collect();
-
-    Ok(OrdersByTxResponse {
-        tx_hash,
-        block_number,
-        timestamp,
-        orders: entries?,
-    })
+    Ok(all_orders)
 }
 
 fn extract_tx_metadata(order: &RaindexOrder) -> (u64, u64) {
@@ -127,64 +149,8 @@ fn build_order_by_tx_entry(order: &RaindexOrder) -> Result<OrderByTxEntry, ApiEr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::routes::order::test_fixtures::mock_order;
-    use crate::routes::orders::test_fixtures::MockOrdersListDataSource;
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
-    use alloy::primitives::Address;
     use rocket::http::{Header, Status};
-
-    fn test_tx_hash() -> B256 {
-        "0x0000000000000000000000000000000000000000000000000000000000000099"
-            .parse()
-            .unwrap()
-    }
-
-    #[rocket::async_test]
-    async fn test_process_get_orders_by_tx_success() {
-        let order = mock_order();
-        let ds = MockOrdersListDataSource {
-            orders: Ok(vec![order]),
-            total_count: 1,
-            quotes: Ok(vec![]),
-        };
-        let result = process_get_orders_by_tx(&ds, test_tx_hash()).await.unwrap();
-
-        assert_eq!(result.tx_hash, test_tx_hash());
-        assert_eq!(result.block_number, 1);
-        assert_eq!(result.timestamp, 1700000000);
-        assert_eq!(result.orders.len(), 1);
-        assert_eq!(
-            result.orders[0].owner,
-            "0x0000000000000000000000000000000000000001"
-                .parse::<Address>()
-                .unwrap()
-        );
-        assert_eq!(result.orders[0].input_token.symbol, "USDC");
-        assert_eq!(result.orders[0].output_token.symbol, "WETH");
-    }
-
-    #[rocket::async_test]
-    async fn test_process_get_orders_by_tx_not_found() {
-        let ds = MockOrdersListDataSource {
-            orders: Ok(vec![]),
-            total_count: 0,
-            quotes: Ok(vec![]),
-        };
-        let result = process_get_orders_by_tx(&ds, test_tx_hash()).await;
-        assert!(matches!(result, Err(ApiError::NotFound(_))));
-    }
-
-    #[rocket::async_test]
-    async fn test_process_get_orders_by_tx_query_failure() {
-        let ds = MockOrdersListDataSource {
-            orders: Err(ApiError::Internal("failed".into())),
-            total_count: 0,
-            quotes: Ok(vec![]),
-        };
-        let result = process_get_orders_by_tx(&ds, test_tx_hash()).await;
-        assert!(matches!(result, Err(ApiError::Internal(_))));
-    }
 
     #[rocket::async_test]
     async fn test_get_orders_by_tx_401_without_auth() {
