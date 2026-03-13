@@ -6,6 +6,7 @@ use rain_orderbook_common::raindex_client::orders::RaindexOrder;
 use rain_orderbook_common::take_orders::TakeOrderCandidate;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
+use std::path::PathBuf;
 
 pub(crate) async fn client() -> Client {
     TestClientBuilder::new().build().await
@@ -15,6 +16,7 @@ pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
     raindex_registry_url: Option<String>,
     raindex_config: Option<crate::raindex::RaindexProvider>,
+    log_dir: Option<PathBuf>,
 }
 
 impl TestClientBuilder {
@@ -23,6 +25,7 @@ impl TestClientBuilder {
             rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
             raindex_registry_url: None,
             raindex_config: None,
+            log_dir: None,
         }
     }
 
@@ -33,6 +36,11 @@ impl TestClientBuilder {
 
     pub(crate) fn raindex_config(mut self, config: crate::raindex::RaindexProvider) -> Self {
         self.raindex_config = Some(config);
+        self
+    }
+
+    pub(crate) fn log_dir(mut self, log_dir: impl Into<PathBuf>) -> Self {
+        self.log_dir = Some(log_dir.into());
         self
     }
 
@@ -57,7 +65,8 @@ impl TestClientBuilder {
 
         let shared_raindex = tokio::sync::RwLock::new(raindex_config);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
-        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir)
+        let log_dir = self.log_dir.unwrap_or_else(std::env::temp_dir);
+        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir, log_dir)
             .expect("valid rocket instance");
 
         Client::tracked(rocket).await.expect("valid client")

@@ -115,6 +115,7 @@ pub(crate) fn rocket(
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     docs_dir: String,
+    log_dir: std::path::PathBuf,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
@@ -126,6 +127,7 @@ pub(crate) fn rocket(
         .manage(pool)
         .manage(rate_limiter)
         .manage(raindex_config)
+        .manage(config::LogDirectory::new(log_dir))
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -261,7 +263,13 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let rocket = match rocket(pool, rate_limiter, shared_raindex, cfg.docs_dir) {
+            let rocket = match rocket(
+                pool,
+                rate_limiter,
+                shared_raindex,
+                cfg.docs_dir,
+                std::path::PathBuf::from(&cfg.log_dir),
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");

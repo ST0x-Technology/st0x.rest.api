@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -10,6 +10,19 @@ pub struct Config {
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,
     pub local_db_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogDirectory(pub PathBuf);
+
+impl LogDirectory {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
 }
 
 impl Config {
