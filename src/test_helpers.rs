@@ -64,7 +64,7 @@ impl TestClientBuilder {
         };
 
         let shared_raindex = tokio::sync::RwLock::new(raindex_config);
-        let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let docs_dir = std::env::temp_dir();
         let log_dir = self.log_dir.unwrap_or_else(std::env::temp_dir);
         let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir, log_dir)
             .expect("valid rocket instance");

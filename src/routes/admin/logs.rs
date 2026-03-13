@@ -1,7 +1,7 @@
 use crate::auth::AdminKey;
-use crate::config::LogDirectory;
 use crate::error::ApiError;
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::log_files::LogFiles;
 use chrono::NaiveDate;
 use rocket::form::FromForm;
 use rocket::fs::NamedFile;
@@ -9,10 +9,7 @@ use rocket::http::{ContentType, Header};
 use rocket::request::Request;
 use rocket::response::Responder;
 use rocket::{Route, State};
-use std::path::{Path, PathBuf};
 use tracing::Instrument;
-
-const LOG_FILE_PREFIX: &str = "st0x-rest-api.log";
 
 #[derive(Debug, Clone, FromForm)]
 pub struct AdminLogDownloadParams {
@@ -41,19 +38,11 @@ fn parse_log_date(date: &str) -> Result<NaiveDate, ApiError> {
         .map_err(|_| ApiError::BadRequest("date must use YYYY-MM-DD format".into()))
 }
 
-fn daily_log_path(log_dir: &Path, date: &NaiveDate) -> PathBuf {
-    log_dir.join(format!("{LOG_FILE_PREFIX}.{}", date.format("%Y-%m-%d")))
-}
-
-fn download_filename(date: &NaiveDate) -> String {
-    format!("st0x-rest-api-{}.log", date.format("%Y-%m-%d"))
-}
-
 #[get("/logs?<params..>")]
 pub async fn get_logs(
     _global: GlobalRateLimit,
     _admin: AdminKey,
-    log_dir: &State<LogDirectory>,
+    log_files: &State<LogFiles>,
     span: TracingSpan,
     params: AdminLogDownloadParams,
 ) -> Result<AdminLogDownload, ApiError> {
@@ -61,8 +50,8 @@ pub async fn get_logs(
         tracing::info!(date = %params.date, "request received");
 
         let date = parse_log_date(&params.date)?;
-        let log_path = daily_log_path(log_dir.as_path(), &date);
-        let filename = download_filename(&date);
+        let log_file = log_files.file_for_date(date);
+        let log_path = log_file.path().to_path_buf();
 
         tracing::info!(path = %log_path.display(), "resolved log file path");
 
@@ -78,11 +67,14 @@ pub async fn get_logs(
 
         tracing::info!(
             path = %log_path.display(),
-            filename = %filename,
+            filename = %log_file.download_filename(),
             "serving log file"
         );
 
-        Ok(AdminLogDownload { file, filename })
+        Ok(AdminLogDownload {
+            file,
+            filename: log_file.download_filename().to_string(),
+        })
     }
     .instrument(span.0)
     .await

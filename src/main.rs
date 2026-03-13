@@ -8,6 +8,7 @@ mod config;
 mod db;
 mod error;
 mod fairings;
+mod log_files;
 mod raindex;
 mod routes;
 mod telemetry;
@@ -114,7 +115,7 @@ pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
-    docs_dir: String,
+    docs_dir: std::path::PathBuf,
     log_dir: std::path::PathBuf,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
@@ -127,7 +128,7 @@ pub(crate) fn rocket(
         .manage(pool)
         .manage(rate_limiter)
         .manage(raindex_config)
-        .manage(config::LogDirectory::new(log_dir))
+        .manage(log_files::LogFiles::new(log_dir))
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -224,7 +225,7 @@ async fn main() {
                 }
             };
 
-            let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
+            let local_db_path = cfg.local_db_path.clone();
             if let Some(parent) = local_db_path.parent() {
                 if !parent.exists() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
@@ -256,19 +257,19 @@ async fn main() {
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
 
-            if !std::path::Path::new(&cfg.docs_dir).is_dir() {
-                tracing::error!(docs_dir = %cfg.docs_dir, "docs_dir is not a valid directory");
+            if !cfg.docs_dir.is_dir() {
+                tracing::error!(docs_dir = %cfg.docs_dir.display(), "docs_dir is not a valid directory");
                 drop(log_guard);
                 std::process::exit(1);
             }
-            tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
+            tracing::info!(docs_dir = %cfg.docs_dir.display(), "serving documentation at /docs");
 
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
-                cfg.docs_dir,
-                std::path::PathBuf::from(&cfg.log_dir),
+                cfg.docs_dir.clone(),
+                cfg.log_dir.clone(),
             ) {
                 Ok(r) => r,
                 Err(e) => {

@@ -1,12 +1,13 @@
+use std::path::Path;
 use std::sync::Once;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 static TELEMETRY_INIT: Once = Once::new();
 
-pub fn init(log_dir: &str) -> Result<WorkerGuard, String> {
+pub fn init(log_dir: &Path) -> Result<WorkerGuard, String> {
     let mut guard_slot: Option<WorkerGuard> = None;
-    let log_dir = log_dir.to_string();
+    let log_dir = log_dir.to_path_buf();
 
     TELEMETRY_INIT.call_once(|| {
         let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|e| {
