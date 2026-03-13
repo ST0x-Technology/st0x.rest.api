@@ -13,7 +13,7 @@ use tracing::Instrument;
 
 #[derive(Debug, Clone, FromForm)]
 pub struct AdminLogDownloadParams {
-    pub date: String,
+    pub date: Option<String>,
 }
 
 pub struct AdminLogDownload {
@@ -33,7 +33,12 @@ impl<'r> Responder<'r, 'static> for AdminLogDownload {
     }
 }
 
-fn parse_log_date(date: &str) -> Result<NaiveDate, ApiError> {
+fn parse_log_date(params: &AdminLogDownloadParams) -> Result<NaiveDate, ApiError> {
+    let date = params
+        .date
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("date query parameter is required".into()))?;
+
     NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|_| ApiError::BadRequest("date must use YYYY-MM-DD format".into()))
 }
@@ -47,9 +52,9 @@ pub async fn get_logs(
     params: AdminLogDownloadParams,
 ) -> Result<AdminLogDownload, ApiError> {
     async move {
-        tracing::info!(date = %params.date, "request received");
+        tracing::info!(date = ?params.date, "request received");
 
-        let date = parse_log_date(&params.date)?;
+        let date = parse_log_date(&params)?;
         let log_file = log_files.file_for_date(date);
         let log_path = log_file.path().to_path_buf();
 
@@ -91,7 +96,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_log_file(temp_dir: &TempDir, date: &str, contents: &str) {
-        let path = temp_dir.path().join(format!("st0x-rest-api.log.{date}"));
+        let path = temp_dir
+            .path()
+            .join(format!("{}.{date}", crate::log_files::LOG_FILE_BASENAME));
         std::fs::write(path, contents).expect("write log file");
     }
 
@@ -172,6 +179,25 @@ mod tests {
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         assert_eq!(body["error"]["code"], "BAD_REQUEST");
         assert_eq!(body["error"]["message"], "date must use YYYY-MM-DD format");
+    }
+
+    #[rocket::async_test]
+    async fn test_get_logs_without_date_returns_400() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = seed_admin_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/admin/logs")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert_eq!(body["error"]["message"], "date query parameter is required");
     }
 
     #[rocket::async_test]

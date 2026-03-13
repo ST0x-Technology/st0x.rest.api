@@ -1,3 +1,4 @@
+use crate::log_files::LOG_FILE_BASENAME;
 use std::path::Path;
 use std::sync::Once;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -14,7 +15,7 @@ pub fn init(log_dir: &Path) -> Result<WorkerGuard, String> {
             eprintln!("invalid RUST_LOG filter, using default: {e}");
             EnvFilter::new("st0x_rest_api=info,rocket=warn,warn")
         });
-        let file_appender = tracing_appender::rolling::daily(&log_dir, "st0x-rest-api.log");
+        let file_appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_BASENAME);
         let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
 
         let init_result = tracing_subscriber::registry()

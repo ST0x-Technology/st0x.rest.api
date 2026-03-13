@@ -1,7 +1,7 @@
 use chrono::NaiveDate;
 use std::path::{Path, PathBuf};
 
-const LOG_FILE_PREFIX: &str = "st0x-rest-api.log";
+pub const LOG_FILE_BASENAME: &str = "st0x-rest-api.log";
 
 #[derive(Debug, Clone)]
 pub struct LogFiles {
@@ -24,7 +24,7 @@ impl LogFiles {
         LogFile {
             path: self
                 .root
-                .join(format!("{LOG_FILE_PREFIX}.{formatted_date}")),
+                .join(format!("{LOG_FILE_BASENAME}.{formatted_date}")),
             download_filename: format!("st0x-rest-api-{formatted_date}.log"),
         }
     }
