@@ -34,13 +34,17 @@ impl<'r> Responder<'r, 'static> for AdminLogDownload {
 }
 
 fn parse_log_date(params: &AdminLogDownloadParams) -> Result<NaiveDate, ApiError> {
-    let date = params
-        .date
-        .as_deref()
-        .ok_or_else(|| ApiError::BadRequest("date query parameter is required".into()))?;
+    let Some(date) = params.date.as_deref() else {
+        tracing::warn!("missing required date query parameter");
+        return Err(ApiError::BadRequest(
+            "date query parameter is required".into(),
+        ));
+    };
 
-    NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|_| ApiError::BadRequest("date must use YYYY-MM-DD format".into()))
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
+        tracing::warn!(date = %date, "rejected invalid log download date");
+        ApiError::BadRequest("date must use YYYY-MM-DD format".into())
+    })
 }
 
 #[get("/logs?<params..>")]
