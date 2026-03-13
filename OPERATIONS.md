@@ -96,8 +96,11 @@ Then use the binary directly:
 ```sh
 BINARY=/nix/var/nix/profiles/per-service/rest-api/bin/st0x_rest_api
 
-# Create a key
+# Create a standard key
 $BINARY keys --config $CONFIG create --label "partner-name" --owner "contact@example.com"
+
+# Create an admin key (required for /admin/* endpoints)
+$BINARY keys --config $CONFIG create --label "ops-admin" --owner "ops@example.com" --admin
 
 # List keys
 $BINARY keys --config $CONFIG list
@@ -122,6 +125,12 @@ curl -X PUT \
 ```
 
 Admin credentials are shared separately and should never be committed.
+
+There is no dedicated admin-key rotation command. Rotate admin credentials manually:
+
+1. Create a new admin key with `--admin`
+2. Update the systems or operators using the old credentials
+3. Revoke or delete the old admin key
 
 ## Deployment
 

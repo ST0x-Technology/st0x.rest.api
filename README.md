@@ -22,7 +22,7 @@ git submodule update --init --recursive
 nix develop -c bash prep.sh
 ```
 
-This writes `COMMIT_SHA` to `.env` and bootstraps the orderbook submodule.
+This initializes submodules, runs the orderbook prep script, and builds the local mdBook into `docs/book` for the `/docs` route. Run it before the first `serve`.
 
 ### 3. Configure
 
@@ -58,7 +58,7 @@ export RUST_LOG=st0x_rest_api=info,rocket=warn,warn
 COMMIT_SHA=$(git rev-parse HEAD) nix develop -c cargo run -- serve --config config/dev.toml
 ```
 
-Server runs on `http://127.0.0.1:8000`. Swagger UI is available at `/swagger`.
+Server runs on `http://127.0.0.1:8000`. Swagger UI is available at `/swagger`, and the mdBook docs are served at `/docs`.
 
 The database (`data/st0x.db`) is created and migrated automatically on first run — no manual DB setup needed.
 
@@ -68,7 +68,7 @@ The database (`data/st0x.db`) is created and migrated automatically on first run
 curl -u "KEY_ID:SECRET" http://localhost:8000/v1/tokens
 ```
 
-All endpoints except `/health` require HTTP Basic Auth with the key ID and secret.
+API routes require HTTP Basic Auth with the key ID and secret. `/health`, `/docs`, `/swagger`, and `/api-doc/openapi.json` are public.
 
 ## API Key Management
 
