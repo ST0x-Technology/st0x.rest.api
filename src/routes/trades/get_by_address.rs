@@ -62,18 +62,21 @@ pub(super) async fn process_get_trades_by_address(
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
 
-    let pagination = PaginationParams::new(
-        Some(
+    let pagination = PaginationParams {
+        page: Some(
             page.try_into()
                 .map_err(|_| ApiError::BadRequest("page value too large".into()))?,
         ),
-        Some(
+        page_size: Some(
             page_size
                 .try_into()
                 .map_err(|_| ApiError::BadRequest("page_size value too large".into()))?,
         ),
-    );
-    let time_filter = TimeFilter::new(params.start_time, params.end_time);
+    };
+    let time_filter = TimeFilter {
+        start: params.start_time,
+        end: params.end_time,
+    };
 
     let result = ds
         .get_trades_for_owner(owner, pagination, time_filter)
@@ -184,7 +187,7 @@ mod tests {
     async fn test_process_success() {
         let trade = mock_trade();
         let ds = MockTradesDataSource {
-            owner_result: Ok(RaindexTradesListResult::new(vec![trade], 1)),
+            owner_result: Ok(serde_json::from_value(serde_json::json!({"trades": serde_json::to_value(&[&trade]).unwrap(), "totalCount": 1, "summary": null})).unwrap()),
         };
         let params = TradesPaginationParams {
             page: Some(1),
@@ -218,7 +221,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_no_trades() {
         let ds = MockTradesDataSource {
-            owner_result: Ok(RaindexTradesListResult::new(vec![], 0)),
+            owner_result: Ok(serde_json::from_value(serde_json::json!({"trades": [], "totalCount": 0, "summary": null})).unwrap()),
         };
         let params = TradesPaginationParams {
             page: Some(1),

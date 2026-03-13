@@ -54,10 +54,11 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
     }
 
     async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError> {
-        order.get_trades_list(None, None, None).await.map_err(|e| {
+        let result = order.get_trades_list(None, None, None).await.map_err(|e| {
             tracing::error!(error = %e, "failed to query order trades");
             ApiError::Internal("failed to query order trades".into())
-        })
+        })?;
+        Ok(result.trades().to_vec())
     }
 
     async fn get_remove_calldata(&self, order: &RaindexOrder) -> Result<Bytes, ApiError> {
