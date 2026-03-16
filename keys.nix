@@ -8,10 +8,11 @@ rec {
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPTd2zKSwHgWegi290EiK5nYp1Wp4+x2fDYqFxbd0WLN";
     arda =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAyTREGZCOzMsl7N9dp1saN/t7DCs7YesusVUKApMJ78";
+    sid = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPl3/6RlR6Rvz0ZRyZukzFtt4zUYNz5OVuTsajJl7V3n";
   };
 
-  roles = {
-    infra = [ keys.st0x-op keys.ci ];
-    ssh = [ keys.st0x-op keys.ci keys.arda ];
+  roles = with keys; {
+    infra = [ st0x-op ci ];
+    ssh = [ st0x-op ci arda ];
   };
 }
