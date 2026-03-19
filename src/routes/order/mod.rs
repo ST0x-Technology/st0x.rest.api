@@ -56,10 +56,14 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
     }
 
     async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError> {
-        order.get_trades_list(None, None, None).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to query order trades");
-            ApiError::Internal("failed to query order trades".into())
-        })
+        order
+            .get_trades_list(None, None, None)
+            .await
+            .map(|r| r.trades().to_vec())
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to query order trades");
+                ApiError::Internal("failed to query order trades".into())
+            })
     }
 
     async fn get_remove_calldata(&self, order: &RaindexOrder) -> Result<Bytes, ApiError> {
@@ -92,7 +96,7 @@ pub(crate) mod test_fixtures {
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
-    use rain_orderbook_common::raindex_client::trades::RaindexTrade;
+    use rain_orderbook_common::raindex_client::trades::{RaindexTrade, RaindexTradesListResult};
     use serde_json::json;
 
     pub fn stub_raindex_client() -> serde_json::Value {
@@ -174,7 +178,12 @@ pub(crate) mod test_fixtures {
     pub fn trade_json() -> serde_json::Value {
         json!({
             "id": "0x0000000000000000000000000000000000000000000000000000000000000042",
+            "chainId": 8453,
+            "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
             "orderHash": "0x000000000000000000000000000000000000000000000000000000000000abcd",
+            "owner": "0x0000000000000000000000000000000000000001",
+            "ioRatio": "0xffffffff00000000000000000000000000000000000000000000000000000005",
+            "formattedIoRatio": "2.0",
             "transaction": {
                 "id": "0x0000000000000000000000000000000000000000000000000000000000000088",
                 "from": "0x0000000000000000000000000000000000000002",
@@ -342,6 +351,35 @@ pub(crate) mod test_fixtures {
 
     pub fn mock_trade() -> RaindexTrade {
         serde_json::from_value(trade_json()).expect("deserialize mock RaindexTrade")
+    }
+
+    pub fn mock_trades_list_result() -> RaindexTradesListResult {
+        serde_json::from_value(serde_json::json!({
+            "trades": [trade_json()],
+            "totalCount": 1,
+            "summary": [{
+                "chainId": 8453,
+                "inputToken": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "outputToken": "0x4200000000000000000000000000000000000006",
+                "totalInput": "0xffffffff00000000000000000000000000000000000000000000000000000005",
+                "formattedTotalInput": "0.500000",
+                "totalOutput": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "formattedTotalOutput": "-0.250000000000000000",
+                "averageIoRatio": "0xffffffff00000000000000000000000000000000000000000000000000000005",
+                "formattedAverageIoRatio": "2.0",
+                "tradeCount": 1
+            }]
+        }))
+        .expect("deserialize mock RaindexTradesListResult")
+    }
+
+    pub fn mock_empty_trades_list_result() -> RaindexTradesListResult {
+        serde_json::from_value(serde_json::json!({
+            "trades": [],
+            "totalCount": 0,
+            "summary": null
+        }))
+        .expect("deserialize mock empty RaindexTradesListResult")
     }
 
     pub fn mock_quote(formatted_ratio: &str) -> RaindexOrderQuote {
