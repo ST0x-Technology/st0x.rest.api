@@ -100,7 +100,15 @@ tokens:
 }
 
 pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> String {
+    mock_raindex_registry_url_with_settings_and_tokens(settings, "{}").await
+}
+
+pub(crate) async fn mock_raindex_registry_url_with_settings_and_tokens(
+    settings: &str,
+    remote_tokens: &str,
+) -> String {
     let settings = settings.to_string();
+    let remote_tokens = remote_tokens.to_string();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -108,7 +116,7 @@ pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> S
     let addr = listener.local_addr().expect("mock registry server address");
 
     let registry_body = format!("http://{addr}/settings.yaml");
-    let settings_body = settings.to_string();
+    let settings_body = settings.replace("__TOKENS_URL__", &format!("http://{addr}/tokens.json"));
 
     tokio::spawn(async move {
         loop {
@@ -118,6 +126,7 @@ pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> S
 
             let registry_body = registry_body.clone();
             let settings_body = settings_body.clone();
+            let remote_tokens = remote_tokens.clone();
 
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
@@ -128,6 +137,8 @@ pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> S
 
                 let body = if request.contains("/settings.yaml") {
                     &settings_body
+                } else if request.contains("/tokens.json") {
+                    &remote_tokens
                 } else {
                     &registry_body
                 };
