@@ -6,7 +6,46 @@ use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
+use serde::Serialize;
+use serde_json::Value;
 use tracing::Instrument;
+
+#[derive(Debug, Serialize)]
+pub struct TokenResponse {
+    #[serde(flatten)]
+    token: TokenCfg,
+    name: Option<String>,
+    isin: Option<String>,
+}
+
+impl From<TokenCfg> for TokenResponse {
+    fn from(token: TokenCfg) -> Self {
+        let name = token.label.clone();
+        let isin = token
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extract_extension_string(extensions, "isin"))
+            .or_else(|| {
+                token
+                    .extensions
+                    .as_ref()
+                    .and_then(|extensions| extract_extension_string(extensions, "ISIN"))
+            });
+
+        Self { token, name, isin }
+    }
+}
+
+fn extract_extension_string(
+    extensions: &std::collections::HashMap<String, Value>,
+    key: &str,
+) -> Option<String> {
+    match extensions.get(key) {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Null) | None => None,
+        Some(value) => Some(value.to_string()),
+    }
+}
 
 #[utoipa::path(
     get,
@@ -26,7 +65,7 @@ pub async fn get_tokens(
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
-) -> Result<Json<Vec<TokenCfg>>, ApiError> {
+) -> Result<Json<Vec<TokenResponse>>, ApiError> {
     async move {
         tracing::info!("request received");
 
@@ -39,7 +78,7 @@ pub async fn get_tokens(
                 ApiError::Internal("failed to retrieve token list".into())
             })?;
 
-        let result: Vec<TokenCfg> = tokens.into_values().collect();
+        let result: Vec<TokenResponse> = tokens.into_values().map(TokenResponse::from).collect();
         tracing::info!(count = result.len(), "returning tokens");
         Ok(Json(result))
     }
@@ -53,7 +92,10 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
+    use crate::test_helpers::{
+        basic_auth_header, mock_raindex_registry_url_with_settings_and_tokens, seed_api_key,
+        TestClientBuilder,
+    };
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -134,5 +176,90 @@ tokens:
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         let tokens = body.as_array().expect("tokens is an array");
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_adds_name_and_isin_from_remote_tokens() {
+        let settings = r#"version: 4
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+subgraphs:
+  base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
+orderbooks:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+using-tokens-from:
+  - __TOKENS_URL__
+"#;
+        let remote_tokens = r#"{
+  "name": "ST0x Base Token List",
+  "timestamp": "2026-03-20T00:00:00.000Z",
+  "version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "tokens": [
+    {
+      "chainId": 8453,
+      "address": "0x8AFba81DEc38DE0A18E2Df5E1967a7493651eebf",
+      "decimals": 18,
+      "name": "Wrapped Circle Internet Group Inc ST0x",
+      "symbol": "wtCRCL",
+      "logoURI": "https://tokens.st0x.com/images/CRCL.png",
+      "extensions": {
+        "category": "ST0x",
+        "isin": "US1725731079"
+      }
+    }
+  ]
+}"#;
+        let registry_url =
+            mock_raindex_registry_url_with_settings_and_tokens(settings, remote_tokens).await;
+        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
+            .await
+            .expect("load raindex config");
+        let client = TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let tokens = body.as_array().expect("tokens is an array");
+        assert_eq!(tokens.len(), 1);
+
+        let first = &tokens[0];
+        assert_eq!(
+            first["label"],
+            serde_json::Value::String("Wrapped Circle Internet Group Inc ST0x".to_string())
+        );
+        assert_eq!(
+            first["name"],
+            serde_json::Value::String("Wrapped Circle Internet Group Inc ST0x".to_string())
+        );
+        assert_eq!(
+            first["isin"],
+            serde_json::Value::String("US1725731079".to_string())
+        );
     }
 }
