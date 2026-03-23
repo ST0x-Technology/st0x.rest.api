@@ -1,6 +1,6 @@
 use crate::auth::AdminKey;
 use crate::db::{settings, DbPool};
-use crate::error::{ApiError, ApiErrorResponse};
+use crate::error::ApiError;
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::{RaindexProvider, SharedRaindexProvider};
 use crate::routes::registry::RegistryResponse;
@@ -8,27 +8,12 @@ use rocket::serde::json::Json;
 use rocket::{Route, State};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
-use utoipa::ToSchema;
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateRegistryRequest {
     pub registry_url: String,
 }
 
-#[utoipa::path(
-    put,
-    path = "/admin/registry",
-    tag = "Admin",
-    security(("basicAuth" = [])),
-    request_body = UpdateRegistryRequest,
-    responses(
-        (status = 200, description = "Registry updated", body = RegistryResponse),
-        (status = 400, description = "Bad request", body = ApiErrorResponse),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
-        (status = 403, description = "Forbidden", body = ApiErrorResponse),
-        (status = 500, description = "Internal server error", body = ApiErrorResponse),
-    )
-)]
 #[put("/registry", data = "<request>")]
 pub async fn put_registry(
     _global: GlobalRateLimit,
