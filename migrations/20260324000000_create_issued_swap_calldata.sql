@@ -1,6 +1,9 @@
 CREATE TABLE IF NOT EXISTS issued_swap_calldata (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     api_key_id       INTEGER NOT NULL,
+    key_id           TEXT    NOT NULL,
+    label            TEXT    NOT NULL,
+    owner            TEXT    NOT NULL,
     chain_id         INTEGER NOT NULL,
     taker            TEXT    NOT NULL,
     to_address       TEXT    NOT NULL,
@@ -12,8 +15,7 @@ CREATE TABLE IF NOT EXISTS issued_swap_calldata (
     output_amount    TEXT    NOT NULL,
     maximum_io_ratio TEXT    NOT NULL,
     estimated_input  TEXT    NOT NULL,
-    created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+    created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX idx_issued_swap_calldata_api_key_id_created

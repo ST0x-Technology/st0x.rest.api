@@ -10,7 +10,7 @@ use sqlx::{FromRow, QueryBuilder};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Add;
 
-const MATCH_WINDOW_SECS: i64 = 5 * 60;
+const MATCH_WINDOW_SECS: i64 = 2 * 60;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CustomerVolumeReportArgs {
@@ -394,9 +394,9 @@ async fn load_issued_rows(
         "SELECT
             isc.id,
             isc.api_key_id,
-            ak.key_id,
-            ak.label,
-            ak.owner,
+            isc.key_id,
+            isc.label,
+            isc.owner,
             isc.taker,
             isc.to_address,
             isc.calldata,
@@ -404,7 +404,6 @@ async fn load_issued_rows(
             isc.output_token,
             CAST(strftime('%s', isc.created_at) AS INTEGER) AS created_at_unix
          FROM issued_swap_calldata isc
-         JOIN api_keys ak ON ak.id = isc.api_key_id
          WHERE isc.chain_id = ?
            AND CAST(strftime('%s', isc.created_at) AS INTEGER) >= ?
            AND CAST(strftime('%s', isc.created_at) AS INTEGER) <= ?
@@ -859,6 +858,9 @@ mod tests {
         sqlx::query(
             "INSERT INTO issued_swap_calldata (
                 api_key_id,
+                key_id,
+                label,
+                owner,
                 chain_id,
                 taker,
                 to_address,
@@ -871,9 +873,12 @@ mod tests {
                 maximum_io_ratio,
                 estimated_input,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(?,'unixepoch'))",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(?,'unixepoch'))",
         )
         .bind(api_key_id)
+        .bind(&key_id)
+        .bind("alpha")
+        .bind("owner-a")
         .bind(crate::CHAIN_ID as i64)
         .bind("0x1111111111111111111111111111111111111111")
         .bind("0xd2938e7c9fe3597f78832ce780feb61945c377d7")
@@ -977,7 +982,7 @@ mod tests {
                 "0xtx",
                 "0x1111111111111111111111111111111111111111",
                 "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
-                350,
+                180,
             ),
             "0xabcdef",
             &issued_row_index,
@@ -1000,7 +1005,7 @@ mod tests {
                 "0xtx",
                 "0x1111111111111111111111111111111111111111",
                 "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
-                240,
+                210,
             ),
             "0xabcdef",
             &issued_row_index,
@@ -1152,18 +1157,8 @@ mod tests {
         .expect("insert take order");
     }
 
-    #[tokio::test]
-    async fn test_build_report_reconciles_customer_volume_report() {
-        let pool = test_pool().await;
-        let expected = seed_match_context(&pool, 100).await;
-        let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_path = temp_dir.path().join("raindex.db");
-        seed_raindex_take_orders(&db_path, tx_hash, 105).await;
-
-        let rpc_url = mock_rpc_url_for_input("0xabcdef").await;
-        let settings = format!(
+    fn test_registry_settings(rpc_url: &str) -> String {
+        format!(
             "version: 4
 networks:
   base:
@@ -1188,12 +1183,34 @@ tokens:
     address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
     network: base
 "
-        );
+        )
+    }
+
+    async fn load_test_raindex(
+        db_path: std::path::PathBuf,
+        tx_input: &str,
+    ) -> crate::raindex::RaindexProvider {
+        let rpc_url = mock_rpc_url_for_input(tx_input).await;
+        let settings = test_registry_settings(&rpc_url);
         let registry_url =
             crate::test_helpers::mock_raindex_registry_url_with_settings(&settings).await;
-        let raindex = crate::raindex::RaindexProvider::load(&registry_url, Some(db_path))
+
+        crate::raindex::RaindexProvider::load(&registry_url, Some(db_path))
             .await
-            .expect("load test raindex provider");
+            .expect("load test raindex provider")
+    }
+
+    #[tokio::test]
+    async fn test_build_report_reconciles_customer_volume_report() {
+        let pool = test_pool().await;
+        let expected = seed_match_context(&pool, 100).await;
+        let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders(&db_path, tx_hash, 105).await;
+
+        let raindex = load_test_raindex(db_path, "0xabcdef").await;
 
         let report = build_report(&pool, &raindex, 90, 110)
             .await
@@ -1235,5 +1252,36 @@ tokens:
         assert_eq!(report.matched_transactions[0].total_input_amount, "50");
         assert_eq!(report.matched_transactions[0].total_output_amount, "0.25");
         assert_eq!(report.unmatched_transactions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_report_uses_issued_snapshot_after_api_key_deletion() {
+        let pool = test_pool().await;
+        let expected = seed_match_context(&pool, 100).await;
+        let tx_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        sqlx::query("DELETE FROM api_keys WHERE id = ?")
+            .bind(expected.api_key_id)
+            .execute(&pool)
+            .await
+            .expect("delete api key");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders(&db_path, tx_hash, 105).await;
+
+        let raindex = load_test_raindex(db_path, "0xabcdef").await;
+
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.customers.len(), 1);
+        assert_eq!(report.customers[0].api_key_id, expected.api_key_id);
+        assert_eq!(report.customers[0].key_id, expected.key_id);
+        assert_eq!(report.customers[0].label, "alpha");
+        assert_eq!(report.customers[0].owner, "owner-a");
+        assert_eq!(report.matched_transactions.len(), 1);
+        assert_eq!(report.matched_transactions[0].key_id, report.customers[0].key_id);
     }
 }

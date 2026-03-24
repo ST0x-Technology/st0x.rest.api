@@ -3,9 +3,16 @@ use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
 use alloy::hex::encode_prefixed;
 use alloy::primitives::keccak256;
 
+pub(crate) struct IssuedSwapCalldataKeySnapshot<'a> {
+    pub api_key_id: i64,
+    pub key_id: &'a str,
+    pub label: &'a str,
+    pub owner: &'a str,
+}
+
 pub(crate) async fn insert(
     pool: &DbPool,
-    api_key_id: i64,
+    key: &IssuedSwapCalldataKeySnapshot<'_>,
     chain_id: u32,
     request: &SwapCalldataRequest,
     response: &SwapCalldataResponse,
@@ -16,6 +23,9 @@ pub(crate) async fn insert(
     sqlx::query(
         "INSERT INTO issued_swap_calldata (
             api_key_id,
+            key_id,
+            label,
+            owner,
             chain_id,
             taker,
             to_address,
@@ -27,9 +37,12 @@ pub(crate) async fn insert(
             output_amount,
             maximum_io_ratio,
             estimated_input
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(api_key_id)
+    .bind(key.api_key_id)
+    .bind(key.key_id)
+    .bind(key.label)
+    .bind(key.owner)
     .bind(chain_id as i64)
     .bind(format!("{:#x}", request.taker))
     .bind(format!("{:#x}", response.to))

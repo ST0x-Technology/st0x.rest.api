@@ -42,7 +42,7 @@ pub async fn post_swap_calldata(
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
         };
-        let response = handle_swap_calldata(&ds, &pool, key.id, req).await?;
+        let response = handle_swap_calldata(&ds, &pool, &key, req).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -69,17 +69,17 @@ async fn process_swap_calldata(
 async fn handle_swap_calldata(
     ds: &dyn SwapDataSource,
     pool: &DbPool,
-    api_key_id: i64,
+    key: &AuthenticatedKey,
     req: SwapCalldataRequest,
 ) -> Result<SwapCalldataResponse, ApiError> {
     let response = process_swap_calldata(ds, &req).await?;
-    persist_issued_swap_calldata(pool, api_key_id, &req, &response).await?;
+    persist_issued_swap_calldata(pool, key, &req, &response).await?;
     Ok(response)
 }
 
 async fn persist_issued_swap_calldata(
     pool: &DbPool,
-    api_key_id: i64,
+    key: &AuthenticatedKey,
     request: &SwapCalldataRequest,
     response: &SwapCalldataResponse,
 ) -> Result<(), ApiError> {
@@ -87,12 +87,26 @@ async fn persist_issued_swap_calldata(
         return Ok(());
     }
 
-    crate::db::issued_swap_calldata::insert(pool, api_key_id, crate::CHAIN_ID, request, response)
+    let key_snapshot = crate::db::issued_swap_calldata::IssuedSwapCalldataKeySnapshot {
+        api_key_id: key.id,
+        key_id: &key.key_id,
+        label: &key.label,
+        owner: &key.owner,
+    };
+
+    crate::db::issued_swap_calldata::insert(
+        pool,
+        &key_snapshot,
+        crate::CHAIN_ID,
+        request,
+        response,
+    )
         .await
         .map_err(|error| {
             tracing::error!(
                 error = %error,
-                api_key_id,
+                api_key_id = key.id,
+                key_id = %key.key_id,
                 taker = %request.taker,
                 to = %response.to,
                 "failed to persist issued swap calldata"
@@ -101,7 +115,8 @@ async fn persist_issued_swap_calldata(
         })?;
 
     tracing::info!(
-        api_key_id,
+        api_key_id = key.id,
+        key_id = %key.key_id,
         taker = %request.taker,
         to = %response.to,
         "persisted issued swap calldata"
@@ -241,6 +256,9 @@ mod tests {
     #[derive(Debug, FromRow)]
     struct IssuedSwapCalldataRow {
         api_key_id: i64,
+        key_id: String,
+        label: String,
+        owner: String,
         chain_id: i64,
         taker: String,
         to_address: String,
@@ -254,10 +272,22 @@ mod tests {
         estimated_input: String,
     }
 
+    #[derive(Debug, FromRow)]
+    struct AuthenticatedKeyRow {
+        id: i64,
+        key_id: String,
+        label: String,
+        owner: String,
+        is_admin: bool,
+    }
+
     async fn fetch_issued_rows(pool: &DbPool) -> Vec<IssuedSwapCalldataRow> {
         sqlx::query_as::<_, IssuedSwapCalldataRow>(
             "SELECT
                 api_key_id,
+                key_id,
+                label,
+                owner,
                 chain_id,
                 taker,
                 to_address,
@@ -277,13 +307,22 @@ mod tests {
         .expect("query issued swap calldata")
     }
 
-    async fn fetch_api_key_id(pool: &DbPool, key_id: &str) -> i64 {
-        let row: (i64,) = sqlx::query_as("SELECT id FROM api_keys WHERE key_id = ?")
-            .bind(key_id)
-            .fetch_one(pool)
-            .await
-            .expect("api key");
-        row.0
+    async fn fetch_authenticated_key(pool: &DbPool, key_id: &str) -> AuthenticatedKey {
+        let row = sqlx::query_as::<_, AuthenticatedKeyRow>(
+            "SELECT id, key_id, label, owner, is_admin FROM api_keys WHERE key_id = ?",
+        )
+        .bind(key_id)
+        .fetch_one(pool)
+        .await
+        .expect("authenticated key");
+
+        AuthenticatedKey {
+            id: row.id,
+            key_id: row.key_id,
+            label: row.label,
+            owner: row.owner,
+            is_admin: row.is_admin,
+        }
     }
 
     async fn issued_row_count(pool: &DbPool) -> i64 {
@@ -299,7 +338,7 @@ mod tests {
         let client = TestClientBuilder::new().build().await;
         let (key_id, _secret) = seed_api_key(&client).await;
         let pool = client.rocket().state::<DbPool>().expect("pool");
-        let api_key_id = fetch_api_key_id(pool, &key_id).await;
+        let key = fetch_authenticated_key(pool, &key_id).await;
 
         let ds = MockSwapDataSource {
             orders: Ok(vec![]),
@@ -308,7 +347,7 @@ mod tests {
         };
         let request = calldata_request("100", "2.5");
 
-        let response = handle_swap_calldata(&ds, pool, api_key_id, request.clone())
+        let response = handle_swap_calldata(&ds, pool, &key, request.clone())
             .await
             .expect("successful swap calldata");
 
@@ -321,7 +360,10 @@ mod tests {
         let rows = fetch_issued_rows(pool).await;
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.api_key_id, api_key_id);
+        assert_eq!(row.api_key_id, key.id);
+        assert_eq!(row.key_id, key.key_id.as_str());
+        assert_eq!(row.label, key.label.as_str());
+        assert_eq!(row.owner, key.owner.as_str());
         assert_eq!(row.chain_id, crate::CHAIN_ID as i64);
         assert_eq!(row.taker, format!("{:#x}", request.taker));
         assert_eq!(row.to_address, format!("{:#x}", ORDERBOOK));
@@ -343,7 +385,7 @@ mod tests {
         let client = TestClientBuilder::new().build().await;
         let (key_id, _secret) = seed_api_key(&client).await;
         let pool = client.rocket().state::<DbPool>().expect("pool");
-        let api_key_id = fetch_api_key_id(pool, &key_id).await;
+        let key = fetch_authenticated_key(pool, &key_id).await;
 
         let ds = MockSwapDataSource {
             orders: Ok(vec![]),
@@ -351,7 +393,7 @@ mod tests {
             calldata_result: Ok(approval_response()),
         };
 
-        handle_swap_calldata(&ds, pool, api_key_id, calldata_request("100", "2.5"))
+        handle_swap_calldata(&ds, pool, &key, calldata_request("100", "2.5"))
             .await
             .expect("successful approval response");
 
@@ -364,7 +406,7 @@ mod tests {
         let client = TestClientBuilder::new().build().await;
         let (key_id, _secret) = seed_api_key(&client).await;
         let pool = client.rocket().state::<DbPool>().expect("pool");
-        let api_key_id = fetch_api_key_id(pool, &key_id).await;
+        let key = fetch_authenticated_key(pool, &key_id).await;
 
         let ds = MockSwapDataSource {
             orders: Ok(vec![]),
@@ -373,16 +415,46 @@ mod tests {
         };
         let request = calldata_request("100", "2.5");
 
-        handle_swap_calldata(&ds, pool, api_key_id, request.clone())
+        handle_swap_calldata(&ds, pool, &key, request.clone())
             .await
             .expect("first swap calldata");
-        handle_swap_calldata(&ds, pool, api_key_id, request)
+        handle_swap_calldata(&ds, pool, &key, request)
             .await
             .expect("second swap calldata");
 
         let rows = fetch_issued_rows(pool).await;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].calldata_hash, rows[1].calldata_hash);
+    }
+
+    #[rocket::async_test]
+    async fn test_issued_swap_calldata_survives_api_key_deletion() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, _secret) = seed_api_key(&client).await;
+        let pool = client.rocket().state::<DbPool>().expect("pool");
+        let key = fetch_authenticated_key(pool, &key_id).await;
+
+        let ds = MockSwapDataSource {
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+
+        handle_swap_calldata(&ds, pool, &key, calldata_request("100", "2.5"))
+            .await
+            .expect("successful swap calldata");
+
+        sqlx::query("DELETE FROM api_keys WHERE key_id = ?")
+            .bind(&key_id)
+            .execute(pool)
+            .await
+            .expect("delete api key");
+
+        let rows = fetch_issued_rows(pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key_id, key_id);
+        assert_eq!(rows[0].label, "test-key");
+        assert_eq!(rows[0].owner, "test-owner");
     }
 
     #[test]
@@ -402,8 +474,15 @@ mod tests {
             calldata_result: Ok(ready_response()),
         };
 
-        let result =
-            handle_swap_calldata(&ds, pool, i64::MAX, calldata_request("100", "2.5")).await;
+        let key = AuthenticatedKey {
+            id: i64::MAX,
+            key_id: "missing".to_string(),
+            label: "missing".to_string(),
+            owner: "missing".to_string(),
+            is_admin: false,
+        };
+
+        let result = handle_swap_calldata(&ds, pool, &key, calldata_request("100", "2.5")).await;
         assert!(matches!(
             result,
             Err(ApiError::Internal(msg)) if msg == "failed to persist issued swap calldata"
