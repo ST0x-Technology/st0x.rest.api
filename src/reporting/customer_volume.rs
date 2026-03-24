@@ -88,7 +88,6 @@ struct CandidateExecution {
 
 #[derive(Debug, Clone)]
 struct MatchedExecution {
-    issued_swap_calldata_id: i64,
     api_key_id: i64,
     key_id: String,
     label: String,
@@ -169,12 +168,6 @@ struct CustomerVolumeReport {
     unmatched_transactions: Vec<UnmatchedTransactionReport>,
 }
 
-#[derive(Debug)]
-struct BuiltCustomerVolumeReport {
-    report: CustomerVolumeReport,
-    matched_executions: Vec<MatchedExecution>,
-}
-
 type IssuedRowIndex<'a> = HashMap<(String, String, String), Vec<&'a IssuedSwapRow>>;
 
 #[derive(Debug, Deserialize)]
@@ -209,20 +202,18 @@ pub(crate) async fn run(
         "customer volume report requested"
     );
 
-    let built_report = build_report(pool, raindex, args.start_time, args.end_time).await?;
-    persist_matches(pool, &built_report.matched_executions).await?;
-    persist_report_run(pool, &built_report.report).await?;
+    let report = build_report(pool, raindex, args.start_time, args.end_time).await?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&built_report.report)?);
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_human_report(&built_report.report);
+        print_human_report(&report);
     }
 
     tracing::info!(
-        matched = built_report.report.audit.matched_executions,
-        unmatched = built_report.report.audit.unmatched_executions,
-        ambiguous = built_report.report.audit.ambiguous_matches,
+        matched = report.audit.matched_executions,
+        unmatched = report.audit.unmatched_executions,
+        ambiguous = report.audit.ambiguous_matches,
         "customer volume report complete"
     );
 
@@ -234,7 +225,7 @@ async fn build_report(
     raindex: &RaindexProvider,
     start_time: u64,
     end_time: u64,
-) -> Result<BuiltCustomerVolumeReport, CustomerVolumeReportError> {
+) -> Result<CustomerVolumeReport, CustomerVolumeReportError> {
     let chain_orderbooks = orderbooks_for_chain(raindex)?;
     let issued_rows = load_issued_rows(pool, start_time, end_time).await?;
     let issued_row_index = build_issued_row_index(&issued_rows);
@@ -272,7 +263,6 @@ async fn build_report(
 
         match selection.row {
             Some(row) => matched.push(MatchedExecution {
-                issued_swap_calldata_id: row.id,
                 api_key_id: row.api_key_id,
                 key_id: row.key_id.clone(),
                 label: row.label.clone(),
@@ -323,20 +313,17 @@ async fn build_report(
         })
         .collect::<Result<Vec<_>, CustomerVolumeReportError>>()?;
 
-    Ok(BuiltCustomerVolumeReport {
-        report: CustomerVolumeReport {
-            start_time,
-            end_time,
-            audit: ReportAudit {
-                matched_executions: matched_transactions.len(),
-                unmatched_executions: unmatched.len(),
-                ambiguous_matches,
-            },
-            customers,
-            matched_transactions,
-            unmatched_transactions: unmatched,
+    Ok(CustomerVolumeReport {
+        start_time,
+        end_time,
+        audit: ReportAudit {
+            matched_executions: matched_transactions.len(),
+            unmatched_executions: unmatched.len(),
+            ambiguous_matches,
         },
-        matched_executions: matched,
+        customers,
+        matched_transactions,
+        unmatched_transactions: unmatched,
     })
 }
 
@@ -759,87 +746,6 @@ async fn fetch_transaction_input(
     })
 }
 
-async fn persist_matches(
-    pool: &DbPool,
-    matches: &[MatchedExecution],
-) -> Result<(), CustomerVolumeReportError> {
-    let mut transaction = pool.begin().await?;
-
-    for entry in matches {
-        sqlx::query(
-            "INSERT INTO attributed_swap_txs (
-                tx_hash,
-                issued_swap_calldata_id,
-                api_key_id,
-                chain_id,
-                sender,
-                to_address,
-                block_number,
-                block_timestamp,
-                input_token,
-                output_token,
-                total_input_amount,
-                total_output_amount
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tx_hash) DO UPDATE SET
-                issued_swap_calldata_id = excluded.issued_swap_calldata_id,
-                api_key_id = excluded.api_key_id,
-                chain_id = excluded.chain_id,
-                sender = excluded.sender,
-                to_address = excluded.to_address,
-                block_number = excluded.block_number,
-                block_timestamp = excluded.block_timestamp,
-                input_token = excluded.input_token,
-                output_token = excluded.output_token,
-                total_input_amount = excluded.total_input_amount,
-                total_output_amount = excluded.total_output_amount",
-        )
-        .bind(&entry.tx_hash)
-        .bind(entry.issued_swap_calldata_id)
-        .bind(entry.api_key_id)
-        .bind(crate::CHAIN_ID as i64)
-        .bind(&entry.sender)
-        .bind(&entry.to_address)
-        .bind(entry.block_number as i64)
-        .bind(entry.timestamp as i64)
-        .bind(&entry.input_token)
-        .bind(&entry.output_token)
-        .bind(format_hex(&entry.total_input_hex)?)
-        .bind(format_hex(&entry.total_output_hex)?)
-        .execute(&mut *transaction)
-        .await?;
-    }
-
-    transaction.commit().await?;
-    Ok(())
-}
-
-async fn persist_report_run(
-    pool: &DbPool,
-    report: &CustomerVolumeReport,
-) -> Result<(), CustomerVolumeReportError> {
-    sqlx::query(
-        "INSERT INTO swap_report_runs (
-            report_name,
-            start_time,
-            end_time,
-            matched_count,
-            unmatched_count,
-            ambiguous_count
-        ) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind("customer-volume")
-    .bind(report.start_time as i64)
-    .bind(report.end_time as i64)
-    .bind(report.audit.matched_executions as i64)
-    .bind(report.audit.unmatched_executions as i64)
-    .bind(report.audit.ambiguous_matches as i64)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 fn print_human_report(report: &CustomerVolumeReport) {
     println!("Customer volume report");
     println!("Window: {} -> {}", report.start_time, report.end_time);
@@ -921,7 +827,12 @@ fn format_hex(value_hex: &str) -> Result<String, CustomerVolumeReportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Row;
+
+    #[derive(Debug)]
+    struct SeededMatchContext {
+        api_key_id: i64,
+        key_id: String,
+    }
 
     async fn test_pool() -> DbPool {
         let id = uuid::Uuid::new_v4();
@@ -930,7 +841,7 @@ mod tests {
             .expect("test database init")
     }
 
-    async fn seed_match_context(pool: &DbPool, created_at_unix: i64) -> MatchedExecution {
+    async fn seed_match_context(pool: &DbPool, created_at_unix: i64) -> SeededMatchContext {
         let key_id = uuid::Uuid::new_v4().to_string();
         let secret_hash = crate::auth::hash_secret("test-secret").expect("hash secret");
         let api_key_insert = sqlx::query(
@@ -945,7 +856,7 @@ mod tests {
         .expect("insert api key");
         let api_key_id = api_key_insert.last_insert_rowid();
 
-        let issued_insert = sqlx::query(
+        sqlx::query(
             "INSERT INTO issued_swap_calldata (
                 api_key_id,
                 chain_id,
@@ -978,25 +889,8 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert issued calldata");
-        let issued_swap_calldata_id = issued_insert.last_insert_rowid();
 
-        MatchedExecution {
-            issued_swap_calldata_id,
-            api_key_id,
-            key_id,
-            label: "alpha".to_string(),
-            owner: "owner-a".to_string(),
-            tx_hash: "0xtx1".to_string(),
-            sender: "0x1111111111111111111111111111111111111111".to_string(),
-            to_address: "0xd2938e7c9fe3597f78832ce780feb61945c377d7".to_string(),
-            block_number: 10,
-            timestamp: 100,
-            input_token: "0xinput".to_string(),
-            output_token: "0xoutput".to_string(),
-            total_input_hex: Float::parse("50".to_string()).expect("float").as_hex(),
-            total_output_hex: Float::parse("0.25".to_string()).expect("float").as_hex(),
-            duplicate_match_count: 1,
-        }
+        SeededMatchContext { api_key_id, key_id }
     }
 
     fn issued_row(
@@ -1120,7 +1014,6 @@ mod tests {
     fn test_build_customer_summaries_groups_by_customer_and_pair() {
         let executions = vec![
             MatchedExecution {
-                issued_swap_calldata_id: 1,
                 api_key_id: 1,
                 key_id: "key-1".to_string(),
                 label: "alpha".to_string(),
@@ -1137,7 +1030,6 @@ mod tests {
                 duplicate_match_count: 1,
             },
             MatchedExecution {
-                issued_swap_calldata_id: 2,
                 api_key_id: 1,
                 key_id: "key-1".to_string(),
                 label: "alpha".to_string(),
@@ -1261,7 +1153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_reconciles_and_persists_customer_volume_report() {
+    async fn test_build_report_reconciles_customer_volume_report() {
         let pool = test_pool().await;
         let expected = seed_match_context(&pool, 100).await;
         let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1303,136 +1195,45 @@ tokens:
             .await
             .expect("load test raindex provider");
 
-        run(
-            &pool,
-            &raindex,
-            CustomerVolumeReportArgs {
-                start_time: 90,
-                end_time: 110,
-                json: true,
-            },
-        )
-        .await
-        .expect("run report");
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
 
-        let attributed = sqlx::query(
-            "SELECT tx_hash, issued_swap_calldata_id, api_key_id, total_input_amount, total_output_amount
-             FROM attributed_swap_txs",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("fetch attributed tx");
-
-        assert_eq!(attributed.get::<String, _>("tx_hash"), tx_hash);
+        assert_eq!(report.start_time, 90);
+        assert_eq!(report.end_time, 110);
+        assert_eq!(report.audit.matched_executions, 1);
+        assert_eq!(report.audit.unmatched_executions, 0);
+        assert_eq!(report.audit.ambiguous_matches, 0);
+        assert_eq!(report.customers.len(), 1);
+        assert_eq!(report.customers[0].api_key_id, expected.api_key_id);
+        assert_eq!(report.customers[0].key_id, expected.key_id);
+        assert_eq!(report.customers[0].label, "alpha");
+        assert_eq!(report.customers[0].owner, "owner-a");
+        assert_eq!(report.customers[0].executed_txs, 1);
+        assert_eq!(report.customers[0].pairs.len(), 1);
+        assert_eq!(report.customers[0].pairs[0].input_token, "0xinput");
+        assert_eq!(report.customers[0].pairs[0].output_token, "0xoutput");
+        assert_eq!(report.customers[0].pairs[0].total_input_amount, "50");
+        assert_eq!(report.customers[0].pairs[0].total_output_amount, "0.25");
+        assert_eq!(report.matched_transactions.len(), 1);
+        assert_eq!(report.matched_transactions[0].tx_hash, tx_hash);
         assert_eq!(
-            attributed.get::<i64, _>("issued_swap_calldata_id"),
-            expected.issued_swap_calldata_id
+            report.matched_transactions[0].api_key_id,
+            expected.api_key_id
         );
-        assert_eq!(attributed.get::<i64, _>("api_key_id"), expected.api_key_id);
-        assert_eq!(attributed.get::<String, _>("total_input_amount"), "50");
-        assert_eq!(attributed.get::<String, _>("total_output_amount"), "0.25");
-
-        let run_counts = sqlx::query(
-            "SELECT matched_count, unmatched_count, ambiguous_count FROM swap_report_runs",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("fetch report run");
-        assert_eq!(run_counts.get::<i64, _>("matched_count"), 1);
-        assert_eq!(run_counts.get::<i64, _>("unmatched_count"), 0);
-        assert_eq!(run_counts.get::<i64, _>("ambiguous_count"), 0);
-
-        run(
-            &pool,
-            &raindex,
-            CustomerVolumeReportArgs {
-                start_time: 90,
-                end_time: 110,
-                json: true,
-            },
-        )
-        .await
-        .expect("rerun report");
-
-        let attributed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attributed_swap_txs")
-            .fetch_one(&pool)
-            .await
-            .expect("count attributed txs");
-        let report_run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM swap_report_runs")
-            .fetch_one(&pool)
-            .await
-            .expect("count report runs");
-
-        assert_eq!(attributed_count, 1);
-        assert_eq!(report_run_count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_persist_matches_is_idempotent() {
-        let pool = test_pool().await;
-        let mut execution = seed_match_context(&pool, 100).await;
-
-        persist_matches(&pool, &[execution.clone()])
-            .await
-            .expect("persist match");
-
-        execution.total_input_hex = Float::parse("60".to_string()).expect("float").as_hex();
-        execution.total_output_hex = Float::parse("0.30".to_string()).expect("float").as_hex();
-
-        persist_matches(&pool, &[execution])
-            .await
-            .expect("persist updated match");
-
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attributed_swap_txs")
-            .fetch_one(&pool)
-            .await
-            .expect("count matches");
-        assert_eq!(count, 1);
-
-        let amounts: (String, String) = sqlx::query_as(
-            "SELECT total_input_amount, total_output_amount FROM attributed_swap_txs WHERE tx_hash = ?",
-        )
-        .bind("0xtx1")
-        .fetch_one(&pool)
-        .await
-        .expect("fetch persisted amounts");
-        assert_eq!(amounts.0, "60");
-        assert_eq!(amounts.1, "0.3");
-    }
-
-    #[tokio::test]
-    async fn test_persist_report_run_records_audit_counts() {
-        let pool = test_pool().await;
-        let report = CustomerVolumeReport {
-            start_time: 10,
-            end_time: 20,
-            audit: ReportAudit {
-                matched_executions: 2,
-                unmatched_executions: 1,
-                ambiguous_matches: 1,
-            },
-            customers: Vec::new(),
-            matched_transactions: Vec::new(),
-            unmatched_transactions: Vec::new(),
-        };
-
-        persist_report_run(&pool, &report)
-            .await
-            .expect("persist report run");
-
-        let stored: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT report_name, start_time, end_time, matched_count, unmatched_count, ambiguous_count
-             FROM swap_report_runs",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("fetch report run");
-
-        assert_eq!(stored.0, "customer-volume");
-        assert_eq!(stored.1, 10);
-        assert_eq!(stored.2, 20);
-        assert_eq!(stored.3, 2);
-        assert_eq!(stored.4, 1);
-        assert_eq!(stored.5, 1);
+        assert_eq!(report.matched_transactions[0].key_id, expected.key_id);
+        assert_eq!(
+            report.matched_transactions[0].sender,
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            report.matched_transactions[0].to_address,
+            "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
+        );
+        assert_eq!(report.matched_transactions[0].input_token, "0xinput");
+        assert_eq!(report.matched_transactions[0].output_token, "0xoutput");
+        assert_eq!(report.matched_transactions[0].total_input_amount, "50");
+        assert_eq!(report.matched_transactions[0].total_output_amount, "0.25");
+        assert_eq!(report.unmatched_transactions.len(), 0);
     }
 }
