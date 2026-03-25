@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS issued_swap_calldata (
 
 CREATE INDEX idx_issued_swap_calldata_api_key_id_created
     ON issued_swap_calldata (api_key_id, created_at);
+CREATE INDEX idx_issued_swap_calldata_chain_id_created
+    ON issued_swap_calldata (chain_id, created_at);
 CREATE INDEX idx_issued_swap_calldata_calldata_hash_created
     ON issued_swap_calldata (calldata_hash, created_at);
 CREATE INDEX idx_issued_swap_calldata_taker_created

@@ -1,5 +1,6 @@
 use crate::db::DbPool;
 use crate::raindex::RaindexProvider;
+use futures::stream::{self, StreamExt};
 use rain_math_float::Float;
 use rain_orderbook_common::raindex_client::RaindexError;
 use reqwest::Client as HttpClient;
@@ -9,8 +10,13 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, QueryBuilder};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Add;
+use std::time::Duration;
 
 const MATCH_WINDOW_SECS: i64 = 2 * 60;
+const RPC_LOOKUP_CONCURRENCY: usize = 8;
+const RPC_LOOKUP_TIMEOUT_SECS: u64 = 5;
+const RPC_LOOKUP_MAX_ATTEMPTS: u32 = 3;
+const RPC_LOOKUP_RETRY_BASE_DELAY_MS: u64 = 200;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CustomerVolumeReportArgs {
@@ -27,8 +33,6 @@ pub(crate) enum CustomerVolumeReportError {
     MissingLocalDbPath,
     #[error("raindex local db file not found: {path}")]
     MissingLocalDb { path: String },
-    #[error("no orderbooks configured for chain {chain_id}")]
-    MissingOrderbooks { chain_id: u32 },
     #[error("no RPC URLs configured for chain {chain_id}")]
     MissingRpcUrls { chain_id: u32 },
     #[error("database error: {0}")]
@@ -109,6 +113,7 @@ struct ReportAudit {
     matched_executions: usize,
     unmatched_executions: usize,
     ambiguous_matches: usize,
+    rpc_lookup_failures: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +164,57 @@ struct UnmatchedTransactionReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AmbiguousMatchCandidateReport {
+    api_key_id: i64,
+    key_id: String,
+    label: String,
+    owner: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AmbiguousTransactionReport {
+    tx_hash: String,
+    sender: String,
+    to_address: String,
+    block_number: u64,
+    timestamp: u64,
+    total_input_amount: String,
+    total_output_amount: String,
+    candidates: Vec<AmbiguousMatchCandidateReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RpcLookupFailureReport {
+    tx_hash: String,
+    sender: String,
+    to_address: String,
+    block_number: u64,
+    timestamp: u64,
+    error: String,
+}
+
+impl RpcLookupFailureReport {
+    fn from_error(candidate: &CandidateExecution, error: CustomerVolumeReportError) -> Self {
+        let (tx_hash, error) = match error {
+            CustomerVolumeReportError::RpcLookup { tx_hash, message } => (tx_hash, message),
+            CustomerVolumeReportError::TransactionNotFound { tx_hash } => {
+                (tx_hash, "transaction not found via RPC".to_string())
+            }
+            other => (candidate.tx_hash.clone(), other.to_string()),
+        };
+
+        Self {
+            tx_hash,
+            sender: candidate.sender.clone(),
+            to_address: candidate.orderbook_address.clone(),
+            block_number: candidate.block_number,
+            timestamp: candidate.timestamp,
+            error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CustomerVolumeReport {
     start_time: u64,
     end_time: u64,
@@ -166,6 +222,8 @@ struct CustomerVolumeReport {
     customers: Vec<CustomerVolumeSummary>,
     matched_transactions: Vec<MatchedTransactionReport>,
     unmatched_transactions: Vec<UnmatchedTransactionReport>,
+    ambiguous_transactions: Vec<AmbiguousTransactionReport>,
+    rpc_lookup_failures: Vec<RpcLookupFailureReport>,
 }
 
 type IssuedRowIndex<'a> = HashMap<(String, String, String), Vec<&'a IssuedSwapRow>>;
@@ -214,6 +272,7 @@ pub(crate) async fn run(
         matched = report.audit.matched_executions,
         unmatched = report.audit.unmatched_executions,
         ambiguous = report.audit.ambiguous_matches,
+        rpc_lookup_failures = report.audit.rpc_lookup_failures,
         "customer volume report complete"
     );
 
@@ -226,22 +285,22 @@ async fn build_report(
     start_time: u64,
     end_time: u64,
 ) -> Result<CustomerVolumeReport, CustomerVolumeReportError> {
-    let chain_orderbooks = orderbooks_for_chain(raindex)?;
     let issued_rows = load_issued_rows(pool, start_time, end_time).await?;
     let issued_row_index = build_issued_row_index(&issued_rows);
 
     tracing::info!(
-        orderbook_count = chain_orderbooks.len(),
         issued_count = issued_rows.len(),
         "loaded issued swap rows for customer volume report"
     );
 
     let raindex_db = open_raindex_db(raindex).await?;
-    let candidate_rows =
-        load_take_order_rows(&raindex_db, &chain_orderbooks, start_time, end_time).await?;
+    let candidate_rows = load_take_order_rows(&raindex_db, start_time, end_time).await?;
     let candidates = aggregate_candidate_rows(candidate_rows)?;
     let rpc_urls = rpc_urls_for_chain(raindex)?;
-    let rpc = HttpClient::new();
+    let rpc = HttpClient::builder()
+        .timeout(Duration::from_secs(RPC_LOOKUP_TIMEOUT_SECS))
+        .build()
+        .map_err(CustomerVolumeReportError::Http)?;
 
     tracing::info!(
         candidate_count = candidates.len(),
@@ -252,13 +311,62 @@ async fn build_report(
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
     let mut ambiguous_matches = 0usize;
+    let mut ambiguous_transactions = Vec::new();
+    let mut rpc_lookup_failures = Vec::new();
 
-    for candidate in candidates {
-        let tx_input = fetch_transaction_input(&rpc, &rpc_urls, &candidate.tx_hash).await?;
+    let mut lookup_results = stream::iter(candidates.into_iter().map(|candidate| {
+        let rpc = rpc.clone();
+        let rpc_urls = rpc_urls.clone();
+
+        async move {
+            let tx_input = fetch_transaction_input(&rpc, &rpc_urls, &candidate.tx_hash).await;
+            (candidate, tx_input)
+        }
+    }))
+    .buffered(RPC_LOOKUP_CONCURRENCY);
+
+    while let Some((candidate, tx_input)) = lookup_results.next().await {
+        let tx_input = match tx_input {
+            Ok(tx_input) => tx_input,
+            Err(error @ CustomerVolumeReportError::RpcLookup { .. })
+            | Err(error @ CustomerVolumeReportError::TransactionNotFound { .. }) => {
+                let failure = RpcLookupFailureReport::from_error(&candidate, error);
+                tracing::warn!(
+                    tx_hash = %failure.tx_hash,
+                    sender = %failure.sender,
+                    to = %failure.to_address,
+                    error = %failure.error,
+                    "skipping candidate execution after RPC lookup failure"
+                );
+                rpc_lookup_failures.push(failure);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let selection = select_issued_row(&candidate, &tx_input, &issued_row_index);
 
-        if selection.duplicate_match_count > 1 {
+        if selection.distinct_match_count > 1 {
             ambiguous_matches += 1;
+            ambiguous_transactions.push(AmbiguousTransactionReport {
+                tx_hash: candidate.tx_hash.clone(),
+                sender: candidate.sender.clone(),
+                to_address: candidate.orderbook_address.clone(),
+                block_number: candidate.block_number,
+                timestamp: candidate.timestamp,
+                total_input_amount: format_hex(&candidate.total_input_hex)?,
+                total_output_amount: format_hex(&candidate.total_output_hex)?,
+                candidates: selection
+                    .distinct_matches
+                    .iter()
+                    .map(|row| AmbiguousMatchCandidateReport {
+                        api_key_id: row.api_key_id,
+                        key_id: row.key_id.clone(),
+                        label: row.label.clone(),
+                        owner: row.owner.clone(),
+                    })
+                    .collect(),
+            });
+            continue;
         }
 
         match selection.row {
@@ -276,7 +384,7 @@ async fn build_report(
                 output_token: row.output_token.clone(),
                 total_input_hex: candidate.total_input_hex.clone(),
                 total_output_hex: candidate.total_output_hex.clone(),
-                duplicate_match_count: selection.duplicate_match_count,
+                duplicate_match_count: selection.matching_row_count,
             }),
             None => unmatched.push(UnmatchedTransactionReport {
                 tx_hash: candidate.tx_hash.clone(),
@@ -320,34 +428,14 @@ async fn build_report(
             matched_executions: matched_transactions.len(),
             unmatched_executions: unmatched.len(),
             ambiguous_matches,
+            rpc_lookup_failures: rpc_lookup_failures.len(),
         },
         customers,
         matched_transactions,
         unmatched_transactions: unmatched,
+        ambiguous_transactions,
+        rpc_lookup_failures,
     })
-}
-
-fn orderbooks_for_chain(
-    raindex: &RaindexProvider,
-) -> Result<Vec<String>, CustomerVolumeReportError> {
-    let mut addresses = raindex
-        .client()
-        .get_all_orderbooks()?
-        .into_values()
-        .filter(|orderbook| orderbook.network.chain_id == crate::CHAIN_ID)
-        .map(|orderbook| normalize_address(&format!("{:#x}", orderbook.address)))
-        .collect::<Vec<_>>();
-
-    addresses.sort();
-    addresses.dedup();
-
-    if addresses.is_empty() {
-        return Err(CustomerVolumeReportError::MissingOrderbooks {
-            chain_id: crate::CHAIN_ID,
-        });
-    }
-
-    Ok(addresses)
 }
 
 fn rpc_urls_for_chain(raindex: &RaindexProvider) -> Result<Vec<Url>, CustomerVolumeReportError> {
@@ -405,9 +493,9 @@ async fn load_issued_rows(
             CAST(strftime('%s', isc.created_at) AS INTEGER) AS created_at_unix
          FROM issued_swap_calldata isc
          WHERE isc.chain_id = ?
-           AND CAST(strftime('%s', isc.created_at) AS INTEGER) >= ?
-           AND CAST(strftime('%s', isc.created_at) AS INTEGER) <= ?
-         ORDER BY created_at_unix DESC, isc.id DESC",
+           AND isc.created_at >= datetime(?,'unixepoch')
+           AND isc.created_at <= datetime(?,'unixepoch')
+         ORDER BY isc.created_at DESC, isc.id DESC",
     )
     .bind(crate::CHAIN_ID as i64)
     .bind(min_issue_time)
@@ -419,7 +507,6 @@ async fn load_issued_rows(
 
 async fn load_take_order_rows(
     raindex_db: &sqlx::Pool<sqlx::Sqlite>,
-    orderbook_addresses: &[String],
     start_time: u64,
     end_time: u64,
 ) -> Result<Vec<TakeOrderRow>, CustomerVolumeReportError> {
@@ -442,14 +529,7 @@ async fn load_take_order_rows(
         .push_bind(start_time as i64)
         .push(" AND block_timestamp <= ")
         .push_bind(end_time as i64)
-        .push(" AND orderbook_address IN (");
-
-    let mut separated = query_builder.separated(", ");
-    for orderbook in orderbook_addresses {
-        separated.push_bind(orderbook);
-    }
-    separated.push_unseparated(")");
-    query_builder.push(" ORDER BY block_number, log_index");
+        .push(" ORDER BY block_number, log_index");
 
     query_builder
         .build_query_as::<TakeOrderRow>()
@@ -461,7 +541,7 @@ async fn load_take_order_rows(
 fn aggregate_candidate_rows(
     rows: Vec<TakeOrderRow>,
 ) -> Result<Vec<CandidateExecution>, CustomerVolumeReportError> {
-    let mut aggregates: HashMap<String, CandidateExecution> = HashMap::new();
+    let mut aggregates: HashMap<(String, String), CandidateExecution> = HashMap::new();
 
     for row in rows {
         let tx_hash = normalize_hex(&row.transaction_hash);
@@ -470,10 +550,11 @@ fn aggregate_candidate_rows(
         let input_delta = normalize_hex(&row.taker_output);
         let output_delta = normalize_hex(&row.taker_input);
 
-        match aggregates.get_mut(&tx_hash) {
+        let aggregate_key = (tx_hash.clone(), orderbook_address.clone());
+
+        match aggregates.get_mut(&aggregate_key) {
             Some(existing) => {
                 if existing.sender != sender
-                    || existing.orderbook_address != orderbook_address
                     || existing.block_number != row.block_number as u64
                     || existing.timestamp != row.block_timestamp as u64
                 {
@@ -491,7 +572,7 @@ fn aggregate_candidate_rows(
                 add_hex_amount(&mut total_output_hex, &output_delta)?;
 
                 aggregates.insert(
-                    tx_hash.clone(),
+                    aggregate_key,
                     CandidateExecution {
                         tx_hash,
                         orderbook_address,
@@ -512,13 +593,16 @@ fn aggregate_candidate_rows(
             .cmp(&right.timestamp)
             .then_with(|| left.block_number.cmp(&right.block_number))
             .then_with(|| left.tx_hash.cmp(&right.tx_hash))
+            .then_with(|| left.orderbook_address.cmp(&right.orderbook_address))
     });
     Ok(candidates)
 }
 
 struct Selection<'a> {
     row: Option<&'a IssuedSwapRow>,
-    duplicate_match_count: usize,
+    matching_row_count: usize,
+    distinct_match_count: usize,
+    distinct_matches: Vec<&'a IssuedSwapRow>,
 }
 
 fn build_issued_row_index(issued_rows: &[IssuedSwapRow]) -> IssuedRowIndex<'_> {
@@ -566,13 +650,17 @@ fn select_issued_row<'a>(
         None => {
             return Selection {
                 row: None,
-                duplicate_match_count: 0,
+                matching_row_count: 0,
+                distinct_match_count: 0,
+                distinct_matches: Vec::new(),
             };
         }
     };
 
     let mut matched_row = None;
-    let mut duplicate_match_count = 0;
+    let mut matching_row_count = 0;
+    let mut distinct_matches = Vec::new();
+    let mut seen_api_keys = std::collections::HashSet::new();
 
     for row in issued_rows {
         if row.created_at_unix > candidate_timestamp {
@@ -580,9 +668,13 @@ fn select_issued_row<'a>(
         }
 
         if candidate_timestamp <= row.created_at_unix + MATCH_WINDOW_SECS {
-            duplicate_match_count += 1;
+            matching_row_count += 1;
             if matched_row.is_none() {
                 matched_row = Some(*row);
+            }
+
+            if seen_api_keys.insert(row.api_key_id) {
+                distinct_matches.push(*row);
             }
             continue;
         }
@@ -590,9 +682,17 @@ fn select_issued_row<'a>(
         break;
     }
 
+    let row = if distinct_matches.len() == 1 {
+        matched_row
+    } else {
+        None
+    };
+
     Selection {
-        row: matched_row,
-        duplicate_match_count,
+        row,
+        matching_row_count,
+        distinct_match_count: distinct_matches.len(),
+        distinct_matches,
     }
 }
 
@@ -705,31 +805,43 @@ async fn fetch_transaction_input(
     let mut last_error = None;
 
     for rpc_url in rpc_urls {
-        let response = match client.post(rpc_url.clone()).json(&payload).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = Some(error.to_string());
+        for attempt in 1..=RPC_LOOKUP_MAX_ATTEMPTS {
+            let response = match client.post(rpc_url.clone()).json(&payload).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    sleep_before_retry(attempt).await;
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                last_error = Some(format!("rpc status {}", response.status()));
+                sleep_before_retry(attempt).await;
                 continue;
             }
-        };
 
-        let envelope = match response
-            .json::<JsonRpcEnvelope<RpcTransactionResponse>>()
-            .await
-        {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                last_error = Some(error.to_string());
-                continue;
+            let envelope = match response
+                .json::<JsonRpcEnvelope<RpcTransactionResponse>>()
+                .await
+            {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    sleep_before_retry(attempt).await;
+                    continue;
+                }
+            };
+
+            if let Some(result) = envelope.result {
+                return Ok(normalize_hex(&result.input));
             }
-        };
 
-        if let Some(result) = envelope.result {
-            return Ok(normalize_hex(&result.input));
-        }
+            if let Some(error) = envelope.error {
+                last_error = Some(error.message);
+            }
 
-        if let Some(error) = envelope.error {
-            last_error = Some(error.message);
+            break;
         }
     }
 
@@ -745,55 +857,101 @@ async fn fetch_transaction_input(
     })
 }
 
+async fn sleep_before_retry(attempt: u32) {
+    if attempt >= RPC_LOOKUP_MAX_ATTEMPTS {
+        return;
+    }
+
+    tokio::time::sleep(Duration::from_millis(
+        RPC_LOOKUP_RETRY_BASE_DELAY_MS * u64::from(attempt),
+    ))
+    .await;
+}
+
 fn print_human_report(report: &CustomerVolumeReport) {
     println!("Customer volume report");
     println!("Window: {} -> {}", report.start_time, report.end_time);
     println!(
-        "Matched executed txs: {} | Unmatched executed txs: {} | Ambiguous matches: {}",
+        "Matched executed txs: {} | Unmatched executed txs: {} | Ambiguous matches: {} | RPC lookup failures: {}",
         report.audit.matched_executions,
         report.audit.unmatched_executions,
-        report.audit.ambiguous_matches
+        report.audit.ambiguous_matches,
+        report.audit.rpc_lookup_failures
     );
     println!();
 
-    if report.customers.is_empty() {
-        println!("No matched customer executions found.");
-        return;
-    }
-
-    for customer in &report.customers {
-        println!(
-            "{} ({}) [{}] executions={}",
-            customer.label, customer.owner, customer.key_id, customer.executed_txs
-        );
-
-        for pair in &customer.pairs {
+    if !report.rpc_lookup_failures.is_empty() {
+        println!("RPC lookup failures:");
+        for failure in &report.rpc_lookup_failures {
             println!(
-                "  {} -> {} | input={} | output={}",
-                pair.input_token,
-                pair.output_token,
-                pair.total_input_amount,
-                pair.total_output_amount
+                "  {} | sender={} | to={} | block={} | timestamp={} | error={}",
+                failure.tx_hash,
+                failure.sender,
+                failure.to_address,
+                failure.block_number,
+                failure.timestamp,
+                failure.error
             );
         }
-
         println!();
+    }
+
+    if !report.ambiguous_transactions.is_empty() {
+        println!("Ambiguous transactions:");
+        for transaction in &report.ambiguous_transactions {
+            println!(
+                "  {} | sender={} | to={} | block={} | timestamp={} | input={} | output={}",
+                transaction.tx_hash,
+                transaction.sender,
+                transaction.to_address,
+                transaction.block_number,
+                transaction.timestamp,
+                transaction.total_input_amount,
+                transaction.total_output_amount
+            );
+            for candidate in &transaction.candidates {
+                println!(
+                    "    candidate api_key_id={} key_id={} label={} owner={}",
+                    candidate.api_key_id, candidate.key_id, candidate.label, candidate.owner
+                );
+            }
+        }
+        println!();
+    }
+
+    if report.customers.is_empty() {
+        println!("No matched customer executions found.");
+    } else {
+        for customer in &report.customers {
+            println!(
+                "{} ({}) [{}] executions={}",
+                customer.label, customer.owner, customer.key_id, customer.executed_txs
+            );
+
+            for pair in &customer.pairs {
+                println!(
+                    "  {} -> {} | input={} | output={}",
+                    pair.input_token,
+                    pair.output_token,
+                    pair.total_input_amount,
+                    pair.total_output_amount
+                );
+            }
+
+            println!();
+        }
     }
 }
 
 fn normalize_address(value: &str) -> String {
-    let trimmed = value.trim();
-    if let Some(address) = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-    {
-        format!("0x{}", address.to_ascii_lowercase())
-    } else {
-        format!("0x{}", trimmed.to_ascii_lowercase())
-    }
+    normalize_prefixed_hex(value)
 }
 
 fn normalize_hex(value: &str) -> String {
+    normalize_prefixed_hex(value)
+}
+
+fn normalize_prefixed_hex(value: &str) -> String {
     let trimmed = value.trim();
     if let Some(hex) = trimmed
         .strip_prefix("0x")
@@ -826,6 +984,10 @@ fn format_hex(value_hex: &str) -> Result<String, CustomerVolumeReportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[derive(Debug)]
     struct SeededMatchContext {
@@ -970,6 +1132,43 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_candidate_rows_keeps_same_tx_separate_per_orderbook() {
+        let rows = vec![
+            TakeOrderRow {
+                orderbook_address: "0xd2938e7c9fe3597f78832ce780feb61945c377d7".to_string(),
+                transaction_hash:
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                block_number: 10,
+                block_timestamp: 100,
+                sender: "0x1111111111111111111111111111111111111111".to_string(),
+                taker_input: Float::parse("0.25".to_string()).expect("float").as_hex(),
+                taker_output: Float::parse("50".to_string()).expect("float").as_hex(),
+            },
+            TakeOrderRow {
+                orderbook_address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                transaction_hash:
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                block_number: 10,
+                block_timestamp: 100,
+                sender: "0x1111111111111111111111111111111111111111".to_string(),
+                taker_input: Float::parse("0.20".to_string()).expect("float").as_hex(),
+                taker_output: Float::parse("40".to_string()).expect("float").as_hex(),
+            },
+        ];
+
+        let aggregated = aggregate_candidate_rows(rows).expect("aggregate");
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(
+            aggregated[0].orderbook_address,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            aggregated[1].orderbook_address,
+            "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
+        );
+    }
+
+    #[test]
     fn test_select_issued_row_requires_exact_match_and_window() {
         let rows = vec![
             issued_row(1, 1, "alpha", "owner-a", 100),
@@ -989,11 +1188,96 @@ mod tests {
         );
 
         assert_eq!(selection.row.map(|row| row.id), Some(1));
-        assert_eq!(selection.duplicate_match_count, 1);
+        assert_eq!(selection.matching_row_count, 1);
+        assert_eq!(selection.distinct_match_count, 1);
     }
 
     #[test]
-    fn test_select_issued_row_prefers_latest_matching_issuance() {
+    fn test_select_issued_row_rejects_future_issuance() {
+        let rows = vec![issued_row(1, 1, "alpha", "owner-a", 200)];
+        let issued_row_index = build_issued_row_index(&rows);
+
+        let selection = select_issued_row(
+            &candidate(
+                "0xtx",
+                "0x1111111111111111111111111111111111111111",
+                "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                199,
+            ),
+            "0xabcdef",
+            &issued_row_index,
+        );
+
+        assert!(selection.row.is_none());
+        assert_eq!(selection.matching_row_count, 0);
+        assert_eq!(selection.distinct_match_count, 0);
+    }
+
+    #[test]
+    fn test_select_issued_row_accepts_same_timestamp_issuance() {
+        let rows = vec![issued_row(1, 1, "alpha", "owner-a", 100)];
+        let issued_row_index = build_issued_row_index(&rows);
+
+        let selection = select_issued_row(
+            &candidate(
+                "0xtx",
+                "0x1111111111111111111111111111111111111111",
+                "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                100,
+            ),
+            "0xabcdef",
+            &issued_row_index,
+        );
+
+        assert_eq!(selection.row.map(|row| row.id), Some(1));
+        assert_eq!(selection.matching_row_count, 1);
+        assert_eq!(selection.distinct_match_count, 1);
+    }
+
+    #[test]
+    fn test_select_issued_row_accepts_exact_match_window_boundary() {
+        let rows = vec![issued_row(1, 1, "alpha", "owner-a", 100)];
+        let issued_row_index = build_issued_row_index(&rows);
+
+        let selection = select_issued_row(
+            &candidate(
+                "0xtx",
+                "0x1111111111111111111111111111111111111111",
+                "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                220,
+            ),
+            "0xabcdef",
+            &issued_row_index,
+        );
+
+        assert_eq!(selection.row.map(|row| row.id), Some(1));
+        assert_eq!(selection.matching_row_count, 1);
+        assert_eq!(selection.distinct_match_count, 1);
+    }
+
+    #[test]
+    fn test_select_issued_row_rejects_after_match_window_boundary() {
+        let rows = vec![issued_row(1, 1, "alpha", "owner-a", 100)];
+        let issued_row_index = build_issued_row_index(&rows);
+
+        let selection = select_issued_row(
+            &candidate(
+                "0xtx",
+                "0x1111111111111111111111111111111111111111",
+                "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                221,
+            ),
+            "0xabcdef",
+            &issued_row_index,
+        );
+
+        assert!(selection.row.is_none());
+        assert_eq!(selection.matching_row_count, 0);
+        assert_eq!(selection.distinct_match_count, 0);
+    }
+
+    #[test]
+    fn test_select_issued_row_returns_none_for_ambiguous_distinct_keys() {
         let rows = vec![
             issued_row(1, 1, "alpha", "owner-a", 100),
             issued_row(2, 2, "beta", "owner-b", 200),
@@ -1011,8 +1295,33 @@ mod tests {
             &issued_row_index,
         );
 
+        assert!(selection.row.is_none());
+        assert_eq!(selection.matching_row_count, 2);
+        assert_eq!(selection.distinct_match_count, 2);
+    }
+
+    #[test]
+    fn test_select_issued_row_treats_same_key_duplicates_as_single_match() {
+        let rows = vec![
+            issued_row(1, 1, "alpha", "owner-a", 100),
+            issued_row(2, 1, "alpha", "owner-a", 200),
+        ];
+        let issued_row_index = build_issued_row_index(&rows);
+
+        let selection = select_issued_row(
+            &candidate(
+                "0xtx",
+                "0x1111111111111111111111111111111111111111",
+                "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                210,
+            ),
+            "0xabcdef",
+            &issued_row_index,
+        );
+
         assert_eq!(selection.row.map(|row| row.id), Some(2));
-        assert_eq!(selection.duplicate_match_count, 2);
+        assert_eq!(selection.matching_row_count, 2);
+        assert_eq!(selection.distinct_match_count, 1);
     }
 
     #[test]
@@ -1060,19 +1369,11 @@ mod tests {
         assert_eq!(customers[0].pairs[0].total_output_amount, "0.45");
     }
 
-    async fn mock_rpc_url_for_input(input: &str) -> String {
+    async fn mock_rpc_url_with_body(body: String) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock rpc server");
         let addr = listener.local_addr().expect("mock rpc addr");
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "input": input,
-            }
-        })
-        .to_string();
 
         tokio::spawn(async move {
             loop {
@@ -1098,10 +1399,107 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn mock_rpc_url_with_bodies(bodies: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock rpc server");
+        let addr = listener.local_addr().expect("mock rpc addr");
+        let bodies = Arc::new(bodies);
+        let next_index = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+
+                let bodies = Arc::clone(&bodies);
+                let next_index = Arc::clone(&next_index);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+
+                    let index = next_index.fetch_add(1, Ordering::SeqCst);
+                    let body = bodies
+                        .get(index)
+                        .or_else(|| bodies.last())
+                        .cloned()
+                        .expect("at least one mock rpc body");
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn mock_rpc_url_for_input(input: &str) -> String {
+        mock_rpc_url_with_body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "input": input,
+                }
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    async fn mock_rpc_url_for_missing_transaction() -> String {
+        mock_rpc_url_with_body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    async fn mock_rpc_url_for_rpc_error(message: &str) -> String {
+        mock_rpc_url_with_body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "message": message,
+                }
+            })
+            .to_string(),
+        )
+        .await
+    }
+
     async fn seed_raindex_take_orders(
         db_path: &std::path::Path,
         tx_hash: &str,
         block_timestamp: i64,
+    ) {
+        seed_raindex_take_orders_for_orderbook(
+            db_path,
+            tx_hash,
+            block_timestamp,
+            "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+        )
+        .await;
+    }
+
+    async fn seed_raindex_take_orders_for_orderbook(
+        db_path: &std::path::Path,
+        tx_hash: &str,
+        block_timestamp: i64,
+        orderbook_address: &str,
     ) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1144,7 +1542,7 @@ mod tests {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(crate::CHAIN_ID as i64)
-        .bind("0xd2938e7c9fe3597f78832ce780feb61945c377d7")
+        .bind(orderbook_address)
         .bind(tx_hash)
         .bind(10_i64)
         .bind(block_timestamp)
@@ -1158,6 +1556,10 @@ mod tests {
     }
 
     fn test_registry_settings(rpc_url: &str) -> String {
+        test_registry_settings_with_orderbook(rpc_url, "0xd2938e7c9fe3597f78832ce780feb61945c377d7")
+    }
+
+    fn test_registry_settings_with_orderbook(rpc_url: &str, orderbook_address: &str) -> String {
         format!(
             "version: 4
 networks:
@@ -1170,7 +1572,7 @@ subgraphs:
   base: https://example.com/subgraph
 orderbooks:
   base:
-    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    address: {orderbook_address}
     network: base
     subgraph: base
     deployment-block: 0
@@ -1191,7 +1593,28 @@ tokens:
         tx_input: &str,
     ) -> crate::raindex::RaindexProvider {
         let rpc_url = mock_rpc_url_for_input(tx_input).await;
-        let settings = test_registry_settings(&rpc_url);
+        load_test_raindex_with_rpc_url(db_path, &rpc_url).await
+    }
+
+    async fn load_test_raindex_with_rpc_url(
+        db_path: std::path::PathBuf,
+        rpc_url: &str,
+    ) -> crate::raindex::RaindexProvider {
+        let settings = test_registry_settings(rpc_url);
+        let registry_url =
+            crate::test_helpers::mock_raindex_registry_url_with_settings(&settings).await;
+
+        crate::raindex::RaindexProvider::load(&registry_url, Some(db_path))
+            .await
+            .expect("load test raindex provider")
+    }
+
+    async fn load_test_raindex_with_rpc_url_and_orderbook(
+        db_path: std::path::PathBuf,
+        rpc_url: &str,
+        orderbook_address: &str,
+    ) -> crate::raindex::RaindexProvider {
+        let settings = test_registry_settings_with_orderbook(rpc_url, orderbook_address);
         let registry_url =
             crate::test_helpers::mock_raindex_registry_url_with_settings(&settings).await;
 
@@ -1221,6 +1644,7 @@ tokens:
         assert_eq!(report.audit.matched_executions, 1);
         assert_eq!(report.audit.unmatched_executions, 0);
         assert_eq!(report.audit.ambiguous_matches, 0);
+        assert_eq!(report.audit.rpc_lookup_failures, 0);
         assert_eq!(report.customers.len(), 1);
         assert_eq!(report.customers[0].api_key_id, expected.api_key_id);
         assert_eq!(report.customers[0].key_id, expected.key_id);
@@ -1252,6 +1676,8 @@ tokens:
         assert_eq!(report.matched_transactions[0].total_input_amount, "50");
         assert_eq!(report.matched_transactions[0].total_output_amount, "0.25");
         assert_eq!(report.unmatched_transactions.len(), 0);
+        assert!(report.ambiguous_transactions.is_empty());
+        assert!(report.rpc_lookup_failures.is_empty());
     }
 
     #[tokio::test]
@@ -1282,6 +1708,267 @@ tokens:
         assert_eq!(report.customers[0].label, "alpha");
         assert_eq!(report.customers[0].owner, "owner-a");
         assert_eq!(report.matched_transactions.len(), 1);
-        assert_eq!(report.matched_transactions[0].key_id, report.customers[0].key_id);
+        assert_eq!(
+            report.matched_transactions[0].key_id,
+            report.customers[0].key_id
+        );
+        assert!(report.ambiguous_transactions.is_empty());
+        assert!(report.rpc_lookup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_report_uses_chain_history_not_current_orderbook_registry() {
+        let pool = test_pool().await;
+        let expected = seed_match_context(&pool, 100).await;
+        let tx_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders_for_orderbook(
+            &db_path,
+            tx_hash,
+            105,
+            "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+        )
+        .await;
+
+        let rpc_url = mock_rpc_url_for_input("0xabcdef").await;
+        let raindex = load_test_raindex_with_rpc_url_and_orderbook(
+            db_path,
+            &rpc_url,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.audit.matched_executions, 1);
+        assert_eq!(report.matched_transactions.len(), 1);
+        assert_eq!(report.matched_transactions[0].tx_hash, tx_hash);
+        assert_eq!(
+            report.matched_transactions[0].api_key_id,
+            expected.api_key_id
+        );
+        assert!(report.unmatched_transactions.is_empty());
+        assert!(report.ambiguous_transactions.is_empty());
+        assert!(report.rpc_lookup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_report_does_not_match_when_execution_precedes_issuance() {
+        let pool = test_pool().await;
+        seed_match_context(&pool, 105).await;
+        let tx_hash = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders(&db_path, tx_hash, 90).await;
+
+        let raindex = load_test_raindex(db_path, "0xabcdef").await;
+
+        let report = build_report(&pool, &raindex, 80, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.audit.matched_executions, 0);
+        assert_eq!(report.matched_transactions.len(), 0);
+        assert_eq!(report.audit.unmatched_executions, 1);
+        assert_eq!(report.unmatched_transactions.len(), 1);
+        assert_eq!(report.unmatched_transactions[0].tx_hash, tx_hash);
+        assert!(report.ambiguous_transactions.is_empty());
+        assert!(report.rpc_lookup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_report_excludes_issued_rows_after_execution() {
+        let pool = test_pool().await;
+        seed_match_context(&pool, 111).await;
+        let tx_hash = "0xabababababababababababababababababababababababababababababababab";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders(&db_path, tx_hash, 110).await;
+
+        let raindex = load_test_raindex(db_path, "0xabcdef").await;
+
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.audit.matched_executions, 0);
+        assert_eq!(report.matched_transactions.len(), 0);
+        assert_eq!(report.audit.unmatched_executions, 1);
+        assert_eq!(report.unmatched_transactions.len(), 1);
+        assert_eq!(report.unmatched_transactions[0].tx_hash, tx_hash);
+        assert!(report.ambiguous_transactions.is_empty());
+        assert!(report.rpc_lookup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_report_keeps_same_tx_hash_separate_per_orderbook() {
+        let pool = test_pool().await;
+        let expected = seed_match_context(&pool, 100).await;
+        let tx_hash = "0xedededededededededededededededededededededededededededededededed";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders_for_orderbook(
+            &db_path,
+            tx_hash,
+            105,
+            "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+        )
+        .await;
+        seed_raindex_take_orders_for_orderbook(
+            &db_path,
+            tx_hash,
+            105,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+
+        let raindex = load_test_raindex(db_path, "0xabcdef").await;
+
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.audit.matched_executions, 1);
+        assert_eq!(report.audit.unmatched_executions, 1);
+        assert_eq!(report.matched_transactions.len(), 1);
+        assert_eq!(report.matched_transactions[0].tx_hash, tx_hash);
+        assert_eq!(
+            report.matched_transactions[0].api_key_id,
+            expected.api_key_id
+        );
+        assert_eq!(report.unmatched_transactions.len(), 1);
+        assert_eq!(report.unmatched_transactions[0].tx_hash, tx_hash);
+        assert_eq!(
+            report.unmatched_transactions[0].to_address,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(report.ambiguous_transactions.is_empty());
+        assert!(report.rpc_lookup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_report_records_ambiguous_transactions_without_attribution() {
+        let pool = test_pool().await;
+        let first = seed_match_context(&pool, 100).await;
+        let second = seed_match_context(&pool, 101).await;
+        let tx_hash = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders(&db_path, tx_hash, 105).await;
+
+        let raindex = load_test_raindex(db_path, "0xabcdef").await;
+
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.audit.matched_executions, 0);
+        assert_eq!(report.audit.unmatched_executions, 0);
+        assert_eq!(report.audit.ambiguous_matches, 1);
+        assert!(report.customers.is_empty());
+        assert!(report.matched_transactions.is_empty());
+        assert!(report.unmatched_transactions.is_empty());
+        assert_eq!(report.ambiguous_transactions.len(), 1);
+        assert_eq!(report.ambiguous_transactions[0].tx_hash, tx_hash);
+        assert_eq!(report.ambiguous_transactions[0].candidates.len(), 2);
+        assert_eq!(
+            report.ambiguous_transactions[0].candidates[0].api_key_id,
+            second.api_key_id
+        );
+        assert_eq!(
+            report.ambiguous_transactions[0].candidates[1].api_key_id,
+            first.api_key_id
+        );
+        assert!(report.rpc_lookup_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_report_records_rpc_lookup_failures_without_aborting() {
+        let pool = test_pool().await;
+        let tx_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("raindex.db");
+        seed_raindex_take_orders(&db_path, tx_hash, 105).await;
+
+        let rpc_url = mock_rpc_url_for_missing_transaction().await;
+        let raindex = load_test_raindex_with_rpc_url(db_path, &rpc_url).await;
+
+        let report = build_report(&pool, &raindex, 90, 110)
+            .await
+            .expect("build report");
+
+        assert_eq!(report.audit.matched_executions, 0);
+        assert_eq!(report.audit.unmatched_executions, 0);
+        assert_eq!(report.audit.ambiguous_matches, 0);
+        assert_eq!(report.audit.rpc_lookup_failures, 1);
+        assert!(report.customers.is_empty());
+        assert!(report.matched_transactions.is_empty());
+        assert!(report.unmatched_transactions.is_empty());
+        assert!(report.ambiguous_transactions.is_empty());
+        assert_eq!(report.rpc_lookup_failures.len(), 1);
+        assert_eq!(report.rpc_lookup_failures[0].tx_hash, tx_hash);
+        assert_eq!(
+            report.rpc_lookup_failures[0].error,
+            "transaction not found via RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_transaction_input_retries_same_rpc_url_after_invalid_json() {
+        let rpc_url = mock_rpc_url_with_bodies(vec![
+            "not-json".to_string(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "input": "0xabcdef",
+                }
+            })
+            .to_string(),
+        ])
+        .await;
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(RPC_LOOKUP_TIMEOUT_SECS))
+            .build()
+            .expect("http client");
+
+        let input =
+            fetch_transaction_input(&client, &[Url::parse(&rpc_url).expect("rpc url")], "0xtx")
+                .await
+                .expect("rpc retry should succeed");
+
+        assert_eq!(input, "0xabcdef");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_transaction_input_falls_back_to_next_rpc_url() {
+        let failing_rpc_url = mock_rpc_url_for_rpc_error("upstream unavailable").await;
+        let succeeding_rpc_url = mock_rpc_url_for_input("0xabcdef").await;
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(RPC_LOOKUP_TIMEOUT_SECS))
+            .build()
+            .expect("http client");
+
+        let input = fetch_transaction_input(
+            &client,
+            &[
+                Url::parse(&failing_rpc_url).expect("failing rpc url"),
+                Url::parse(&succeeding_rpc_url).expect("succeeding rpc url"),
+            ],
+            "0xtx",
+        )
+        .await
+        .expect("rpc fallback should succeed");
+
+        assert_eq!(input, "0xabcdef");
     }
 }

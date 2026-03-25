@@ -4,6 +4,8 @@ use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
+use alloy::hex::encode_prefixed;
+use alloy::primitives::keccak256;
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
 use rocket::serde::json::Json;
@@ -73,7 +75,16 @@ async fn handle_swap_calldata(
     req: SwapCalldataRequest,
 ) -> Result<SwapCalldataResponse, ApiError> {
     let response = process_swap_calldata(ds, &req).await?;
-    persist_issued_swap_calldata(pool, key, &req, &response).await?;
+    if let Err(error) = persist_issued_swap_calldata(pool, key, &req, &response).await {
+        tracing::warn!(
+            error = %error,
+            api_key_id = key.id,
+            key_id = %key.key_id,
+            taker = %req.taker,
+            to = %response.to,
+            "continuing after issued swap calldata persistence failure"
+        );
+    }
     Ok(response)
 }
 
@@ -82,37 +93,30 @@ async fn persist_issued_swap_calldata(
     key: &AuthenticatedKey,
     request: &SwapCalldataRequest,
     response: &SwapCalldataResponse,
-) -> Result<(), ApiError> {
+) -> Result<(), sqlx::Error> {
     if !should_persist_issued_swap_calldata(response) {
         return Ok(());
     }
 
-    let key_snapshot = crate::db::issued_swap_calldata::IssuedSwapCalldataKeySnapshot {
+    let record = crate::db::issued_swap_calldata::NewIssuedSwapCalldata {
         api_key_id: key.id,
-        key_id: &key.key_id,
-        label: &key.label,
-        owner: &key.owner,
+        key_id: key.key_id.clone(),
+        label: key.label.clone(),
+        owner: key.owner.clone(),
+        chain_id: crate::CHAIN_ID as i64,
+        taker: format!("{:#x}", request.taker),
+        to_address: format!("{:#x}", response.to),
+        tx_value: response.value.to_string(),
+        calldata: encode_prefixed(response.data.as_ref()),
+        calldata_hash: encode_prefixed(keccak256(response.data.as_ref())),
+        input_token: format!("{:#x}", request.input_token),
+        output_token: format!("{:#x}", request.output_token),
+        output_amount: request.output_amount.clone(),
+        maximum_io_ratio: request.maximum_io_ratio.clone(),
+        estimated_input: response.estimated_input.clone(),
     };
 
-    crate::db::issued_swap_calldata::insert(
-        pool,
-        &key_snapshot,
-        crate::CHAIN_ID,
-        request,
-        response,
-    )
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                error = %error,
-                api_key_id = key.id,
-                key_id = %key.key_id,
-                taker = %request.taker,
-                to = %response.to,
-                "failed to persist issued swap calldata"
-            );
-            ApiError::Internal("failed to persist issued swap calldata".into())
-        })?;
+    crate::db::issued_swap_calldata::insert(pool, &record).await?;
 
     tracing::info!(
         api_key_id = key.id,
@@ -464,9 +468,14 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_handle_swap_calldata_returns_internal_if_persistence_fails() {
+    async fn test_handle_swap_calldata_returns_response_if_persistence_fails() {
         let client = TestClientBuilder::new().build().await;
         let pool = client.rocket().state::<DbPool>().expect("pool");
+
+        sqlx::query("DROP TABLE issued_swap_calldata")
+            .execute(pool)
+            .await
+            .expect("drop issued swap calldata table");
 
         let ds = MockSwapDataSource {
             orders: Ok(vec![]),
@@ -482,12 +491,11 @@ mod tests {
             is_admin: false,
         };
 
-        let result = handle_swap_calldata(&ds, pool, &key, calldata_request("100", "2.5")).await;
-        assert!(matches!(
-            result,
-            Err(ApiError::Internal(msg)) if msg == "failed to persist issued swap calldata"
-        ));
-        assert_eq!(issued_row_count(pool).await, 0);
+        let result = handle_swap_calldata(&ds, pool, &key, calldata_request("100", "2.5"))
+            .await
+            .expect("swap calldata should still succeed");
+        assert_eq!(result.to, ORDERBOOK);
+        assert_eq!(result.data, ready_response().data);
     }
 
     #[rocket::async_test]

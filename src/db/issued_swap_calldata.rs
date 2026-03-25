@@ -1,25 +1,27 @@
 use crate::db::DbPool;
-use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
-use alloy::hex::encode_prefixed;
-use alloy::primitives::keccak256;
 
-pub(crate) struct IssuedSwapCalldataKeySnapshot<'a> {
+pub(crate) struct NewIssuedSwapCalldata {
     pub api_key_id: i64,
-    pub key_id: &'a str,
-    pub label: &'a str,
-    pub owner: &'a str,
+    pub key_id: String,
+    pub label: String,
+    pub owner: String,
+    pub chain_id: i64,
+    pub taker: String,
+    pub to_address: String,
+    pub tx_value: String,
+    pub calldata: String,
+    pub calldata_hash: String,
+    pub input_token: String,
+    pub output_token: String,
+    pub output_amount: String,
+    pub maximum_io_ratio: String,
+    pub estimated_input: String,
 }
 
 pub(crate) async fn insert(
     pool: &DbPool,
-    key: &IssuedSwapCalldataKeySnapshot<'_>,
-    chain_id: u32,
-    request: &SwapCalldataRequest,
-    response: &SwapCalldataResponse,
+    record: &NewIssuedSwapCalldata,
 ) -> Result<(), sqlx::Error> {
-    let calldata = encode_prefixed(response.data.as_ref());
-    let calldata_hash = encode_prefixed(keccak256(response.data.as_ref()));
-
     sqlx::query(
         "INSERT INTO issued_swap_calldata (
             api_key_id,
@@ -39,21 +41,21 @@ pub(crate) async fn insert(
             estimated_input
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(key.api_key_id)
-    .bind(key.key_id)
-    .bind(key.label)
-    .bind(key.owner)
-    .bind(chain_id as i64)
-    .bind(format!("{:#x}", request.taker))
-    .bind(format!("{:#x}", response.to))
-    .bind(response.value.to_string())
-    .bind(calldata)
-    .bind(calldata_hash)
-    .bind(format!("{:#x}", request.input_token))
-    .bind(format!("{:#x}", request.output_token))
-    .bind(&request.output_amount)
-    .bind(&request.maximum_io_ratio)
-    .bind(&response.estimated_input)
+    .bind(record.api_key_id)
+    .bind(&record.key_id)
+    .bind(&record.label)
+    .bind(&record.owner)
+    .bind(record.chain_id)
+    .bind(&record.taker)
+    .bind(&record.to_address)
+    .bind(&record.tx_value)
+    .bind(&record.calldata)
+    .bind(&record.calldata_hash)
+    .bind(&record.input_token)
+    .bind(&record.output_token)
+    .bind(&record.output_amount)
+    .bind(&record.maximum_io_ratio)
+    .bind(&record.estimated_input)
     .execute(pool)
     .await?;
 
