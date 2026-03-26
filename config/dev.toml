@@ -1,6 +1,6 @@
 log_dir = "./logs"
 database_url = "sqlite:./data/st0x.db"
-registry_url = "https://raw.githubusercontent.com/rainlanguage/rain.strategies/5d0a11ad4a3e89531c922317b09216200ea7bdc0/registry"
+registry_url = "https://raw.githubusercontent.com/ST0x-Technology/st0x.registry/4576454c0860c2bbf5726b3d1fcdc60771e377a7/registry"
 rate_limit_global_rpm = 600
 rate_limit_per_key_rpm = 60
 docs_dir = "./docs/book"
