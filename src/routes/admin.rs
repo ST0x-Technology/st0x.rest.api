@@ -52,10 +52,21 @@ pub async fn put_registry(
             ));
         }
 
-        let db_path = {
+        let (previous_url, db_path) = {
             let guard = shared_raindex.read().await;
-            guard.db_path()
+            (guard.registry_url(), guard.db_path())
         };
+
+        if previous_url == req.registry_url {
+            tracing::info!(
+                registry_url = %req.registry_url,
+                admin_key_id = %admin.0.key_id,
+                "registry unchanged"
+            );
+            return Ok(Json(RegistryResponse {
+                registry_url: req.registry_url,
+            }));
+        }
 
         let new_provider = RaindexProvider::load(&req.registry_url, db_path)
             .await
@@ -142,7 +153,9 @@ mod tests {
     };
     use rocket::http::{ContentType, Header, Status};
 
-    async fn history_rows(client: &rocket::local::asynchronous::Client) -> Vec<RegistryUrlHistoryRow> {
+    async fn history_rows(
+        client: &rocket::local::asynchronous::Client,
+    ) -> Vec<RegistryUrlHistoryRow> {
         let pool = client
             .rocket()
             .state::<crate::db::DbPool>()
@@ -194,7 +207,6 @@ mod tests {
 
         let history = history_rows(&client).await;
         assert_eq!(history.len(), 1);
-        assert!(history[0].id > 0);
         assert_eq!(history[0].previous_url, original_url);
         assert_eq!(history[0].new_url, new_url);
         assert_eq!(history[0].actor_key_id, key_id);

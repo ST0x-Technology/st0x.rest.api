@@ -2,7 +2,6 @@ use super::DbPool;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct RegistryUrlHistoryRow {
-    pub id: i64,
     pub previous_url: String,
     pub new_url: String,
     pub actor_key_id: String,
@@ -43,7 +42,7 @@ pub(crate) async fn list_registry_url_history(
     pool: &DbPool,
 ) -> Result<Vec<RegistryUrlHistoryRow>, sqlx::Error> {
     sqlx::query_as::<_, RegistryUrlHistoryRow>(
-        "SELECT id, previous_url, new_url, actor_key_id, actor_label, actor_owner, changed_at \
+        "SELECT previous_url, new_url, actor_key_id, actor_label, actor_owner, changed_at \
          FROM registry_url_history \
          ORDER BY changed_at DESC, id DESC",
     )
