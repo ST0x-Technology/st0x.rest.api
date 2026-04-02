@@ -8,7 +8,6 @@ use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedAddress;
 use crate::types::orders::{OrderSide, OrdersByTokenParams, OrdersListResponse};
 use alloy::primitives::Address;
-use futures::future::join_all;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rain_orderbook_common::raindex_client::orders::GetOrdersTokenFilter;
 use rocket::serde::json::Json;
@@ -51,8 +50,11 @@ pub(crate) async fn process_get_orders_by_token(
         .get_orders_list(filters, Some(page_num), Some(effective_page_size))
         .await?;
 
-    let quote_futures: Vec<_> = orders.iter().map(|o| ds.get_order_quotes(o)).collect();
-    let quote_results = join_all(quote_futures).await;
+    tracing::info!(
+        quoted_orders = orders.len(),
+        "fetching batched quotes for orders by token"
+    );
+    let quote_results = ds.get_order_quotes_batch(&orders).await;
 
     let mut summaries = Vec::with_capacity(orders.len());
     for (order, quotes_result) in orders.iter().zip(quote_results) {
