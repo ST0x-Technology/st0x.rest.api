@@ -1,4 +1,4 @@
-use super::{RaindexTradesDataSource, TradesDataSource};
+use super::{RaindexTradesDataSource, TradesDataSource, TxIndexState};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -56,9 +56,14 @@ pub(super) async fn process_get_trades_by_tx(
     let trades = result.trades();
 
     if trades.is_empty() {
-        return Err(ApiError::NotFound(
-            "transaction has no associated trades".into(),
-        ));
+        return match trades_ds.check_tx_index_state(tx_hash).await? {
+            TxIndexState::NotYetIndexed => Err(ApiError::NotYetIndexed(format!(
+                "transaction {tx_hash:#x} not yet indexed"
+            ))),
+            TxIndexState::Indexed => Err(ApiError::NotFound(
+                "transaction has no associated trades".into(),
+            )),
+        };
     }
 
     let first_tx = trades[0].transaction();
@@ -130,6 +135,7 @@ mod tests {
 
     struct MockTradesDataSource {
         result: Result<RaindexTradesListResult, ApiError>,
+        tx_index_state: Result<TxIndexState, ApiError>,
     }
 
     #[async_trait]
@@ -143,12 +149,17 @@ mod tests {
                 Err(e) => Err(e.clone()),
             }
         }
+
+        async fn check_tx_index_state(&self, _tx_hash: B256) -> Result<TxIndexState, ApiError> {
+            self.tx_index_state.clone()
+        }
     }
 
     #[rocket::async_test]
     async fn test_process_success() {
         let trades_ds = MockTradesDataSource {
             result: Ok(mock_trades_list_result()),
+            tx_index_state: Ok(TxIndexState::Indexed),
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
@@ -177,6 +188,7 @@ mod tests {
     async fn test_process_tx_not_found() {
         let trades_ds = MockTradesDataSource {
             result: Ok(mock_empty_trades_list_result()),
+            tx_index_state: Ok(TxIndexState::Indexed),
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
@@ -191,7 +203,8 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_tx_not_indexed() {
         let trades_ds = MockTradesDataSource {
-            result: Err(ApiError::NotYetIndexed("not indexed".into())),
+            result: Ok(mock_empty_trades_list_result()),
+            tx_index_state: Ok(TxIndexState::NotYetIndexed),
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
@@ -207,6 +220,23 @@ mod tests {
     async fn test_process_query_failure() {
         let trades_ds = MockTradesDataSource {
             result: Err(ApiError::Internal("subgraph error".into())),
+            tx_index_state: Ok(TxIndexState::Indexed),
+        };
+        let result = process_get_trades_by_tx(
+            &trades_ds,
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_index_check_failure() {
+        let trades_ds = MockTradesDataSource {
+            result: Ok(mock_empty_trades_list_result()),
+            tx_index_state: Err(ApiError::Internal("index check failed".into())),
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
