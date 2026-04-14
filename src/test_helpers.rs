@@ -89,11 +89,22 @@ impl TestClientBuilder {
             crate::cache::RouteResponseCaches::new(100, std::time::Duration::from_secs(10));
         let app_state = crate::app_state::ApplicationState::new(artifact_store, response_caches);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
+
+        // Deterministic hardhat account #0 — test-only signer.
+        const TEST_GATING_KEY: &str =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let gating_state = crate::signing::GatingState {
+            signer: crate::signing::GatingSigner::from_hex_key(TEST_GATING_KEY)
+                .expect("parse test gating key"),
+            ttl_seconds: 60,
+        };
+
         let rocket = crate::rocket(
             pool,
             self.rate_limiter,
             shared_raindex,
             app_state,
+            gating_state,
             docs_dir,
             2,
         )
