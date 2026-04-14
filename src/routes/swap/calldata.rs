@@ -2,6 +2,8 @@ use super::{RaindexSwapDataSource, SwapDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::raindex::ApiGatingInjector;
+use crate::signing::GatingState;
 use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
@@ -27,19 +29,21 @@ use tracing::Instrument;
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    gating: &State<GatingState>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
+    let injector = ApiGatingInjector::for_request(gating, &key);
     async move {
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
         };
-        let response = process_swap_calldata(&ds, req).await?;
+        let response = process_swap_calldata(&ds, req, &injector).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -49,6 +53,7 @@ pub async fn post_swap_calldata(
 async fn process_swap_calldata(
     ds: &dyn SwapDataSource,
     req: SwapCalldataRequest,
+    injector: &dyn rain_orderbook_common::take_orders::SignedContextInjector,
 ) -> Result<SwapCalldataResponse, ApiError> {
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
@@ -60,7 +65,7 @@ async fn process_swap_calldata(
         price_cap: req.maximum_io_ratio,
     };
 
-    ds.get_calldata(take_req).await
+    ds.get_calldata(take_req, injector).await
 }
 
 #[cfg(test)]
@@ -70,6 +75,7 @@ mod tests {
     use crate::test_helpers::TestClientBuilder;
     use crate::types::common::Approval;
     use alloy::primitives::{address, Address, Bytes, U256};
+    use rain_orderbook_common::take_orders::NoopInjector;
     use rocket::http::{ContentType, Status};
 
     const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -120,7 +126,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Ok(ready_response()),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector)
             .await
             .unwrap();
 
@@ -138,7 +144,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Ok(approval_response()),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector)
             .await
             .unwrap();
 
@@ -158,7 +164,8 @@ mod tests {
                 "no liquidity found for this pair".into(),
             )),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
     }
 
@@ -169,7 +176,9 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::BadRequest("invalid parameters".into())),
         };
-        let result = process_swap_calldata(&ds, calldata_request("not-a-number", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("not-a-number", "2.5"), &NoopInjector)
+                .await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -180,7 +189,8 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 

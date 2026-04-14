@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, U256};
 use base64::Engine;
 use rain_math_float::Float;
-use rain_orderbook_bindings::IOrderBookV6::{EvaluableV4, OrderV4, IOV2};
+use rain_orderbook_bindings::IRaindexV6::{EvaluableV4, OrderV4, IOV2};
 use rain_orderbook_common::raindex_client::orders::RaindexOrder;
 use rain_orderbook_common::take_orders::TakeOrderCandidate;
 use rocket::local::asynchronous::Client;
@@ -57,8 +57,25 @@ impl TestClientBuilder {
 
         let shared_raindex = tokio::sync::RwLock::new(raindex_config);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
-        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir, None)
-            .expect("valid rocket instance");
+
+        // Deterministic hardhat account #0 — test-only signer.
+        const TEST_GATING_KEY: &str =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let gating_state = crate::signing::GatingState {
+            signer: crate::signing::GatingSigner::from_hex_key(TEST_GATING_KEY)
+                .expect("parse test gating key"),
+            ttl_seconds: 60,
+        };
+
+        let rocket = crate::rocket(
+            pool,
+            self.rate_limiter,
+            shared_raindex,
+            gating_state,
+            docs_dir,
+            None,
+        )
+        .expect("valid rocket instance");
 
         Client::tracked(rocket).await.expect("valid client")
     }
@@ -72,7 +89,7 @@ pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
 }
 
 pub(crate) async fn mock_raindex_registry_url() -> String {
-    let settings = r#"version: 4
+    let settings = r#"version: 5
 networks:
   base:
     rpcs:
@@ -207,7 +224,7 @@ pub(crate) fn basic_auth_header(key_id: &str, secret: &str) -> String {
 fn stub_raindex_client() -> serde_json::Value {
     json!({
         "orderbook_yaml": {
-            "documents": ["version: 4\nnetworks:\n  base:\n    rpcs:\n      - https://mainnet.base.org\n    chain-id: 8453\n    currency: ETH\nsubgraphs:\n  base: https://example.com/sg\norderbooks:\n  base:\n    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7\n    network: base\n    subgraph: base\n    deployment-block: 0\ndeployers:\n  base:\n    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D\n    network: base\n"],
+            "documents": ["version: 5\nnetworks:\n  base:\n    rpcs:\n      - https://mainnet.base.org\n    chain-id: 8453\n    currency: ETH\nsubgraphs:\n  base: https://example.com/sg\norderbooks:\n  base:\n    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7\n    network: base\n    subgraph: base\n    deployment-block: 0\ndeployers:\n  base:\n    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D\n    network: base\n"],
             "profile": "strict"
         }
     })
@@ -310,5 +327,6 @@ pub(crate) fn mock_candidate(max_output: &str, ratio: &str) -> TakeOrderCandidat
         output_io_index: 0,
         max_output: Float::parse(max_output.to_string()).unwrap(),
         ratio: Float::parse(ratio.to_string()).unwrap(),
+        signed_context: vec![],
     }
 }
