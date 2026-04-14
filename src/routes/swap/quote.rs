@@ -2,9 +2,12 @@ use super::{RaindexSwapDataSource, SwapDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::raindex::ApiGatingInjector;
+use crate::signing::GatingState;
 use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
+use alloy::primitives::Address;
 use rain_math_float::Float;
-use rain_orderbook_common::take_orders::simulate_buy_over_candidates;
+use rain_orderbook_common::take_orders::{simulate_buy_over_candidates, SignedContextInjector};
 use rocket::serde::json::Json;
 use rocket::State;
 use std::ops::Div;
@@ -28,19 +31,21 @@ use tracing::Instrument;
 #[post("/quote", data = "<request>")]
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    gating: &State<GatingState>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
+    let injector = ApiGatingInjector::for_request(gating, &key);
     async move {
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
         };
-        let response = process_swap_quote(&ds, req).await?;
+        let response = process_swap_quote(&ds, req, &injector).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -50,6 +55,7 @@ pub async fn post_swap_quote(
 async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
+    injector: &dyn SignedContextInjector,
 ) -> Result<SwapQuoteResponse, ApiError> {
     let orders = ds
         .get_orders_for_pair(req.input_token, req.output_token)
@@ -61,8 +67,15 @@ async fn process_swap_quote(
         ));
     }
 
+    let counterparty = req.taker.unwrap_or(Address::ZERO);
     let candidates = ds
-        .build_candidates_for_pair(&orders, req.input_token, req.output_token)
+        .build_candidates_for_pair(
+            &orders,
+            req.input_token,
+            req.output_token,
+            counterparty,
+            injector,
+        )
         .await?;
 
     if candidates.is_empty() {
@@ -124,6 +137,7 @@ mod tests {
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
     use alloy::primitives::address;
+    use rain_orderbook_common::take_orders::NoopInjector;
     use rocket::http::{ContentType, Status};
 
     const USDC: alloy::primitives::Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -134,6 +148,7 @@ mod tests {
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
+            taker: None,
         }
     }
 
@@ -144,7 +159,9 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("100"), &NoopInjector)
+            .await
+            .unwrap();
 
         assert_eq!(result.input_token, USDC);
         assert_eq!(result.output_token, WETH);
@@ -161,7 +178,9 @@ mod tests {
             candidates: vec![mock_candidate("50", "2"), mock_candidate("50", "3")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("100"), &NoopInjector)
+            .await
+            .unwrap();
 
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "100");
@@ -176,7 +195,9 @@ mod tests {
             candidates: vec![mock_candidate("30", "2")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("100"), &NoopInjector)
+            .await
+            .unwrap();
 
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "30");
@@ -194,7 +215,9 @@ mod tests {
             ],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("10")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("10"), &NoopInjector)
+            .await
+            .unwrap();
 
         assert_eq!(result.estimated_io_ratio, "1.5");
         assert_eq!(result.estimated_input, "15");
@@ -207,7 +230,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
     }
 
@@ -218,7 +241,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no valid quotes")));
     }
 
@@ -229,7 +252,7 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("not-a-number")).await;
+        let result = process_swap_quote(&ds, quote_request("not-a-number"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -240,7 +263,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
