@@ -4,3 +4,4 @@ registry_url = "https://raw.githubusercontent.com/rainlanguage/rain.strategies/a
 rate_limit_global_rpm = 1000
 rate_limit_per_key_rpm = 100
 docs_dir = "docs/book"
+gating_signature_ttl_seconds = 60

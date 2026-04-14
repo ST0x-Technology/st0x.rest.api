@@ -5,3 +5,4 @@ rate_limit_global_rpm = 600
 rate_limit_per_key_rpm = 60
 docs_dir = "./docs/book"
 local_db_path = "data/raindex.db"
+gating_signature_ttl_seconds = 60
