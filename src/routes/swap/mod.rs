@@ -19,7 +19,7 @@ use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rain_orderbook_common::take_orders::{
-    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate,
+    build_take_order_candidates_for_pair, NoopInjector, SignedContextInjector, TakeOrderCandidate,
 };
 use rocket::Route;
 use std::collections::HashMap;
@@ -43,11 +43,14 @@ pub(crate) trait SwapDataSource: Send + Sync {
         orders: &[RaindexOrder],
         input_token: Address,
         output_token: Address,
+        counterparty: Address,
+        injector: &dyn SignedContextInjector,
     ) -> Result<Vec<TakeOrderCandidate>, ApiError>;
 
     async fn get_calldata(
         &self,
         request: TakeOrdersRequest,
+        injector: &dyn SignedContextInjector,
     ) -> Result<SwapCalldataResponse, ApiError>;
 
     async fn get_wrap_ratios_for_tokens(
@@ -146,7 +149,26 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         orders: &[RaindexOrder],
         input_token: Address,
         output_token: Address,
+        counterparty: Address,
+        injector: &dyn SignedContextInjector,
     ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
+        if counterparty != Address::ZERO {
+            return build_take_order_candidates_for_pair(
+                orders,
+                input_token,
+                output_token,
+                None,
+                None,
+                counterparty,
+                injector,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to build order candidates");
+                ApiError::Internal("failed to build order candidates".into())
+            });
+        }
+
         let fetch = || async {
             build_take_order_candidates_for_pair(
                 orders,
@@ -181,10 +203,11 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     async fn get_calldata(
         &self,
         request: TakeOrdersRequest,
+        injector: &dyn SignedContextInjector,
     ) -> Result<SwapCalldataResponse, ApiError> {
         let result = self
             .client
-            .get_take_orders_calldata(request)
+            .get_take_orders_calldata_with_injector(request, injector)
             .await
             .map_err(map_raindex_error)?;
 
@@ -327,7 +350,7 @@ pub(crate) mod test_fixtures {
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
-    use rain_orderbook_common::take_orders::TakeOrderCandidate;
+    use rain_orderbook_common::take_orders::{SignedContextInjector, TakeOrderCandidate};
 
     pub struct MockSwapDataSource {
         pub supported_tokens: Result<(), ApiError>,
@@ -362,6 +385,8 @@ pub(crate) mod test_fixtures {
             _orders: &[RaindexOrder],
             _input_token: Address,
             _output_token: Address,
+            _counterparty: Address,
+            _injector: &dyn SignedContextInjector,
         ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
             Ok(self.candidates.clone())
         }
@@ -369,6 +394,7 @@ pub(crate) mod test_fixtures {
         async fn get_calldata(
             &self,
             _request: TakeOrdersRequest,
+            _injector: &dyn SignedContextInjector,
         ) -> Result<SwapCalldataResponse, ApiError> {
             self.calldata_result.clone()
         }

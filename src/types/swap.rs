@@ -23,6 +23,16 @@ pub struct SwapQuoteRequest {
     #[serde(default)]
     #[schema(example = "wrapped", default = "wrapped")]
     pub denomination: SwapDenomination,
+    /// Taker address used for pricing. For API-gated orders this must match
+    /// the address that will eventually call `takeOrders4`; otherwise the
+    /// gating signature produced for the quote won't validate at take time.
+    /// Omit for non-gated orders.
+    #[schema(
+        value_type = Option<String>,
+        example = "0x1234567890abcdef1234567890abcdef12345678"
+    )]
+    #[serde(default)]
+    pub taker: Option<Address>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

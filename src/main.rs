@@ -15,6 +15,7 @@ mod fairings;
 mod raindex;
 mod registry_artifact;
 mod routes;
+mod signing;
 mod telemetry;
 mod types;
 mod wrap_ratio;
@@ -398,8 +399,36 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let app_state =
-                app_state::ApplicationState::new(registry_artifact_store, response_caches);
+            let gating_key = match std::env::var("ST0X_GATING_SIGNER_KEY") {
+                Ok(k) if !k.is_empty() => k,
+                _ => {
+                    tracing::error!(
+                        "ST0X_GATING_SIGNER_KEY env var is required but missing or empty"
+                    );
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let gating_signer = match signing::GatingSigner::from_hex_key(&gating_key) {
+                Ok(s) => {
+                    tracing::info!(signer = %s.address(), "gating signer loaded");
+                    s
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to parse ST0X_GATING_SIGNER_KEY");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let gating_state = signing::GatingState {
+                signer: gating_signer,
+                ttl_seconds: cfg.gating_signature_ttl_seconds,
+            };
+            let app_state = app_state::ApplicationState::new(
+                registry_artifact_store,
+                response_caches,
+                gating_state,
+            );
 
             let rocket = match rocket(
                 pool,
@@ -524,6 +553,7 @@ mod tests {
             rate_limit_per_key_rpm: 60,
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
+            gating_signature_ttl_seconds: 60,
         }
     }
 

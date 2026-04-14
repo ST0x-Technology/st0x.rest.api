@@ -4,6 +4,7 @@ use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::raindex::ApiGatingInjector;
 use crate::routes::swap::denomination::{
     normalize_calldata_request_values, normalize_calldata_response, CalldataRequestNormalization,
 };
@@ -36,7 +37,7 @@ use tracing::Instrument;
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
@@ -44,6 +45,7 @@ pub async fn post_swap_calldata(
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
+    let injector = ApiGatingInjector::for_request(&app_state.gating, &key);
     async move {
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
@@ -52,7 +54,7 @@ pub async fn post_swap_calldata(
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_calldata(&ds, req).await?;
+        let response = process_swap_calldata(&ds, req, &injector).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -78,7 +80,7 @@ pub async fn post_swap_calldata(
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata_v2(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
@@ -86,6 +88,7 @@ pub async fn post_swap_calldata_v2(
     request: Json<SwapCalldataV2Request>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
+    let injector = ApiGatingInjector::for_request(&app_state.gating, &key);
     async move {
         tracing::info!(
             mode = ?req.mode,
@@ -98,7 +101,7 @@ pub async fn post_swap_calldata_v2(
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_calldata_v2(&ds, req).await?;
+        let response = process_swap_calldata_v2(&ds, req, &injector).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -163,20 +166,23 @@ impl From<SwapCalldataMode> for TakeOrdersMode {
 async fn process_swap_calldata(
     ds: &dyn SwapDataSource,
     req: SwapCalldataRequest,
+    injector: &dyn rain_orderbook_common::take_orders::SignedContextInjector,
 ) -> Result<SwapCalldataResponse, ApiError> {
-    process_swap_calldata_build(ds, req.into()).await
+    process_swap_calldata_build(ds, req.into(), injector).await
 }
 
 async fn process_swap_calldata_v2(
     ds: &dyn SwapDataSource,
     req: SwapCalldataV2Request,
+    injector: &dyn rain_orderbook_common::take_orders::SignedContextInjector,
 ) -> Result<SwapCalldataResponse, ApiError> {
-    process_swap_calldata_build(ds, req.into()).await
+    process_swap_calldata_build(ds, req.into(), injector).await
 }
 
 async fn process_swap_calldata_build(
     ds: &dyn SwapDataSource,
     req: SwapCalldataBuildRequest,
+    injector: &dyn rain_orderbook_common::take_orders::SignedContextInjector,
 ) -> Result<SwapCalldataResponse, ApiError> {
     ds.validate_supported_tokens(req.input_token, req.output_token)
         .await?;
@@ -206,7 +212,7 @@ async fn process_swap_calldata_build(
         price_cap,
     };
 
-    let response = ds.get_calldata(take_req).await?;
+    let response = ds.get_calldata(take_req, injector).await?;
     normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
 }
 
@@ -220,6 +226,7 @@ mod tests {
     use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::{address, Address, Bytes, U256};
     use async_trait::async_trait;
+    use rain_orderbook_common::take_orders::NoopInjector;
     use rocket::http::{ContentType, Status};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -394,18 +401,27 @@ mod tests {
             orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
             input_token: Address,
             output_token: Address,
+            counterparty: Address,
+            injector: &dyn rain_orderbook_common::take_orders::SignedContextInjector,
         ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
             self.base
-                .build_candidates_for_pair(orders, input_token, output_token)
+                .build_candidates_for_pair(
+                    orders,
+                    input_token,
+                    output_token,
+                    counterparty,
+                    injector,
+                )
                 .await
         }
 
         async fn get_calldata(
             &self,
             request: TakeOrdersRequest,
+            injector: &dyn rain_orderbook_common::take_orders::SignedContextInjector,
         ) -> Result<SwapCalldataResponse, ApiError> {
-            *self.captured_request.lock().unwrap() = Some(request);
-            self.base.calldata_result.clone()
+            *self.captured_request.lock().unwrap() = Some(request.clone());
+            self.base.get_calldata(request, injector).await
         }
 
         async fn get_wrap_ratios_for_tokens(
@@ -442,7 +458,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Ok(ready_response()),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector)
             .await
             .unwrap();
 
@@ -462,7 +478,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Ok(approval_response()),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector)
             .await
             .unwrap();
 
@@ -477,7 +493,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_default_denomination_preserves_request() {
         let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector)
             .await
             .unwrap();
         let request = captured_take_orders_request(&captured_request);
@@ -497,6 +513,7 @@ mod tests {
         let result = process_swap_calldata_v2(
             &ds,
             calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5"),
+            &NoopInjector,
         )
         .await
         .unwrap();
@@ -517,6 +534,7 @@ mod tests {
         let result = process_swap_calldata_v2(
             &ds,
             calldata_v2_request(SwapCalldataMode::SpendUpTo, "75", "3"),
+            &NoopInjector,
         )
         .await
         .unwrap();
@@ -534,6 +552,7 @@ mod tests {
         let result = process_swap_calldata_v2(
             &ds,
             calldata_v2_request(SwapCalldataMode::BuyUpTo, "50", "2"),
+            &NoopInjector,
         )
         .await
         .unwrap();
@@ -550,7 +569,9 @@ mod tests {
         let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
         let mut request = calldata_request("100", "2.5");
         request.denomination = SwapDenomination::Wrapped;
-        let result = process_swap_calldata(&ds, request).await.unwrap();
+        let result = process_swap_calldata(&ds, request, &NoopInjector)
+            .await
+            .unwrap();
         let request = captured_take_orders_request(&captured_request);
 
         assert_eq!(request.amount, "100");
@@ -564,10 +585,13 @@ mod tests {
             ready_response(),
             HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
         );
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"))
-                .await
-                .unwrap();
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"),
+            &NoopInjector,
+        )
+        .await
+        .unwrap();
         let request = captured_take_orders_request(&captured_request);
 
         assert_eq!(request.sell_token, USDC.to_string());
@@ -584,10 +608,13 @@ mod tests {
             ready_response(),
             HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
         );
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
-                .await
-                .unwrap();
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"),
+            &NoopInjector,
+        )
+        .await
+        .unwrap();
         let request = captured_take_orders_request(&captured_request);
 
         assert_eq!(request.sell_token, WT_MSTR.to_string());
@@ -613,6 +640,7 @@ mod tests {
                 "100",
                 "2.5",
             ),
+            &NoopInjector,
         )
         .await
         .unwrap();
@@ -636,6 +664,7 @@ mod tests {
         let result = process_swap_calldata_v2(
             &ds,
             unwrapped_calldata_v2_request(USDC, WT_COIN, SwapCalldataMode::BuyUpTo, "100", "2.5"),
+            &NoopInjector,
         )
         .await
         .unwrap();
@@ -660,6 +689,7 @@ mod tests {
         let result = process_swap_calldata(
             &ds,
             unwrapped_calldata_request(WT_MSTR, WT_COIN, "100", "2.5"),
+            &NoopInjector,
         )
         .await
         .unwrap();
@@ -674,10 +704,13 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_unwrapped_noop_for_non_wrapped_tokens() {
         let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WETH, "100.0", "2.50"))
-                .await
-                .unwrap();
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(USDC, WETH, "100.0", "2.50"),
+            &NoopInjector,
+        )
+        .await
+        .unwrap();
         let request = captured_take_orders_request(&captured_request);
 
         assert_eq!(request.amount, "100.0");
@@ -702,10 +735,13 @@ mod tests {
             },
             HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
         );
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
-                .await
-                .unwrap();
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"),
+            &NoopInjector,
+        )
+        .await
+        .unwrap();
         let request = captured_take_orders_request(&captured_request);
 
         assert_eq!(request.price_cap, "1.25");
@@ -726,6 +762,7 @@ mod tests {
         let result = process_swap_calldata(
             &ds,
             unwrapped_calldata_request(USDC, WT_MSTR, "not-a-number", "2.5"),
+            &NoopInjector,
         )
         .await;
 
@@ -742,6 +779,7 @@ mod tests {
         let result = process_swap_calldata(
             &ds,
             unwrapped_calldata_request(USDC, WT_MSTR, "100", "not-a-number"),
+            &NoopInjector,
         )
         .await;
 
@@ -766,6 +804,7 @@ mod tests {
                 "not-a-number",
                 "2.5",
             ),
+            &NoopInjector,
         )
         .await;
 
@@ -788,6 +827,7 @@ mod tests {
                 "100",
                 "not-a-number",
             ),
+            &NoopInjector,
         )
         .await;
 
@@ -801,9 +841,12 @@ mod tests {
             ready_response(),
             Err(ApiError::Internal("failed to read wrap ratios".into())),
         );
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
-                .await;
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"),
+            &NoopInjector,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read wrap ratios")
@@ -817,9 +860,12 @@ mod tests {
             ready_response(),
             HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "not-a-number"))]),
         );
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"))
-                .await;
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"),
+            &NoopInjector,
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read wrapped token ratio")
@@ -836,9 +882,12 @@ mod tests {
             },
             HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
         );
-        let result =
-            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
-                .await;
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"),
+            &NoopInjector,
+        )
+        .await;
 
         let request = captured_take_orders_request(&captured_request);
         assert_eq!(request.price_cap, "1.25");
@@ -878,7 +927,8 @@ mod tests {
                 "no liquidity found for this pair".into(),
             )),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
     }
 
@@ -890,7 +940,9 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::BadRequest("invalid parameters".into())),
         };
-        let result = process_swap_calldata(&ds, calldata_request("not-a-number", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("not-a-number", "2.5"), &NoopInjector)
+                .await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -902,7 +954,8 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -916,7 +969,8 @@ mod tests {
             candidates: vec![],
             calldata_result: Ok(ready_response()),
         };
-        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        let result =
+            process_swap_calldata(&ds, calldata_request("100", "2.5"), &NoopInjector).await;
         assert!(
             matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
         );
