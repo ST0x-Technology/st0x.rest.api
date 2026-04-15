@@ -18,6 +18,12 @@ use rocket::Route;
 
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
+    async fn validate_supported_tokens(
+        &self,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<(), ApiError>;
+
     async fn get_orders_for_pair(
         &self,
         input_token: Address,
@@ -43,6 +49,36 @@ pub(crate) struct RaindexSwapDataSource<'a> {
 
 #[async_trait]
 impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
+    async fn validate_supported_tokens(
+        &self,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<(), ApiError> {
+        let tokens = self.client.get_all_tokens().map_err(|e| {
+            tracing::error!(error = %e, "failed to retrieve curated tokens");
+            ApiError::Internal("failed to retrieve curated tokens".into())
+        })?;
+
+        let input_supported = tokens.values().any(|token| token.address == input_token);
+        let output_supported = tokens.values().any(|token| token.address == output_token);
+
+        if input_supported && output_supported {
+            tracing::info!(input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
+            return Ok(());
+        }
+
+        tracing::warn!(
+            input_token = %input_token,
+            output_token = %output_token,
+            input_supported,
+            output_supported,
+            "swap request rejected for unsupported curated tokens"
+        );
+        Err(ApiError::BadRequest(
+            "unsupported token for this API".into(),
+        ))
+    }
+
     async fn get_orders_for_pair(
         &self,
         input_token: Address,
@@ -170,6 +206,7 @@ pub(crate) mod test_fixtures {
     use rain_orderbook_common::take_orders::TakeOrderCandidate;
 
     pub struct MockSwapDataSource {
+        pub supported_tokens: Result<(), ApiError>,
         pub orders: Result<Vec<RaindexOrder>, ApiError>,
         pub candidates: Vec<TakeOrderCandidate>,
         pub calldata_result: Result<SwapCalldataResponse, ApiError>,
@@ -177,6 +214,14 @@ pub(crate) mod test_fixtures {
 
     #[async_trait]
     impl SwapDataSource for MockSwapDataSource {
+        async fn validate_supported_tokens(
+            &self,
+            _input_token: Address,
+            _output_token: Address,
+        ) -> Result<(), ApiError> {
+            self.supported_tokens.clone()
+        }
+
         async fn get_orders_for_pair(
             &self,
             _input_token: Address,
