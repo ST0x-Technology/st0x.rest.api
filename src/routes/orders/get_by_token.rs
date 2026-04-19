@@ -3,6 +3,7 @@ use super::{
     DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::auth::AuthenticatedKey;
+use crate::cache::AppCache;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedAddress;
@@ -12,7 +13,18 @@ use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rain_orderbook_common::raindex_client::orders::GetOrdersTokenFilter;
 use rocket::serde::json::Json;
 use rocket::State;
+use std::time::Duration;
 use tracing::Instrument;
+
+const ORDERS_CACHE_TTL: Duration = Duration::from_secs(15);
+const ORDERS_CACHE_CAPACITY: u64 = 1_000;
+
+pub(crate) type OrdersByTokenCache =
+    AppCache<(Address, Option<OrderSide>, u16, u16), OrdersListResponse>;
+
+pub(crate) fn orders_by_token_cache() -> OrdersByTokenCache {
+    AppCache::new(ORDERS_CACHE_CAPACITY, ORDERS_CACHE_TTL)
+}
 
 pub(crate) async fn process_get_orders_by_token(
     ds: &dyn OrdersListDataSource,
@@ -88,6 +100,7 @@ pub async fn get_orders_by_token(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    orders_cache: &State<OrdersByTokenCache>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersByTokenParams,
@@ -96,13 +109,24 @@ pub async fn get_orders_by_token(
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
         let side = params.side;
-        let page = params.page;
-        let page_size = params.page_size;
-        let raindex = shared_raindex.read().await;
-        let ds = RaindexOrdersListDataSource {
-            client: raindex.client(),
-        };
-        let response = process_get_orders_by_token(&ds, addr, side, page, page_size).await?;
+        let page = params.page.unwrap_or(1);
+        let page_size = params
+            .page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE as u16)
+            .min(MAX_PAGE_SIZE);
+        let cache_key = (addr, side, page, page_size);
+
+        let response = orders_cache
+            .get_or_try_insert(cache_key, || async {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexOrdersListDataSource {
+                    client: raindex.client(),
+                };
+                process_get_orders_by_token(&ds, addr, side, Some(page), Some(page_size)).await
+            })
+            .await
+            .map_err(ApiError::from)?;
+
         Ok(Json(response))
     }
     .instrument(span.0)

@@ -319,6 +319,9 @@ pub use get_by_owner::*;
 pub use get_by_token::*;
 pub use get_by_tx::*;
 
+pub(crate) use get_by_owner::{orders_by_owner_cache, OrdersByOwnerCache};
+pub(crate) use get_by_token::{orders_by_token_cache, OrdersByTokenCache};
+
 pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_orders_by_tx,
