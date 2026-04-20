@@ -11,6 +11,7 @@ mod direct_trades;
 mod error;
 mod fairings;
 mod raindex;
+mod reporting;
 mod routes;
 mod telemetry;
 mod types;
@@ -117,6 +118,47 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     .to_cors()?)
 }
 
+async fn load_raindex_provider(
+    cfg: &config::Config,
+    pool: &db::DbPool,
+) -> Result<raindex::RaindexProvider, String> {
+    let db_url = db::settings::get_setting(pool, "registry_url")
+        .await
+        .map_err(|e| format!("failed to read registry_url from database: {e}"))?
+        .filter(|url| !url.is_empty());
+
+    let registry_url = match db_url {
+        Some(url) => {
+            tracing::info!(registry_url = %url, "loaded registry_url from database");
+            url
+        }
+        None if !cfg.registry_url.is_empty() => {
+            if let Err(e) = db::settings::set_setting(pool, "registry_url", &cfg.registry_url).await
+            {
+                tracing::warn!(error = %e, "failed to seed registry_url into database");
+            }
+            cfg.registry_url.clone()
+        }
+        None => {
+            return Err("registry_url not found in database and not set in config file".into());
+        }
+    };
+
+    let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
+    if let Some(parent) = local_db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create local db directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+
+    raindex::RaindexProvider::load(&registry_url, Some(local_db_path))
+        .await
+        .map_err(|e| format!("failed to load raindex registry: {e}"))
+}
+
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
@@ -181,7 +223,9 @@ async fn main() {
     };
 
     let config_path = match &command {
-        cli::Command::Serve { config } | cli::Command::Keys { config, .. } => config.clone(),
+        cli::Command::Serve { config }
+        | cli::Command::Keys { config, .. }
+        | cli::Command::Report { config, .. } => config.clone(),
     };
 
     let cfg = match config::Config::load(&config_path) {
@@ -217,56 +261,13 @@ async fn main() {
 
     match command {
         cli::Command::Serve { .. } => {
-            let db_url = db::settings::get_setting(&pool, "registry_url")
-                .await
-                .ok()
-                .flatten();
-
-            let registry_url = match db_url {
-                Some(url) if !url.is_empty() => {
-                    tracing::info!(registry_url = %url, "loaded registry_url from database");
-                    url
-                }
-                _ if !cfg.registry_url.is_empty() => {
-                    if let Err(e) =
-                        db::settings::set_setting(&pool, "registry_url", &cfg.registry_url).await
-                    {
-                        tracing::warn!(error = %e, "failed to seed registry_url into database");
-                    }
-                    cfg.registry_url
-                }
-                _ => {
-                    tracing::error!(
-                        "registry_url not found in database and not set in config file"
-                    );
-                    drop(log_guard);
-                    std::process::exit(1);
-                }
-            };
-
-            let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
-            if let Some(parent) = local_db_path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        tracing::error!(error = %e, path = %parent.display(), "failed to create local db directory");
-                        drop(log_guard);
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            let raindex_config = match raindex::RaindexProvider::load(
-                &registry_url,
-                Some(local_db_path),
-            )
-            .await
-            {
+            let raindex_config = match load_raindex_provider(&cfg, &pool).await {
                 Ok(config) => {
-                    tracing::info!(registry_url = %registry_url, "raindex registry loaded");
+                    tracing::info!("raindex registry loaded");
                     config
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, registry_url = %registry_url, "failed to load raindex registry");
+                    tracing::error!(error = %e, "failed to load raindex registry");
                     drop(log_guard);
                     std::process::exit(1);
                 }
@@ -357,6 +358,25 @@ async fn main() {
         cli::Command::Keys { command, .. } => {
             if let Err(e) = cli::handle_keys_command(command, pool).await {
                 tracing::error!(error = %e, "keys command failed");
+                drop(log_guard);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Report { command, .. } => {
+            let raindex_config = match load_raindex_provider(&cfg, &pool).await {
+                Ok(config) => {
+                    tracing::info!("raindex registry loaded for report");
+                    config
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to load raindex registry");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) = cli::handle_report_command(command, pool, &raindex_config).await {
+                tracing::error!(error = %e, "report command failed");
                 drop(log_guard);
                 std::process::exit(1);
             }

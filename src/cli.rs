@@ -27,6 +27,13 @@ pub enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
+    #[command(about = "Run internal reports")]
+    Report {
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: ReportCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -48,12 +55,26 @@ pub enum KeysCommand {
     Delete { key_id: String },
 }
 
+#[derive(Subcommand)]
+pub enum ReportCommand {
+    #[command(about = "Report executed customer swap volume")]
+    CustomerVolume {
+        #[arg(long)]
+        start_time: u64,
+        #[arg(long)]
+        end_time: u64,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
 pub fn print_usage() {
     println!("Usage: st0x_rest_api <command>");
     println!();
     println!("Commands:");
     println!("  serve    Start the API server");
     println!("  keys     Manage API keys");
+    println!("  report   Run internal reports");
     println!();
     println!("Run 'st0x_rest_api <command> --help' for more information on a command.");
 }
@@ -71,6 +92,32 @@ pub async fn handle_keys_command(
         KeysCommand::List => list_keys(&pool).await,
         KeysCommand::Revoke { key_id } => revoke_key(&pool, &key_id).await,
         KeysCommand::Delete { key_id } => delete_key(&pool, &key_id).await,
+    }
+}
+
+pub async fn handle_report_command(
+    command: ReportCommand,
+    pool: DbPool,
+    raindex: &crate::raindex::RaindexProvider,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ReportCommand::CustomerVolume {
+            start_time,
+            end_time,
+            json,
+        } => {
+            crate::reporting::customer_volume::run(
+                &pool,
+                raindex,
+                crate::reporting::customer_volume::CustomerVolumeReportArgs {
+                    start_time,
+                    end_time,
+                    json,
+                },
+            )
+            .await?;
+            Ok(())
+        }
     }
 }
 
@@ -234,6 +281,40 @@ mod tests {
                 assert_eq!(config, PathBuf::from("/path/to/config.toml"));
             }
             _ => panic!("expected Keys command"),
+        }
+    }
+
+    #[test]
+    fn test_report_parses_config_flag() {
+        let cli = Cli::try_parse_from([
+            "app",
+            "report",
+            "--config",
+            "/path/to/config.toml",
+            "customer-volume",
+            "--start-time",
+            "10",
+            "--end-time",
+            "20",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Some(Command::Report {
+                config,
+                command:
+                    ReportCommand::CustomerVolume {
+                        start_time,
+                        end_time,
+                        json,
+                    },
+            }) => {
+                assert_eq!(config, PathBuf::from("/path/to/config.toml"));
+                assert_eq!(start_time, 10);
+                assert_eq!(end_time, 20);
+                assert!(!json);
+            }
+            _ => panic!("expected Report command"),
         }
     }
 

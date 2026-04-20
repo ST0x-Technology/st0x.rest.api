@@ -1,3 +1,4 @@
+pub(crate) mod issued_swap_calldata;
 mod migrate;
 mod pool;
 pub(crate) mod registry_history;
