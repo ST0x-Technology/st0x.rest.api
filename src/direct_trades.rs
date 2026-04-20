@@ -232,6 +232,88 @@ impl DirectTradesFetcher {
             ApiError::Internal("taker trades query failed".into())
         })?
     }
+
+    /// Fetch trades associated with a specific transaction hash.
+    /// Returns trades grouped by order hash — same shape as `batch_fetch`.
+    pub(crate) async fn fetch_by_tx_hash(
+        &self,
+        tx_hash: &B256,
+    ) -> Result<HashMap<B256, Vec<OrderTradeEntry>>, ApiError> {
+        let conn = Arc::clone(&self.conn);
+        let chain_id = self.chain_id;
+        let ob_addr = self.orderbook_address.clone();
+        let tx_hex = format!("{:#x}", tx_hash);
+
+        spawn_blocking(move || {
+            let start = Instant::now();
+            let conn = conn.lock().map_err(|e| {
+                tracing::error!(error = %e, "failed to lock direct trades connection");
+                ApiError::Internal("trade query failed".into())
+            })?;
+
+            let query = build_tx_hash_query();
+            let mut stmt = conn.prepare(&query).map_err(|e| {
+                tracing::error!(error = %e, "failed to prepare tx hash trades query");
+                ApiError::Internal("trade query failed".into())
+            })?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![chain_id, ob_addr, tx_hex], |row| {
+                    Ok(RawTradeRow {
+                        order_hash: row.get(0)?,
+                        transaction_hash: row.get(1)?,
+                        block_timestamp: row.get(2)?,
+                        transaction_sender: row.get(3)?,
+                        input_delta: row.get(4)?,
+                        output_delta_raw: row.get(5)?,
+                        trade_id: row.get(6)?,
+                    })
+                })
+                .map_err(|e| {
+                    tracing::error!(error = %e, "tx hash trades query failed");
+                    ApiError::Internal("trade query failed".into())
+                })?;
+
+            let mut result: HashMap<B256, Vec<OrderTradeEntry>> = HashMap::new();
+            let mut row_count = 0u32;
+
+            for row_result in rows {
+                let raw = row_result.map_err(|e| {
+                    tracing::error!(error = %e, "failed to read trade row");
+                    ApiError::Internal("trade query failed".into())
+                })?;
+
+                row_count += 1;
+
+                match convert_raw_trade(&raw) {
+                    Ok((hash, entry)) => {
+                        result.entry(hash).or_default().push(entry);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            order_hash = %raw.order_hash,
+                            "skipping malformed trade row"
+                        );
+                    }
+                }
+            }
+
+            tracing::info!(
+                tx_hash = %tx_hex,
+                trade_rows = row_count,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "direct tx hash trades query completed"
+            );
+
+            Ok(result)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "tx hash trades blocking task failed");
+            ApiError::Internal("trade query failed".into())
+        })?
+    }
 }
 
 struct RawTradeRow {
@@ -454,4 +536,156 @@ ORDER BY order_hash, block_timestamp DESC, log_index DESC
 "#,
         in_clause = in_clause
     )
+}
+
+/// Build a query that finds all trades in a given transaction.
+/// Filters by `transaction_hash` on the take_orders / clear tables
+/// and joins back to order_events to get the order_hash.
+/// ?1 = chain_id, ?2 = orderbook_address, ?3 = transaction_hash
+fn build_tx_hash_query() -> String {
+    r#"
+WITH
+take_trades AS (
+  SELECT
+    oe.order_hash,
+    t.transaction_hash,
+    t.log_index,
+    t.block_timestamp,
+    t.sender AS transaction_sender,
+    t.taker_output AS input_delta,
+    t.taker_input AS output_delta_raw
+  FROM take_orders t
+  JOIN order_events oe
+    ON oe.chain_id = t.chain_id
+   AND oe.orderbook_address = t.orderbook_address
+   AND oe.order_owner = t.order_owner
+   AND oe.order_nonce = t.order_nonce
+   AND oe.event_type = 'AddOrderV3'
+   AND (oe.block_number < t.block_number
+     OR (oe.block_number = t.block_number AND oe.log_index <= t.log_index))
+   AND NOT EXISTS (
+     SELECT 1 FROM order_events newer
+     WHERE newer.chain_id = oe.chain_id
+      AND newer.orderbook_address = oe.orderbook_address
+      AND newer.order_owner = oe.order_owner
+      AND newer.order_nonce = oe.order_nonce
+      AND newer.event_type = 'AddOrderV3'
+      AND (newer.block_number < t.block_number
+        OR (newer.block_number = t.block_number AND newer.log_index <= t.log_index))
+      AND (newer.block_number > oe.block_number
+        OR (newer.block_number = oe.block_number AND newer.log_index > oe.log_index))
+   )
+  WHERE t.chain_id = ?1
+    AND t.orderbook_address = ?2
+    AND t.transaction_hash = ?3
+),
+clear_alice AS (
+  SELECT DISTINCT
+    oe.order_hash,
+    c.transaction_hash,
+    c.log_index,
+    c.block_timestamp,
+    c.sender AS transaction_sender,
+    a.alice_input AS input_delta,
+    a.alice_output AS output_delta_raw
+  FROM clear_v3_events c
+  JOIN order_events oe
+    ON oe.chain_id = c.chain_id
+   AND oe.orderbook_address = c.orderbook_address
+   AND oe.order_hash = c.alice_order_hash
+   AND oe.event_type = 'AddOrderV3'
+   AND (oe.block_number < c.block_number
+     OR (oe.block_number = c.block_number AND oe.log_index <= c.log_index))
+   AND NOT EXISTS (
+     SELECT 1 FROM order_events newer
+     WHERE newer.chain_id = oe.chain_id
+      AND newer.orderbook_address = oe.orderbook_address
+      AND newer.order_hash = oe.order_hash
+      AND newer.event_type = 'AddOrderV3'
+      AND (newer.block_number < c.block_number
+        OR (newer.block_number = c.block_number AND newer.log_index <= c.log_index))
+      AND (newer.block_number > oe.block_number
+        OR (newer.block_number = oe.block_number AND newer.log_index > oe.log_index))
+   )
+  JOIN after_clear_v2_events a
+    ON a.chain_id = c.chain_id
+   AND a.orderbook_address = c.orderbook_address
+   AND a.transaction_hash = c.transaction_hash
+   AND a.log_index = (
+       SELECT MIN(ac.log_index)
+       FROM after_clear_v2_events ac
+       WHERE ac.chain_id = c.chain_id
+         AND ac.orderbook_address = c.orderbook_address
+         AND ac.transaction_hash = c.transaction_hash
+         AND ac.log_index > c.log_index
+   )
+  WHERE c.chain_id = ?1
+    AND c.orderbook_address = ?2
+    AND c.transaction_hash = ?3
+),
+clear_bob AS (
+  SELECT DISTINCT
+    oe.order_hash,
+    c.transaction_hash,
+    c.log_index,
+    c.block_timestamp,
+    c.sender AS transaction_sender,
+    a.bob_input AS input_delta,
+    a.bob_output AS output_delta_raw
+  FROM clear_v3_events c
+  JOIN order_events oe
+    ON oe.chain_id = c.chain_id
+   AND oe.orderbook_address = c.orderbook_address
+   AND oe.order_hash = c.bob_order_hash
+   AND oe.event_type = 'AddOrderV3'
+   AND (oe.block_number < c.block_number
+     OR (oe.block_number = c.block_number AND oe.log_index <= c.log_index))
+   AND NOT EXISTS (
+     SELECT 1 FROM order_events newer
+     WHERE newer.chain_id = oe.chain_id
+      AND newer.orderbook_address = oe.orderbook_address
+      AND newer.order_hash = oe.order_hash
+      AND newer.event_type = 'AddOrderV3'
+      AND (newer.block_number < c.block_number
+        OR (newer.block_number = c.block_number AND newer.log_index <= c.log_index))
+      AND (newer.block_number > oe.block_number
+        OR (newer.block_number = oe.block_number AND newer.log_index > oe.log_index))
+   )
+  JOIN after_clear_v2_events a
+    ON a.chain_id = c.chain_id
+   AND a.orderbook_address = c.orderbook_address
+   AND a.transaction_hash = c.transaction_hash
+   AND a.log_index = (
+       SELECT MIN(ac.log_index)
+       FROM after_clear_v2_events ac
+       WHERE ac.chain_id = c.chain_id
+         AND ac.orderbook_address = c.orderbook_address
+         AND ac.transaction_hash = c.transaction_hash
+         AND ac.log_index > c.log_index
+   )
+  WHERE c.chain_id = ?1
+    AND c.orderbook_address = ?2
+    AND c.bob_order_hash IN (
+      SELECT DISTINCT bob_order_hash FROM clear_v3_events
+      WHERE chain_id = ?1 AND orderbook_address = ?2 AND transaction_hash = ?3
+    )
+)
+SELECT
+  order_hash,
+  transaction_hash,
+  block_timestamp,
+  transaction_sender,
+  input_delta,
+  output_delta_raw,
+  ('0x' || lower(replace(transaction_hash, '0x', '')) || printf('%016x', log_index)) AS trade_id
+FROM (
+  SELECT * FROM take_trades
+  UNION ALL
+  SELECT * FROM clear_alice
+  UNION ALL
+  SELECT * FROM clear_bob
+)
+ORDER BY order_hash, block_timestamp DESC, log_index DESC
+"#
+    .to_string()
 }
