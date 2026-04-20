@@ -91,6 +91,12 @@ impl<'r> Responder<'r, 'static> for ApiError {
     }
 }
 
+impl From<std::sync::Arc<ApiError>> for ApiError {
+    fn from(arc: std::sync::Arc<ApiError>) -> Self {
+        (*arc).clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

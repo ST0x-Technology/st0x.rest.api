@@ -125,10 +125,15 @@ pub(crate) fn rocket(
 
     let options = Options::Index | Options::NormalizeDirs;
 
+    let orders_by_token_cache = routes::orders::orders_by_token_cache();
+    let orders_by_owner_cache = routes::orders::orders_by_owner_cache();
+
     Ok(rocket::custom(figment)
         .manage(pool)
         .manage(rate_limiter)
         .manage(raindex_config)
+        .manage(orders_by_token_cache)
+        .manage(orders_by_owner_cache)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())

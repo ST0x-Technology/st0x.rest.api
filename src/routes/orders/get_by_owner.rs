@@ -13,6 +13,18 @@ use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
 
+use crate::cache::AppCache;
+use std::time::Duration;
+
+const ORDERS_BY_OWNER_CACHE_TTL: Duration = Duration::from_secs(15);
+const ORDERS_BY_OWNER_CACHE_CAPACITY: u64 = 1_000;
+
+pub(crate) type OrdersByOwnerCache = AppCache<(Address, u16, u16), OrdersListResponse>;
+
+pub(crate) fn orders_by_owner_cache() -> OrdersByOwnerCache {
+    AppCache::new(ORDERS_BY_OWNER_CACHE_CAPACITY, ORDERS_BY_OWNER_CACHE_TTL)
+}
+
 pub(crate) async fn process_get_orders_by_owner(
     ds: &dyn OrdersListDataSource,
     address: Address,
@@ -71,6 +83,7 @@ pub async fn get_orders_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    orders_cache: &State<OrdersByOwnerCache>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,
@@ -78,13 +91,24 @@ pub async fn get_orders_by_address(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
-        let page = params.page;
-        let page_size = params.page_size;
-        let raindex = shared_raindex.read().await;
-        let ds = RaindexOrdersListDataSource {
-            client: raindex.client(),
-        };
-        let response = process_get_orders_by_owner(&ds, addr, page, page_size).await?;
+        let page = params.page.unwrap_or(1);
+        let page_size = params
+            .page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE as u16)
+            .min(MAX_PAGE_SIZE);
+        let cache_key = (addr, page, page_size);
+
+        let response = orders_cache
+            .get_or_try_insert(cache_key, || async {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexOrdersListDataSource {
+                    client: raindex.client(),
+                };
+                process_get_orders_by_owner(&ds, addr, Some(page), Some(page_size)).await
+            })
+            .await
+            .map_err(ApiError::from)?;
+
         Ok(Json(response))
     }
     .instrument(span.0)
