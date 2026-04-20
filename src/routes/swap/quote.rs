@@ -51,6 +51,9 @@ async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
+    ds.validate_supported_tokens(req.input_token, req.output_token)
+        .await?;
+
     let orders = ds
         .get_orders_for_pair(req.input_token, req.output_token)
         .await?;
@@ -140,6 +143,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_success() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
@@ -157,6 +161,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_multi_leg() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("50", "2"), mock_candidate("50", "3")],
             calldata_result: Err(ApiError::Internal("unused".into())),
@@ -172,6 +177,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_partial_fill() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("30", "2")],
             calldata_result: Err(ApiError::Internal("unused".into())),
@@ -186,6 +192,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_picks_best_ratio() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![mock_order()]),
             candidates: vec![
                 mock_candidate("1000", "3"),
@@ -203,6 +210,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_no_liquidity() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
@@ -214,6 +222,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_no_candidates() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![mock_order()]),
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
@@ -225,6 +234,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_invalid_output_amount() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
@@ -236,12 +246,29 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_query_failure() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Err(ApiError::Internal("failed".into())),
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_rejects_unsupported_tokens() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::BadRequest(
+                "unsupported token for this API".into(),
+            )),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
+        );
     }
 
     #[rocket::async_test]
@@ -254,5 +281,20 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_quote_400_for_unsupported_tokens() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let response = client
+            .post("/v1/swap/quote")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new("Authorization", header))
+            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
     }
 }
