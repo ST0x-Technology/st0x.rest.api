@@ -6491,14 +6491,11 @@ dependencies = [
  "alloy",
  "eyre",
  "foundry-evm",
- "once_cell",
  "rain-error-decoding 0.1.0 (git+https://github.com/rainlanguage/rain.error?rev=3d2ed70fb2f7c6156706846e10f163d1e493a8d3)",
  "rain_interpreter_bindings",
- "reqwest 0.11.27",
  "revm 24.0.1",
  "revm 25.0.0",
  "serde",
- "serde_json",
  "thiserror 1.0.69",
  "wasm-bindgen-utils 0.0.10 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
@@ -6612,14 +6609,6 @@ name = "rain_interpreter_dispair"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "alloy-ethers-typecast 0.2.0 (git+https://github.com/rainlanguage/alloy-ethers-typecast?rev=bcc3a04394aefe191fef4ae8e6e94381a419c99a)",
- "rain_interpreter_bindings",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.19",
 ]
 
 [[package]]
@@ -6630,8 +6619,6 @@ dependencies = [
  "alloy-ethers-typecast 0.2.0 (git+https://github.com/rainlanguage/alloy-ethers-typecast?rev=bcc3a04394aefe191fef4ae8e6e94381a419c99a)",
  "rain_interpreter_bindings",
  "rain_interpreter_dispair",
- "serde",
- "serde_json",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -6766,11 +6753,13 @@ dependencies = [
  "alloy-ethers-typecast 0.2.0 (git+https://github.com/rainlanguage/alloy-ethers-typecast?rev=bcc3a04394aefe191fef4ae8e6e94381a419c99a)",
  "anyhow",
  "clap",
+ "futures",
  "getrandom 0.2.16",
  "once_cell",
  "rain-error-decoding 0.1.0 (git+https://github.com/rainlanguage/rain.error?rev=3d2ed70fb2f7c6156706846e10f163d1e493a8d3)",
  "rain-interpreter-eval",
  "rain-math-float",
+ "rain-metadata 0.0.2-alpha.6",
  "rain_orderbook_bindings",
  "rain_orderbook_subgraph_client",
  "reqwest 0.12.20",

@@ -122,7 +122,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_get_tokens_returns_multiple_tokens() {
-        let settings = r#"version: 4
+        let settings = r#"version: 5
 networks:
   base:
     rpcs:
@@ -137,7 +137,7 @@ orderbooks:
     network: base
     subgraph: base
     deployment-block: 0
-deployers:
+rainlangs:
   base:
     address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
     network: base
@@ -180,7 +180,7 @@ tokens:
 
     #[rocket::async_test]
     async fn test_get_tokens_adds_name_and_isin_from_remote_tokens() {
-        let settings = r#"version: 4
+        let settings = r#"version: 5
 networks:
   base:
     rpcs:
@@ -195,7 +195,7 @@ orderbooks:
     network: base
     subgraph: base
     deployment-block: 0
-deployers:
+rainlangs:
   base:
     address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
     network: base
