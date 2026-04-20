@@ -121,7 +121,7 @@ fn build_order_detail(
     })
 }
 
-fn map_trade(trade: &RaindexTrade) -> OrderTradeEntry {
+pub(crate) fn map_trade(trade: &RaindexTrade) -> OrderTradeEntry {
     let timestamp: u64 = trade.timestamp().try_into().unwrap_or(0);
     let tx = trade.transaction();
     OrderTradeEntry {
