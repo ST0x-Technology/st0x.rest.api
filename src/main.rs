@@ -66,6 +66,7 @@ enum StartupError {
         routes::orders::get_orders_by_token,
         routes::admin::put_registry,
         routes::trades::get_trades_by_tx,
+        routes::trades::get_trades_by_token,
         routes::trades::get_trades_by_address,
         routes::trades::get_taker_trades,
         routes::trades::post_trades_batch,
@@ -134,6 +135,7 @@ pub(crate) fn rocket(
     let trades_by_tx_cache = routes::trades::trades_by_tx_cache();
     let trades_by_order_hash_cache = routes::trades::trades_by_order_hash_cache();
     let taker_trades_tx_hash_cache = routes::trades::taker_trades_tx_hash_cache();
+    let trades_by_token_cache = routes::trades::trades_by_token_cache();
     let orders_by_token_cache = routes::orders::orders_by_token_cache();
     let orders_by_owner_cache = routes::orders::orders_by_owner_cache();
 
@@ -145,6 +147,7 @@ pub(crate) fn rocket(
         .manage(trades_by_tx_cache)
         .manage(trades_by_order_hash_cache)
         .manage(taker_trades_tx_hash_cache)
+        .manage(trades_by_token_cache)
         .manage(orders_by_token_cache)
         .manage(orders_by_owner_cache)
         .manage(direct_trades_fetcher)
