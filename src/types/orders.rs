@@ -52,6 +52,10 @@ pub struct OrderSummary {
     pub output_token: TokenRef,
     #[schema(example = "500000")]
     pub output_vault_balance: String,
+    /// Simulated max output from on-chain quote (smaller than vault balance for DCA/strategy orders).
+    /// Falls back to output_vault_balance when no quote is available.
+    #[schema(example = "100")]
+    pub max_output: String,
     #[schema(example = "0.0005")]
     pub io_ratio: String,
     #[schema(example = 1718452800)]

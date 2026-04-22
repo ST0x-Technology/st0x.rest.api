@@ -223,15 +223,27 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
     }
 }
 
+/// Extracted quote fields for building order summaries.
+pub(crate) struct QuoteFields {
+    pub io_ratio: String,
+    /// Simulated max output from on-chain quote. None when quote failed or unavailable.
+    pub max_output: Option<String>,
+}
+
 pub(crate) fn build_order_summary(
     order: &RaindexOrder,
-    io_ratio: &str,
+    quote: &QuoteFields,
 ) -> Result<OrderSummary, ApiError> {
     let (input, output) = super::resolve_io_vaults(order)?;
 
     let input_token_info = input.token();
     let output_token_info = output.token();
     let created_at: u64 = order.timestamp_added().try_into().unwrap_or(0);
+    let vault_balance = output.formatted_balance();
+    let max_output = quote
+        .max_output
+        .clone()
+        .unwrap_or_else(|| vault_balance.clone());
 
     Ok(OrderSummary {
         order_hash: order.order_hash(),
@@ -247,30 +259,38 @@ pub(crate) fn build_order_summary(
             symbol: output_token_info.symbol().unwrap_or_default(),
             decimals: output_token_info.decimals(),
         },
-        output_vault_balance: output.formatted_balance(),
-        io_ratio: io_ratio.to_string(),
+        output_vault_balance: vault_balance,
+        max_output,
+        io_ratio: quote.io_ratio.clone(),
         created_at,
         orderbook_id: order.orderbook(),
     })
 }
 
-pub(crate) fn quote_result_to_io_ratio(
+pub(crate) fn extract_quote_fields(
     order: &RaindexOrder,
     quotes_result: OrderQuoteResult,
-) -> String {
+) -> QuoteFields {
     match quotes_result {
-        Ok(quotes) => quotes
-            .first()
-            .and_then(|quote| quote.data.as_ref())
-            .map(|quote| quote.formatted_ratio.clone())
-            .unwrap_or_else(|| "-".into()),
+        Ok(quotes) => {
+            let data = quotes.first().and_then(|quote| quote.data.as_ref());
+            QuoteFields {
+                io_ratio: data
+                    .map(|d| d.formatted_ratio.clone())
+                    .unwrap_or_else(|| "-".into()),
+                max_output: data.map(|d| d.formatted_max_output.clone()),
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 order_hash = ?order.order_hash(),
                 error = ?err,
                 "quote fetch failed; using fallback io_ratio"
             );
-            "-".into()
+            QuoteFields {
+                io_ratio: "-".into(),
+                max_output: None,
+            }
         }
     }
 }
@@ -309,8 +329,8 @@ pub(crate) fn build_orders_list_response(
 
     let mut summaries = Vec::with_capacity(orders.len());
     for (order, quotes_result) in orders.iter().zip(quote_results) {
-        let io_ratio = quote_result_to_io_ratio(order, quotes_result);
-        summaries.push(build_order_summary(order, &io_ratio)?);
+        let quote = extract_quote_fields(order, quotes_result);
+        summaries.push(build_order_summary(order, &quote)?);
     }
 
     Ok(OrdersListResponse {
