@@ -1,6 +1,6 @@
 use super::{
-    build_order_summary, build_pagination, OrdersListDataSource, RaindexOrdersListDataSource,
-    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    build_order_summary, build_pagination, extract_quote_fields, OrdersListDataSource,
+    QuoteFields, RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::auth::AuthenticatedKey;
 use crate::cache::AppCache;
@@ -78,14 +78,25 @@ pub(crate) async fn process_get_orders_by_owner(
     let quotes_stage_duration_ms = quotes_stage_start.elapsed().as_millis();
 
     // Map quote results back to original order positions
-    let mut io_ratios: Vec<String> = vec!["-".into(); orders.len()];
+    let mut quote_fields: Vec<QuoteFields> = (0..orders.len())
+        .map(|_| QuoteFields {
+            io_ratio: "-".into(),
+            max_output: None,
+        })
+        .collect();
     for (qi, &original_idx) in quotable_indices.iter().enumerate() {
-        io_ratios[original_idx] = super::quote_result_to_io_ratio(&orders[original_idx], quote_results.get(qi).cloned().unwrap_or_else(|| Err(ApiError::Internal("missing quote".into()))));
+        quote_fields[original_idx] = extract_quote_fields(
+            &orders[original_idx],
+            quote_results
+                .get(qi)
+                .cloned()
+                .unwrap_or_else(|| Err(ApiError::Internal("missing quote".into()))),
+        );
     }
 
     let mut summaries = Vec::with_capacity(orders.len());
-    for (order, io_ratio) in orders.iter().zip(io_ratios.iter()) {
-        summaries.push(build_order_summary(order, io_ratio)?);
+    for (order, fields) in orders.iter().zip(quote_fields.iter()) {
+        summaries.push(build_order_summary(order, fields)?);
     }
 
     let pagination = build_pagination(total_count, page_num.into(), effective_page_size.into());

@@ -1,5 +1,5 @@
 use crate::types::common::TokenRef;
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, Bytes, FixedBytes};
 use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -46,10 +46,16 @@ pub struct OrderSummary {
     pub order_hash: FixedBytes<32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub owner: Address,
+    #[schema(value_type = String, example = "0x01")]
+    pub order_bytes: Bytes,
     pub input_token: TokenRef,
     pub output_token: TokenRef,
     #[schema(example = "500000")]
     pub output_vault_balance: String,
+    /// Simulated max output from on-chain quote (smaller than vault balance for DCA/strategy orders).
+    /// Falls back to output_vault_balance when no quote is available.
+    #[schema(example = "100")]
+    pub max_output: String,
     #[schema(example = "0.0005")]
     pub io_ratio: String,
     #[schema(example = 1718452800)]

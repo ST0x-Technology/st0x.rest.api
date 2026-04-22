@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use rain_math_float::Float;
 use rain_orderbook_common::local_db::OrderbookIdentifier;
-use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
+use rain_orderbook_common::raindex_client::orders::{
+    GetOrdersFilters, GetOrdersTokenFilter, RaindexOrder,
+};
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::serde::json::Json;
@@ -57,6 +59,17 @@ pub(crate) fn trades_by_order_hash_cache() -> TradesByOrderHashCache {
 
 pub(crate) fn taker_trades_tx_hash_cache() -> TakerTradesTxHashCache {
     AppCache::new(TRADES_CACHE_CAPACITY, TAKER_TX_HASH_CACHE_TTL)
+}
+
+const TRADES_BY_TOKEN_CACHE_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TokenTradesCacheKey(Address, u32, u32, Option<u64>, Option<u64>);
+
+type TradesByTokenCache = AppCache<TokenTradesCacheKey, TradesByAddressResponse>;
+
+pub(crate) fn trades_by_token_cache() -> TradesByTokenCache {
+    AppCache::new(TRADES_CACHE_CAPACITY, TRADES_BY_TOKEN_CACHE_TTL)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,6 +709,198 @@ async fn get_cached_trades_by_address(
         .map_err(ApiError::from)
 }
 
+async fn process_get_trades_by_token(
+    ds: &dyn TradesDataSource,
+    direct_trades: Option<&crate::direct_trades::DirectTradesFetcher>,
+    token_address: Address,
+    params: TradesPaginationParams,
+) -> Result<TradesByAddressResponse, ApiError> {
+    let start = Instant::now();
+
+    // Find ALL orders (active + inactive) involving this token as input or output
+    let token_filter = GetOrdersTokenFilter {
+        inputs: Some(vec![token_address]),
+        outputs: Some(vec![token_address]),
+    };
+    let all_orders = fetch_all_orders(
+        ds,
+        GetOrdersFilters {
+            tokens: Some(token_filter),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let orders_duration_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        token = %token_address,
+        order_count = all_orders.len(),
+        orders_duration_ms,
+        "fetched orders for trades-by-token"
+    );
+
+    // Reuse the same trade-building logic as trades-by-address
+    let trades = if let Some(fetcher) = direct_trades {
+        // Fast path: batch SQLite query via DirectTradesFetcher
+        let order_hashes: Vec<B256> = all_orders.iter().map(|o| o.order_hash()).collect();
+
+        // Build order_hash → token info lookup
+        let mut token_map: std::collections::HashMap<B256, (TokenRef, TokenRef)> =
+            std::collections::HashMap::new();
+        for order in &all_orders {
+            if let Ok((input_vault, output_vault)) = super::resolve_io_vaults(order) {
+                let input_token_info = input_vault.token();
+                let output_token_info = output_vault.token();
+                token_map.insert(
+                    order.order_hash(),
+                    (
+                        TokenRef {
+                            address: input_token_info.address(),
+                            symbol: input_token_info.symbol().unwrap_or_default(),
+                            decimals: input_token_info.decimals(),
+                        },
+                        TokenRef {
+                            address: output_token_info.address(),
+                            symbol: output_token_info.symbol().unwrap_or_default(),
+                            decimals: output_token_info.decimals(),
+                        },
+                    ),
+                );
+            }
+        }
+
+        let batch_start = Instant::now();
+        match fetcher.batch_fetch(&order_hashes).await {
+            Ok(batch_result) => {
+                let batch_duration_ms = batch_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    token = %token_address,
+                    order_count = order_hashes.len(),
+                    batch_duration_ms,
+                    "direct batch trades completed for trades-by-token"
+                );
+
+                let mut trades = Vec::new();
+                for (order_hash, entries) in &batch_result {
+                    let (input_token, output_token) =
+                        token_map.get(order_hash).cloned().unwrap_or_else(|| {
+                            (
+                                TokenRef {
+                                    address: Address::ZERO,
+                                    symbol: String::new(),
+                                    decimals: 0,
+                                },
+                                TokenRef {
+                                    address: Address::ZERO,
+                                    symbol: String::new(),
+                                    decimals: 0,
+                                },
+                            )
+                        });
+
+                    for entry in entries {
+                        if let Some(start_time) = params.start_time {
+                            if entry.timestamp < start_time {
+                                continue;
+                            }
+                        }
+                        if let Some(end_time) = params.end_time {
+                            if entry.timestamp > end_time {
+                                continue;
+                            }
+                        }
+
+                        trades.push(TradeByAddress {
+                            tx_hash: entry.tx_hash,
+                            input_amount: entry.input_amount.clone(),
+                            output_amount: entry.output_amount.clone(),
+                            input_token: input_token.clone(),
+                            output_token: output_token.clone(),
+                            order_hash: Some(*order_hash),
+                            timestamp: entry.timestamp,
+                            block_number: 0,
+                        });
+                    }
+                }
+                trades
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    token = %token_address,
+                    "direct batch trades failed for trades-by-token; falling back to library"
+                );
+                build_trades_from_library(ds, &all_orders, &params).await?
+            }
+        }
+    } else {
+        build_trades_from_library(ds, &all_orders, &params).await?
+    };
+
+    let mut trades = trades;
+    trades.sort_by_key(|t| (Reverse(t.timestamp), Reverse(t.block_number)));
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20);
+    let total_trades = trades.len() as u64;
+    let total_pages = if page_size == 0 {
+        0
+    } else {
+        total_trades.div_ceil(u64::from(page_size))
+    };
+
+    let offset = (u64::from(page.saturating_sub(1)) * u64::from(page_size)) as usize;
+    let paginated = if offset >= trades.len() {
+        Vec::new()
+    } else {
+        let end = std::cmp::min(offset + page_size as usize, trades.len());
+        trades[offset..end].to_vec()
+    };
+
+    tracing::info!(
+        token = %token_address,
+        page,
+        page_size,
+        total_trades,
+        returned_trades = paginated.len(),
+        total_duration_ms = start.elapsed().as_millis() as u64,
+        "resolved trades by token"
+    );
+
+    Ok(TradesByAddressResponse {
+        trades: paginated,
+        pagination: TradesPagination {
+            page,
+            page_size,
+            total_trades,
+            total_pages,
+            has_more: u64::from(page) < total_pages,
+        },
+    })
+}
+
+async fn get_cached_trades_by_token(
+    cache: &TradesByTokenCache,
+    ds: &dyn TradesDataSource,
+    direct_trades: Option<&crate::direct_trades::DirectTradesFetcher>,
+    token_address: Address,
+    params: TradesPaginationParams,
+) -> Result<TradesByAddressResponse, ApiError> {
+    let cache_key = TokenTradesCacheKey(
+        token_address,
+        params.page.unwrap_or(1),
+        params.page_size.unwrap_or(20),
+        params.start_time,
+        params.end_time,
+    );
+    cache
+        .get_or_try_insert(cache_key, || async move {
+            process_get_trades_by_token(ds, direct_trades, token_address, params).await
+        })
+        .await
+        .map_err(ApiError::from)
+}
+
 async fn process_get_taker_trades(
     ds: &dyn TradesDataSource,
     direct_trades: Option<&crate::direct_trades::DirectTradesFetcher>,
@@ -849,6 +1054,54 @@ pub async fn get_trades_by_tx(
         let response =
             get_cached_trades_by_tx(trades_by_tx_cache, &ds, tx_hash.0, known_order_hashes)
                 .await?;
+        Ok(Json(response))
+    }
+    .instrument(span.0)
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/trades/token/{address}",
+    tag = "Trades",
+    security(("basicAuth" = [])),
+    params(
+        ("address" = String, Path, description = "Token address"),
+        TradesPaginationParams,
+    ),
+    responses(
+        (status = 200, description = "Paginated list of trades for token", body = TradesByAddressResponse),
+        (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    )
+)]
+#[get("/token/<address>?<params..>")]
+pub async fn get_trades_by_token(
+    _global: GlobalRateLimit,
+    _key: AuthenticatedKey,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    trades_by_token_cache: &State<TradesByTokenCache>,
+    direct_trades: &State<Option<crate::direct_trades::DirectTradesFetcher>>,
+    span: TracingSpan,
+    address: ValidatedAddress,
+    params: TradesPaginationParams,
+) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    async move {
+        tracing::info!(address = ?address, params = ?params, "trades by token request received");
+        let raindex = shared_raindex.read().await;
+        let ds = RaindexTradesDataSource {
+            client: raindex.client(),
+        };
+        let response = get_cached_trades_by_token(
+            trades_by_token_cache,
+            &ds,
+            direct_trades.inner().as_ref(),
+            address.0,
+            params,
+        )
+        .await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -1118,6 +1371,7 @@ pub async fn post_trades_batch(
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![
+        get_trades_by_token,
         get_trades_by_tx,
         get_taker_trades,
         get_trades_by_address,
