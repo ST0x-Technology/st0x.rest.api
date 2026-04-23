@@ -52,6 +52,7 @@ enum StartupError {
 #[openapi(
     paths(
         routes::health::get_health,
+        routes::health::get_health_detailed,
         routes::tokens::get_tokens,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
