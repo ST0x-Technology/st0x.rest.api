@@ -12,6 +12,7 @@ mod error;
 mod fairings;
 mod raindex;
 mod routes;
+mod signing;
 mod telemetry;
 mod types;
 
@@ -121,6 +122,7 @@ pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
+    gating: signing::GatingState,
     docs_dir: String,
     direct_trades_fetcher: Option<direct_trades::DirectTradesFetcher>,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
@@ -148,6 +150,7 @@ pub(crate) fn rocket(
         .manage(orders_by_token_cache)
         .manage(orders_by_owner_cache)
         .manage(direct_trades_fetcher)
+        .manage(gating)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -333,10 +336,37 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
+            let gating_key = match std::env::var("ST0X_GATING_SIGNER_KEY") {
+                Ok(k) if !k.is_empty() => k,
+                _ => {
+                    tracing::error!(
+                        "ST0X_GATING_SIGNER_KEY env var is required but missing or empty"
+                    );
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let gating_signer = match signing::GatingSigner::from_hex_key(&gating_key) {
+                Ok(s) => {
+                    tracing::info!(signer = %s.address(), "gating signer loaded");
+                    s
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to parse ST0X_GATING_SIGNER_KEY");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let gating_state = signing::GatingState {
+                signer: gating_signer,
+                ttl_seconds: cfg.gating_signature_ttl_seconds,
+            };
+
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
+                gating_state,
                 cfg.docs_dir,
                 direct_trades_fetcher,
             ) {
