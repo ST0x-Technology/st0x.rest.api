@@ -873,6 +873,7 @@ pub async fn get_trades_by_tx(
     )
 )]
 #[get("/<address>?<params..>", rank = 2)]
+#[allow(clippy::too_many_arguments)] // Rocket route handlers naturally accumulate &State<...> params.
 pub async fn get_trades_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
@@ -921,6 +922,7 @@ pub async fn get_trades_by_address(
     )
 )]
 #[get("/taker/<address>?<params..>")]
+#[allow(clippy::too_many_arguments)] // Rocket route handlers naturally accumulate &State<...> params.
 pub async fn get_taker_trades(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,

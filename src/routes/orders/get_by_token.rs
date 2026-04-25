@@ -98,7 +98,13 @@ pub(crate) async fn process_get_orders_by_token(
     // Map quote results back to original order positions
     let mut io_ratios: Vec<String> = vec!["-".into(); orders.len()];
     for (qi, &original_idx) in quotable_indices.iter().enumerate() {
-        io_ratios[original_idx] = super::quote_result_to_io_ratio(&orders[original_idx], quote_results.get(qi).cloned().unwrap_or_else(|| Err(ApiError::Internal("missing quote".into()))));
+        io_ratios[original_idx] = super::quote_result_to_io_ratio(
+            &orders[original_idx],
+            quote_results
+                .get(qi)
+                .cloned()
+                .unwrap_or_else(|| Err(ApiError::Internal("missing quote".into()))),
+        );
     }
 
     let mut summaries = Vec::with_capacity(orders.len());
