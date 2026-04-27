@@ -99,42 +99,11 @@ in {
       enable = true;
       recommendedTlsSettings = true;
       recommendedProxySettings = true;
-      recommendedOptimisation = true;
-      recommendedGzipSettings = true;
-
-      # Rate-limit zone: 10 req/s per IP, burst 20
-      appendHttpConfig = ''
-        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
-      '';
-
       virtualHosts."api.st0x.io" = {
         enableACME = true;
         forceSSL = true;
-
-        extraConfig = ''
-          # Security headers
-          add_header X-Content-Type-Options "nosniff" always;
-          add_header X-Frame-Options "DENY" always;
-          add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-          # Limit request body size (API payloads are small)
-          client_max_body_size 1m;
-        '';
-
-        # Block common exploit scanners (PHP, Docker, ThinkPHP, etc.)
-        locations."~ \\.(php|asp|aspx|jsp|cgi)$" = {
-          return = "444";
-        };
-        locations."~ ^/(containers|_ignition|vendor|public/index)" = {
-          return = "444";
-        };
-
         locations."/" = {
           proxyPass = "http://127.0.0.1:8000";
-          extraConfig = ''
-            limit_req zone=api burst=20 nodelay;
-            limit_req_status 429;
-          '';
         };
       };
     };
@@ -157,7 +126,7 @@ in {
   };
 
   fileSystems."/mnt/data" = {
-    device = "/dev/disk/by-id/scsi-0DO_Volume_st0x-rest-api-data-v2";
+    device = "/dev/disk/by-id/scsi-0DO_Volume_st0x-rest-api-data";
     fsType = "ext4";
   };
 
@@ -166,7 +135,6 @@ in {
       experimental-features = [ "nix-command" "flakes" ];
       auto-optimise-store = true;
       download-buffer-size = 268435456;
-      sandbox = false;
     };
 
     gc = {

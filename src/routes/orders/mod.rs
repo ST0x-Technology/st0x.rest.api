@@ -207,10 +207,7 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
             .first()
             .map(RaindexOrder::chain_id)
             .unwrap_or_default();
-        // Use small chunk size (4) to avoid exceeding public RPC eth_call gas
-        // limits, which would trigger expensive probe-and-split retries in the
-        // quote library.
-        fetch_order_quotes_batch(orders, None, Some(4))
+        fetch_order_quotes_batch(orders, None, None)
             .await
             .map_err(|error| {
                 tracing::error!(
@@ -321,9 +318,6 @@ pub(crate) fn build_orders_list_response(
 pub use get_by_owner::*;
 pub use get_by_token::*;
 pub use get_by_tx::*;
-
-pub(crate) use get_by_owner::{orders_by_owner_cache, OrdersByOwnerCache};
-pub(crate) use get_by_token::{orders_by_token_cache, OrdersByTokenCache};
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![

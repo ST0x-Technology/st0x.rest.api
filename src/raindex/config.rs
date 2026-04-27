@@ -10,37 +10,6 @@ pub(crate) struct RaindexProvider {
     db_path: Option<PathBuf>,
 }
 
-/// Neutralizes the `metaboards` section in YAML settings so the library's
-/// `fetch_orders_dotrain_sources()` skips network requests to the Goldsky
-/// metaboard subgraph. That function fetches `DotrainSourceV1` metadata per
-/// order (~5s for 20 orders). Our API never uses `DotrainSourceV1`, so
-/// replacing the metaboard keys with non-matching names causes each order's
-/// `fetch_dotrain_source()` to return `Ok(())` immediately.
-fn neutralize_metaboards(yaml: &str) -> String {
-    let mut result = String::with_capacity(yaml.len() + 64);
-    let mut in_metaboards = false;
-
-    for line in yaml.lines() {
-        if !in_metaboards && line.starts_with("metaboards:") {
-            in_metaboards = true;
-            result.push_str("metaboards:\n  _disabled: https://localhost\n");
-            continue;
-        }
-
-        if in_metaboards {
-            if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
-                continue;
-            }
-            in_metaboards = false;
-        }
-
-        result.push_str(line);
-        result.push('\n');
-    }
-
-    result
-}
-
 impl RaindexProvider {
     pub(crate) async fn load(
         registry_url: &str,
@@ -68,10 +37,8 @@ impl RaindexProvider {
                     .await
                     .map_err(|e| RaindexProviderError::RegistryLoad(e.to_string()))?;
 
-                // Build the client with metaboard lookups disabled to avoid ~5s
-                // of network calls in fetch_orders_dotrain_sources().
-                let settings = neutralize_metaboards(&registry.settings());
-                let client = RaindexClient::new(vec![settings], None, db.clone())
+                let client = registry
+                    .get_raindex_client(db.clone())
                     .await
                     .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
 
@@ -171,51 +138,6 @@ mod tests {
     async fn test_load_succeeds_with_valid_registry() {
         let config = crate::test_helpers::mock_raindex_config().await;
         assert!(!config.registry_url().is_empty());
-    }
-
-    #[test]
-    fn test_neutralize_metaboards_replaces_entries() {
-        let yaml = "\
-version: 4
-networks:
-  base:
-    chain-id: 8453
-metaboards:
-  base: https://api.goldsky.com/metaboard
-  ethereum: https://api.goldsky.com/metaboard-eth
-orderbooks:
-  base:
-    address: 0xabc
-";
-        let result = neutralize_metaboards(yaml);
-        assert!(result.contains("metaboards:\n  _disabled: https://localhost\n"));
-        assert!(!result.contains("api.goldsky.com"));
-        assert!(result.contains("orderbooks:"));
-        assert!(result.contains("networks:"));
-    }
-
-    #[test]
-    fn test_neutralize_metaboards_no_section() {
-        let yaml = "\
-version: 4
-networks:
-  base:
-    chain-id: 8453
-";
-        let result = neutralize_metaboards(yaml);
-        assert_eq!(result.trim(), yaml.trim());
-        assert!(!result.contains("metaboards"));
-    }
-
-    #[test]
-    fn test_neutralize_metaboards_at_end_of_file() {
-        let yaml = "\
-version: 4
-metaboards:
-  base: https://api.goldsky.com/metaboard";
-        let result = neutralize_metaboards(yaml);
-        assert!(result.contains("metaboards:\n  _disabled: https://localhost\n"));
-        assert!(!result.contains("api.goldsky.com"));
     }
 
     #[test]

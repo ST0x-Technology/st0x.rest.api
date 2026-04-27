@@ -16,9 +16,7 @@ pub struct OrdersPaginationParams {
     pub page_size: Option<u16>,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, FromFormField, ToSchema,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromFormField, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderSide {
     Input,
