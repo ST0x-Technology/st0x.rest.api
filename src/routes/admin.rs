@@ -68,7 +68,11 @@ pub async fn put_registry(
             }));
         }
 
-        let new_provider = RaindexProvider::load(&req.registry_url, db_path)
+        let rpc_overrides = {
+            let guard = shared_raindex.read().await;
+            guard.rpc_overrides()
+        };
+        let new_provider = RaindexProvider::load(&req.registry_url, db_path, rpc_overrides)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "failed to load new registry");

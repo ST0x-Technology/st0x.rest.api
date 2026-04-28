@@ -49,16 +49,34 @@ impl TestClientBuilder {
                     Some(url) => url,
                     None => mock_raindex_registry_url().await,
                 };
-                crate::raindex::RaindexProvider::load(&registry_url, None)
+                crate::raindex::RaindexProvider::load(&registry_url, None, std::collections::HashMap::new())
                     .await
                     .expect("mock raindex config from registry url")
             }
         };
 
-        let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+        let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
-        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir, None)
-            .expect("valid rocket instance");
+        let orders_by_token_cache = crate::routes::orders::orders_by_token_cache();
+        let block_number_cache = crate::raindex::block_number_cache();
+        let limit_ratio_cache = crate::routes::orders::limit_order_ratio_cache();
+        let stale_price_skip_cache = crate::routes::orders::stale_price_skip_cache();
+        let swap_quote_cache = crate::routes::swap::swap_quote_cache();
+        let cache_warmer_stats = crate::cache_warmer::shared_cache_warmer_stats();
+        let rocket = crate::rocket(
+            pool,
+            self.rate_limiter,
+            shared_raindex,
+            docs_dir,
+            None,
+            orders_by_token_cache,
+            block_number_cache,
+            limit_ratio_cache,
+            stale_price_skip_cache,
+            swap_quote_cache,
+            cache_warmer_stats,
+        )
+        .expect("valid rocket instance");
 
         Client::tracked(rocket).await.expect("valid client")
     }
@@ -66,7 +84,7 @@ impl TestClientBuilder {
 
 pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
     let registry_url = mock_raindex_registry_url().await;
-    crate::raindex::RaindexProvider::load(&registry_url, None)
+    crate::raindex::RaindexProvider::load(&registry_url, None, std::collections::HashMap::new())
         .await
         .expect("mock raindex config")
 }

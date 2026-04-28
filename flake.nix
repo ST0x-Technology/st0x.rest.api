@@ -25,6 +25,14 @@
 
           specialArgs = {
             docsRoot = self.packages.x86_64-linux.st0x-docs;
+            # Public hostname this box answers on. Drives the nginx vhost
+            # name and the ACME cert. Defaults to `api.st0x.io` for prod;
+            # override with `SITE_HOSTNAME` env var for preview / staging
+            # deploys (e.g. `SITE_HOSTNAME=api.preview.st0x.io`). Requires
+            # `--impure` (already passed by the deploy wrappers).
+            siteHostname =
+              let env = builtins.getEnv "SITE_HOSTNAME";
+              in if env == "" then "api.st0x.io" else env;
           };
 
           modules =

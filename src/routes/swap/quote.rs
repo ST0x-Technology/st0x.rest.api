@@ -1,4 +1,4 @@
-use super::{RaindexSwapDataSource, SwapDataSource};
+use super::{RaindexSwapDataSource, SwapDataSource, SwapQuoteCache};
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -30,17 +30,25 @@ pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    swap_cache: &State<SwapQuoteCache>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let raindex = shared_raindex.read().await;
-        let ds = RaindexSwapDataSource {
-            client: raindex.client(),
-        };
-        let response = process_swap_quote(&ds, req).await?;
+        let cache_key = (req.input_token, req.output_token, req.output_amount.clone());
+        let req_for_fetch = req.clone();
+        let response = swap_cache
+            .get_or_try_insert(cache_key, || async move {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexSwapDataSource {
+                    client: raindex.client(),
+                };
+                process_swap_quote(&ds, req_for_fetch).await
+            })
+            .await
+            .map_err(ApiError::from)?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -254,5 +262,70 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_cache_returns_cached_response_without_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cache = crate::routes::swap::swap_quote_cache();
+        let key = (USDC, WETH, "100".to_string());
+        let cached = SwapQuoteResponse {
+            input_token: USDC,
+            output_token: WETH,
+            output_amount: "100".to_string(),
+            estimated_output: "100".to_string(),
+            estimated_input: "150".to_string(),
+            estimated_io_ratio: "1.5".to_string(),
+        };
+        cache.insert(key.clone(), cached.clone()).await;
+
+        // Fetch closure should not run on a cache hit; if it does the test
+        // notices via the counter.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = Arc::clone(&calls);
+        let result: Result<SwapQuoteResponse, std::sync::Arc<ApiError>> = cache
+            .get_or_try_insert(key, || async move {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                Err::<SwapQuoteResponse, _>(ApiError::Internal("should not be called".into()))
+            })
+            .await;
+
+        let response = result.expect("cache hit should bypass fetch");
+        assert_eq!(response.estimated_io_ratio, "1.5");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_cache_runs_fetch_on_miss_and_populates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cache = crate::routes::swap::swap_quote_cache();
+        let key = (USDC, WETH, "200".to_string());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = Arc::clone(&calls);
+
+        let response: Result<SwapQuoteResponse, std::sync::Arc<ApiError>> = cache
+            .get_or_try_insert(key.clone(), || async move {
+                calls_inner.fetch_add(1, Ordering::SeqCst);
+                Ok(SwapQuoteResponse {
+                    input_token: USDC,
+                    output_token: WETH,
+                    output_amount: "200".to_string(),
+                    estimated_output: "200".to_string(),
+                    estimated_input: "300".to_string(),
+                    estimated_io_ratio: "1.5".to_string(),
+                })
+            })
+            .await;
+
+        let r = response.expect("fetch result populated cache");
+        assert_eq!(r.estimated_input, "300");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Subsequent get sees cached value without re-fetching.
+        let cached = cache.get(&key).await.expect("cached value present");
+        assert_eq!(cached.estimated_input, "300");
     }
 }

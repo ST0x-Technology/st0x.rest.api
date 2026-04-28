@@ -1,6 +1,7 @@
 use crate::error::ApiError;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_js_api::registry::DotrainRegistry;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -8,6 +9,86 @@ pub(crate) struct RaindexProvider {
     registry: DotrainRegistry,
     client: RaindexClient,
     db_path: Option<PathBuf>,
+    rpc_overrides: HashMap<String, Vec<String>>,
+}
+
+/// Replaces the `rpcs:` list inside each `networks.<name>` block whose name
+/// has an entry in `overrides`. Lets operators point at private/paid RPC
+/// endpoints without forking the rain.strategies registry.
+///
+/// The YAML mutation is line-based and intentionally narrow: it only touches
+/// the `rpcs:` list immediately under a matched `<name>:` key inside the
+/// `networks:` section. Any other keys (chain-id, currency, etc.) are
+/// preserved untouched.
+fn apply_rpc_override(yaml: &str, overrides: &HashMap<String, Vec<String>>) -> String {
+    if overrides.is_empty() {
+        return yaml.to_string();
+    }
+
+    let mut out = String::with_capacity(yaml.len());
+    let mut in_networks = false;
+    let mut current_network: Option<String> = None;
+    let mut skipping_rpcs = false;
+
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+
+        // Detect leaving the `networks:` block (any new top-level key).
+        if in_networks && indent == 0 && !line.is_empty() {
+            in_networks = false;
+            current_network = None;
+            skipping_rpcs = false;
+        }
+
+        // Enter the `networks:` block.
+        if !in_networks && line.starts_with("networks:") {
+            in_networks = true;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if in_networks {
+            // A network name lives at indent 2 (one level under `networks:`).
+            if indent == 2 && trimmed.ends_with(':') {
+                let name = trimmed.trim_end_matches(':').to_string();
+                current_network = Some(name);
+                skipping_rpcs = false;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+
+            // While skipping the original `rpcs:` list, drop list entries
+            // (lines starting with '-' at indent > 4).
+            if skipping_rpcs {
+                if indent > 4 && trimmed.starts_with('-') {
+                    continue;
+                }
+                skipping_rpcs = false;
+            }
+
+            // Detect `rpcs:` key inside the current network and rewrite it.
+            if let Some(name) = &current_network {
+                if indent == 4 && trimmed.starts_with("rpcs:") {
+                    if let Some(replacement_urls) = overrides.get(name) {
+                        out.push_str("    rpcs:\n");
+                        for url in replacement_urls {
+                            out.push_str(&format!("      - {url}\n"));
+                        }
+                        skipping_rpcs = true;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
 }
 
 /// Neutralizes the `metaboards` section in YAML settings so the library's
@@ -45,9 +126,11 @@ impl RaindexProvider {
     pub(crate) async fn load(
         registry_url: &str,
         db_path: Option<PathBuf>,
+        rpc_overrides: HashMap<String, Vec<String>>,
     ) -> Result<Self, RaindexProviderError> {
         let url = registry_url.to_string();
         let db = db_path.clone();
+        let overrides = rpc_overrides;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -68,9 +151,20 @@ impl RaindexProvider {
                     .await
                     .map_err(|e| RaindexProviderError::RegistryLoad(e.to_string()))?;
 
-                // Build the client with metaboard lookups disabled to avoid ~5s
-                // of network calls in fetch_orders_dotrain_sources().
-                let settings = neutralize_metaboards(&registry.settings());
+                // Build the client with:
+                //  - metaboard lookups disabled to avoid ~5s of subgraph calls
+                //  - per-network RPC URLs overridden if `[rpc_override]` is set
+                let mut settings = neutralize_metaboards(&registry.settings());
+                if !overrides.is_empty() {
+                    settings = apply_rpc_override(&settings, &overrides);
+                    for (name, urls) in &overrides {
+                        tracing::info!(
+                            network = %name,
+                            url_count = urls.len(),
+                            "applied RPC override for network"
+                        );
+                    }
+                }
                 let client = RaindexClient::new(vec![settings], None, db.clone())
                     .await
                     .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
@@ -79,6 +173,7 @@ impl RaindexProvider {
                     registry,
                     client,
                     db_path: db,
+                    rpc_overrides: overrides,
                 })
             });
 
@@ -98,6 +193,10 @@ impl RaindexProvider {
 
     pub(crate) fn db_path(&self) -> Option<PathBuf> {
         self.db_path.clone()
+    }
+
+    pub(crate) fn rpc_overrides(&self) -> HashMap<String, Vec<String>> {
+        self.rpc_overrides.clone()
     }
 }
 
@@ -134,7 +233,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_load_fails_with_unreachable_url() {
-        let result = RaindexProvider::load("http://127.0.0.1:1/registry.txt", None).await;
+        let result = RaindexProvider::load("http://127.0.0.1:1/registry.txt", None, HashMap::new()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -159,7 +258,7 @@ mod tests {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
 
-        let result = RaindexProvider::load(&format!("http://{addr}/registry.txt"), None).await;
+        let result = RaindexProvider::load(&format!("http://{addr}/registry.txt"), None, HashMap::new()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -216,6 +315,106 @@ metaboards:
         let result = neutralize_metaboards(yaml);
         assert!(result.contains("metaboards:\n  _disabled: https://localhost\n"));
         assert!(!result.contains("api.goldsky.com"));
+    }
+
+    #[test]
+    fn test_apply_rpc_override_replaces_single_url() {
+        let yaml = "\
+version: 4
+networks:
+  base:
+    rpcs:
+      - https://base-rpc.publicnode.com
+    chain-id: 8453
+    currency: ETH
+orderbooks:
+  base:
+    address: 0xabc
+";
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "base".to_string(),
+            vec!["https://alchemy.example/v2/key".to_string()],
+        );
+        let result = apply_rpc_override(yaml, &overrides);
+
+        assert!(result.contains("- https://alchemy.example/v2/key"));
+        assert!(!result.contains("publicnode.com"));
+        // Other fields preserved.
+        assert!(result.contains("chain-id: 8453"));
+        assert!(result.contains("currency: ETH"));
+        assert!(result.contains("orderbooks:"));
+    }
+
+    #[test]
+    fn test_apply_rpc_override_replaces_multi_url() {
+        let yaml = "\
+networks:
+  base:
+    rpcs:
+      - https://old-1
+      - https://old-2
+      - https://old-3
+    chain-id: 8453
+";
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "base".to_string(),
+            vec!["https://new-a".to_string(), "https://new-b".to_string()],
+        );
+        let result = apply_rpc_override(yaml, &overrides);
+
+        assert!(result.contains("- https://new-a"));
+        assert!(result.contains("- https://new-b"));
+        assert!(!result.contains("old-1"));
+        assert!(!result.contains("old-2"));
+        assert!(!result.contains("old-3"));
+        assert!(result.contains("chain-id: 8453"));
+    }
+
+    #[test]
+    fn test_apply_rpc_override_only_named_network() {
+        let yaml = "\
+networks:
+  base:
+    rpcs:
+      - https://base-rpc
+    chain-id: 8453
+  ethereum:
+    rpcs:
+      - https://eth-rpc
+    chain-id: 1
+";
+        let mut overrides = HashMap::new();
+        overrides.insert("base".to_string(), vec!["https://new-base".to_string()]);
+        let result = apply_rpc_override(yaml, &overrides);
+
+        assert!(result.contains("- https://new-base"));
+        assert!(!result.contains("base-rpc"));
+        // Ethereum block untouched.
+        assert!(result.contains("- https://eth-rpc"));
+    }
+
+    #[test]
+    fn test_apply_rpc_override_empty_passthrough() {
+        let yaml = "networks:\n  base:\n    rpcs:\n      - https://x\n";
+        let result = apply_rpc_override(yaml, &HashMap::new());
+        assert_eq!(result, yaml);
+    }
+
+    #[test]
+    fn test_apply_rpc_override_unknown_network_passthrough() {
+        let yaml = "\
+networks:
+  base:
+    rpcs:
+      - https://base-rpc
+";
+        let mut overrides = HashMap::new();
+        overrides.insert("polygon".to_string(), vec!["https://poly".to_string()]);
+        let result = apply_rpc_override(yaml, &overrides);
+        assert!(result.contains("- https://base-rpc"));
+        assert!(!result.contains("poly"));
     }
 
     #[test]

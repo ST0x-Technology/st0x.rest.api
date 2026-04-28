@@ -1,12 +1,15 @@
 mod get_by_owner;
 mod get_by_token;
 mod get_by_tx;
+mod limit_cache;
+mod stale_price_skip;
 
 use crate::error::ApiError;
 use crate::types::common::TokenRef;
 use crate::types::orders::{OrderSummary, OrdersListResponse, OrdersPagination};
 use async_trait::async_trait;
 use futures::{future::join_all, stream, StreamExt};
+use rain_orderbook_bindings::IOrderBookV6::SignedContextV1;
 use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch as fetch_order_quotes_batch, RaindexOrderQuote,
 };
@@ -18,6 +21,83 @@ use std::collections::BTreeMap;
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
 pub(crate) const MAX_PAGE_SIZE: u16 = 50;
 const MAX_CHAIN_BATCH_CONCURRENCY: usize = 4;
+
+/// Fetch signed oracle context from an order's oracle URL.
+/// Returns an empty vec if the order has no oracle URL or the fetch fails.
+///
+/// The oracle server expects a POST with an ABI-encoded `bytes` body.
+/// An empty bytes value is: offset (0x20) + length (0x00), each as a 32-byte word.
+async fn fetch_oracle_context(oracle_url: &str) -> Vec<SignedContextV1> {
+    // ABI-encode an empty `bytes` value: offset=0x20, length=0
+    let mut abi_body = vec![0u8; 64];
+    abi_body[31] = 0x20; // offset = 32
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(oracle_url)
+        .header("Content-Type", "application/octet-stream")
+        .body(abi_body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            tracing::warn!(
+                oracle_url,
+                status = %resp.status(),
+                "oracle endpoint returned non-success status"
+            );
+            return vec![];
+        }
+        Err(e) => {
+            tracing::warn!(oracle_url, error = %e, "failed to fetch oracle context");
+            return vec![];
+        }
+    };
+
+    let body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(oracle_url, error = %e, "failed to read oracle response body");
+            return vec![];
+        }
+    };
+
+    // Try parsing as array first, then as single object
+    if let Ok(contexts) = serde_json::from_str::<Vec<SignedContextV1>>(&body) {
+        tracing::debug!(
+            oracle_url,
+            count = contexts.len(),
+            "fetched oracle signed context"
+        );
+        return contexts;
+    }
+    if let Ok(context) = serde_json::from_str::<SignedContextV1>(&body) {
+        tracing::debug!(oracle_url, "fetched single oracle signed context");
+        return vec![context];
+    }
+
+    tracing::warn!(
+        oracle_url,
+        "failed to parse oracle response as SignedContextV1"
+    );
+    vec![]
+}
+
+/// For each order, fetch oracle signed context if the order has an oracle URL.
+/// Returns a vec parallel to the input orders, with empty vecs for non-oracle orders.
+async fn fetch_oracle_contexts_for_orders(orders: &[RaindexOrder]) -> Vec<Vec<SignedContextV1>> {
+    let futures: Vec<_> = orders
+        .iter()
+        .map(|order| async move {
+            match order.oracle_url() {
+                Some(url) => fetch_oracle_context(&url).await,
+                None => vec![],
+            }
+        })
+        .collect();
+    join_all(futures).await
+}
 
 type OrderQuoteResult = Result<Vec<RaindexOrderQuote>, ApiError>;
 type OrderQuoteBatchResult = Result<Vec<Vec<RaindexOrderQuote>>, ApiError>;
@@ -50,10 +130,28 @@ pub(crate) trait OrdersListDataSource: Send + Sync {
     async fn get_order_quotes_batch(&self, orders: &[RaindexOrder]) -> Vec<OrderQuoteResult> {
         fetch_order_quotes_grouped(self, orders).await
     }
+
+    /// Fetch `QuoteFields` (display-level extracted quote data) for each order.
+    ///
+    /// Default implementation runs the multicall batch for every order and
+    /// returns the extracted fields with no caching. The real implementation
+    /// applies caches (e.g. limit-order ratio cache) before falling back to
+    /// the multicall.
+    async fn fetch_quote_fields(&self, orders: &[RaindexOrder]) -> Vec<QuoteFields> {
+        let results = self.get_order_quotes_batch(orders).await;
+        orders
+            .iter()
+            .zip(results)
+            .map(|(order, result)| extract_quote_fields(order, result))
+            .collect()
+    }
 }
 
 pub(crate) struct RaindexOrdersListDataSource<'a> {
     pub client: &'a RaindexClient,
+    pub block_number_cache: &'a crate::raindex::BlockNumberCache,
+    pub limit_ratio_cache: &'a LimitOrderRatioCache,
+    pub stale_price_skip_cache: &'a StalePriceSkipCache,
 }
 
 fn group_orders_by_chain(orders: &[RaindexOrder]) -> GroupedOrders {
@@ -207,23 +305,159 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
             .first()
             .map(RaindexOrder::chain_id)
             .unwrap_or_default();
-        // Use small chunk size (4) to avoid exceeding public RPC eth_call gas
-        // limits, which would trigger expensive probe-and-split retries in the
-        // quote library.
-        fetch_order_quotes_batch(orders, None, Some(4))
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    chain_id,
-                    error = %error,
-                    "failed to batch query order quotes"
-                );
-                ApiError::Internal("failed to query order quotes".into())
-            })
+
+        // Fetch oracle signed context for orders that have an oracle URL.
+        // This enables accurate quoting for oracle-dependent orders (e.g. SPYM).
+        let signed_contexts = fetch_oracle_contexts_for_orders(orders).await;
+        let has_any_context = signed_contexts.iter().any(|ctx| !ctx.is_empty());
+
+        // Resolve the block number once via our short-TTL cache so multiple
+        // concurrent batches hit the RPC at most once per cache window. If the
+        // cache fetch fails we fall through to `None` and let the upstream
+        // library do its own (uncached) lookup.
+        let block_number = if let Some(first_order) = orders.first() {
+            let rpc_urls: Vec<String> = first_order
+                .get_rpc_urls()
+                .map(|urls| urls.into_iter().map(|u| u.to_string()).collect())
+                .unwrap_or_default();
+            crate::raindex::get_or_fetch_block_number(self.block_number_cache, chain_id, &rpc_urls)
+                .await
+        } else {
+            None
+        };
+
+        // Chunk size 16 matches the upstream library default. A multicall is
+        // a single eth_call regardless of chunk size, so larger chunks reduce
+        // RPC volume without adding latency. The library has a probe-and-split
+        // safety net if a chunk exceeds the RPC's gas budget.
+        fetch_order_quotes_batch(
+            orders,
+            block_number,
+            Some(16),
+            if has_any_context {
+                Some(&signed_contexts)
+            } else {
+                None
+            },
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                chain_id,
+                error = %error,
+                "failed to batch query order quotes"
+            );
+            ApiError::Internal("failed to query order quotes".into())
+        })
+    }
+
+    async fn fetch_quote_fields(&self, orders: &[RaindexOrder]) -> Vec<QuoteFields> {
+        fetch_quote_fields_with_caches(
+            self,
+            self.limit_ratio_cache,
+            self.stale_price_skip_cache,
+            crate::market_calendar::is_nyse_open(chrono::Utc::now()),
+            orders,
+        )
+        .await
     }
 }
 
+/// Apply per-order quote caches around a batched quote call:
+/// - **Limit-order ratio cache**: orders identified as limit orders that
+///   already have a cached io_ratio bypass the multicall entirely.
+///   `max_output` is left `None`, which causes the downstream summary
+///   builder to fall back to `vault_balance` (the right behavior for
+///   limit orders, where max_output is bounded by the output vault).
+/// - **Stale-price skip cache**: orders previously known to revert with
+///   `StalePrice` are skipped while NYSE is closed (their oracle won't
+///   refresh until the cash session reopens). When NYSE is open, every
+///   order is quoted normally — fresh `StalePrice` failures re-mark the
+///   order so it stays skipped during the next off-hours window.
+/// - All other orders go through the standard batched quote path.
+/// - After the batch, successful quotes for limit orders populate the
+///   limit cache, and any quote whose error includes `StalePrice` is
+///   added to the skip cache.
+pub(crate) async fn fetch_quote_fields_with_caches<T>(
+    ds: &T,
+    limit_cache: &LimitOrderRatioCache,
+    stale_skip_cache: &StalePriceSkipCache,
+    nyse_open: bool,
+    orders: &[RaindexOrder],
+) -> Vec<QuoteFields>
+where
+    T: OrdersListDataSource + ?Sized,
+{
+    let mut fields: Vec<Option<QuoteFields>> = vec![None; orders.len()];
+    let mut to_quote_indices: Vec<usize> = Vec::new();
+    let mut to_quote_orders: Vec<RaindexOrder> = Vec::new();
+
+    for (i, order) in orders.iter().enumerate() {
+        if is_limit_order(order) {
+            if let Some(cached_ratio) = limit_cache.get(&order.order_hash()).await {
+                fields[i] = Some(QuoteFields {
+                    io_ratio: cached_ratio,
+                    max_output: None,
+                });
+                continue;
+            }
+        }
+        if !nyse_open && stale_skip_cache.get(&order.order_hash()).await.is_some() {
+            tracing::debug!(
+                order_hash = ?order.order_hash(),
+                "skipping quote for stale-marked order (NYSE closed)"
+            );
+            fields[i] = Some(QuoteFields {
+                io_ratio: "-".into(),
+                max_output: None,
+            });
+            continue;
+        }
+        to_quote_indices.push(i);
+        to_quote_orders.push(order.clone());
+    }
+
+    if !to_quote_orders.is_empty() {
+        let quote_results = ds.get_order_quotes_batch(&to_quote_orders).await;
+        for (qi, &original_idx) in to_quote_indices.iter().enumerate() {
+            let order = &orders[original_idx];
+            let result = quote_results
+                .get(qi)
+                .cloned()
+                .unwrap_or_else(|| Err(ApiError::Internal("missing quote result".into())));
+
+            if let Ok(quotes) = &result {
+                if quotes
+                    .iter()
+                    .any(|q| q.error.as_deref().is_some_and(quote_indicates_stale_price))
+                {
+                    stale_skip_cache.insert(order.order_hash(), ()).await;
+                }
+            }
+
+            let extracted = extract_quote_fields(order, result);
+            if is_limit_order(order) && extracted.io_ratio != "-" {
+                limit_cache
+                    .insert(order.order_hash(), extracted.io_ratio.clone())
+                    .await;
+            }
+            fields[original_idx] = Some(extracted);
+        }
+    }
+
+    fields
+        .into_iter()
+        .map(|opt| {
+            opt.unwrap_or_else(|| QuoteFields {
+                io_ratio: "-".into(),
+                max_output: None,
+            })
+        })
+        .collect()
+}
+
 /// Extracted quote fields for building order summaries.
+#[derive(Clone)]
 pub(crate) struct QuoteFields {
     pub io_ratio: String,
     /// Simulated max output from on-chain quote. None when quote failed or unavailable.
@@ -273,7 +507,18 @@ pub(crate) fn extract_quote_fields(
 ) -> QuoteFields {
     match quotes_result {
         Ok(quotes) => {
-            let data = quotes.first().and_then(|quote| quote.data.as_ref());
+            let first = quotes.first();
+            let data = first.and_then(|quote| quote.data.as_ref());
+            if data.is_none() {
+                if let Some(quote) = first {
+                    tracing::warn!(
+                        order_hash = ?order.order_hash(),
+                        success = quote.success,
+                        error = ?quote.error,
+                        "quote returned no data; using fallback io_ratio"
+                    );
+                }
+            }
             QuoteFields {
                 io_ratio: data
                     .map(|d| d.formatted_ratio.clone())
@@ -343,8 +588,14 @@ pub use get_by_owner::*;
 pub use get_by_token::*;
 pub use get_by_tx::*;
 
-pub(crate) use get_by_owner::{orders_by_owner_cache, OrdersByOwnerCache};
-pub(crate) use get_by_token::{orders_by_token_cache, OrdersByTokenCache};
+pub(crate) use get_by_owner::orders_by_owner_cache;
+pub(crate) use get_by_token::{
+    orders_by_token_cache, process_get_orders_by_token, OrdersByTokenCache,
+};
+pub(crate) use limit_cache::{is_limit_order, limit_order_ratio_cache, LimitOrderRatioCache};
+pub(crate) use stale_price_skip::{
+    quote_indicates_stale_price, stale_price_skip_cache, StalePriceSkipCache,
+};
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![
@@ -602,5 +853,316 @@ mod tests {
         let result = build_orders_list_response(&orders, 1, 1, 20, vec![]);
 
         assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    fn limit_order_for_chain(chain_id: u32, order_hash: &str, deployment: &str) -> RaindexOrder {
+        let mut value = order_json();
+        value["chainId"] = json!(chain_id);
+        value["orderHash"] = json!(order_hash);
+        value["parsedMeta"] = json!([{
+            "DotrainGuiStateV1": {
+                "dotrain_hash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "field_values": {},
+                "deposits": {},
+                "select_tokens": {},
+                "vault_ids": {},
+                "selected_deployment": deployment,
+            }
+        }]);
+        serde_json::from_value(value).expect("deserialize limit-order mock")
+    }
+
+    #[rocket::async_test]
+    async fn test_limit_cache_hit_skips_multicall() {
+        let cache = limit_order_ratio_cache();
+        let order = limit_order_for_chain(
+            8453,
+            "0x00000000000000000000000000000000000000000000000000000000000000aa",
+            "fixed-limit-buy",
+        );
+        cache.insert(order.order_hash(), "0.42".to_string()).await;
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::new(),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let stale_skip_cache = stale_price_skip_cache();
+        let fields = fetch_quote_fields_with_caches(
+            &ds,
+            &cache,
+            &stale_skip_cache,
+            true,
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].io_ratio, "0.42");
+        assert!(fields[0].max_output.is_none());
+        // No multicall and no per-order call should have happened.
+        assert!(batch_calls.lock().expect("lock").is_empty());
+        assert!(single_calls.lock().expect("lock").is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn test_limit_cache_miss_populates_cache() {
+        let cache = limit_order_ratio_cache();
+        let order = limit_order_for_chain(
+            8453,
+            "0x00000000000000000000000000000000000000000000000000000000000000bb",
+            "fixed-limit-sell",
+        );
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::from([(8453, Ok(vec![vec![mock_quote("1.234")]]))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let stale_skip_cache = stale_price_skip_cache();
+        let fields = fetch_quote_fields_with_caches(
+            &ds,
+            &cache,
+            &stale_skip_cache,
+            true,
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        assert_eq!(fields[0].io_ratio, "1.234");
+        // Batch happened exactly once for the uncached limit order.
+        assert_eq!(batch_calls.lock().expect("lock").len(), 1);
+        // Cache now contains the freshly-fetched ratio.
+        assert_eq!(
+            cache.get(&order.order_hash()).await.as_deref(),
+            Some("1.234")
+        );
+    }
+
+    #[rocket::async_test]
+    async fn test_limit_cache_does_not_cache_non_limit_orders() {
+        let cache = limit_order_ratio_cache();
+        let order = mock_order_for_chain(
+            8453,
+            "0x00000000000000000000000000000000000000000000000000000000000000cc",
+        );
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::from([(8453, Ok(vec![vec![mock_quote("9.99")]]))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let stale_skip_cache = stale_price_skip_cache();
+        let _ = fetch_quote_fields_with_caches(
+            &ds,
+            &cache,
+            &stale_skip_cache,
+            true,
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        // Non-limit order: cache should not be populated.
+        assert!(cache.get(&order.order_hash()).await.is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_limit_cache_does_not_cache_failed_quote() {
+        let cache = limit_order_ratio_cache();
+        let order = limit_order_for_chain(
+            8453,
+            "0x00000000000000000000000000000000000000000000000000000000000000dd",
+            "fixed-limit",
+        );
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::from([(
+                order_hash_key(&order),
+                Err(ApiError::Internal("nope".into())),
+            )]),
+            batched_quotes: HashMap::from([(8453, Err(ApiError::Internal("batch failed".into())))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let stale_skip_cache = stale_price_skip_cache();
+        let fields = fetch_quote_fields_with_caches(
+            &ds,
+            &cache,
+            &stale_skip_cache,
+            true,
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        // io_ratio is the placeholder, no cache write.
+        assert_eq!(fields[0].io_ratio, "-");
+        assert!(cache.get(&order.order_hash()).await.is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_limit_cache_mixed_orders_only_quotes_uncached() {
+        let cache = limit_order_ratio_cache();
+        let cached_limit = limit_order_for_chain(
+            8453,
+            "0x0000000000000000000000000000000000000000000000000000000000000111",
+            "fixed-limit-buy",
+        );
+        cache
+            .insert(cached_limit.order_hash(), "0.5".to_string())
+            .await;
+        let regular = mock_order_for_chain(
+            8453,
+            "0x0000000000000000000000000000000000000000000000000000000000000222",
+        );
+
+        let orders = vec![cached_limit.clone(), regular.clone()];
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        // The batch only sees the regular order; one mock quote.
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::from([(8453, Ok(vec![vec![mock_quote("7.0")]]))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let stale_skip_cache = stale_price_skip_cache();
+        let fields =
+            fetch_quote_fields_with_caches(&ds, &cache, &stale_skip_cache, true, &orders).await;
+
+        // Position 0: cached limit value.
+        assert_eq!(fields[0].io_ratio, "0.5");
+        assert!(fields[0].max_output.is_none());
+        // Position 1: from the batch.
+        assert_eq!(fields[1].io_ratio, "7.0");
+        // Batch was called with exactly the regular order.
+        let batch_calls = batch_calls.lock().expect("lock");
+        assert_eq!(batch_calls.as_slice(), &[(8453, 1)]);
+    }
+
+    fn stale_price_quote() -> rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote
+    {
+        serde_json::from_value(json!({
+            "pair": { "pairName": "USDC/WETH", "inputIndex": 0, "outputIndex": 0 },
+            "blockNumber": 1,
+            "data": null,
+            "success": false,
+            "error": "Execution reverted with error: StalePrice\n"
+        }))
+        .expect("deserialize stale-price quote")
+    }
+
+    #[rocket::async_test]
+    async fn test_stale_price_marker_set_after_quote_failure() {
+        let limit_cache = limit_order_ratio_cache();
+        let stale_skip_cache = stale_price_skip_cache();
+        let order = mock_order_for_chain(
+            8453,
+            "0x0000000000000000000000000000000000000000000000000000000000000abc",
+        );
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::from([(8453, Ok(vec![vec![stale_price_quote()]]))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let _ = fetch_quote_fields_with_caches(
+            &ds,
+            &limit_cache,
+            &stale_skip_cache,
+            true, // NYSE open: still quote, but mark on failure
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        assert!(stale_skip_cache.get(&order.order_hash()).await.is_some());
+    }
+
+    #[rocket::async_test]
+    async fn test_stale_marked_order_skipped_when_nyse_closed() {
+        let limit_cache = limit_order_ratio_cache();
+        let stale_skip_cache = stale_price_skip_cache();
+        let order = mock_order_for_chain(
+            8453,
+            "0x0000000000000000000000000000000000000000000000000000000000000def",
+        );
+        // Pre-mark the order as stale.
+        stale_skip_cache.insert(order.order_hash(), ()).await;
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::new(), // Empty: any batch attempt would panic.
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let fields = fetch_quote_fields_with_caches(
+            &ds,
+            &limit_cache,
+            &stale_skip_cache,
+            false, // NYSE closed
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        // Skipped: placeholder fields, no batch call.
+        assert_eq!(fields[0].io_ratio, "-");
+        assert!(fields[0].max_output.is_none());
+        assert!(batch_calls.lock().expect("lock").is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn test_stale_marked_order_quoted_when_nyse_open() {
+        let limit_cache = limit_order_ratio_cache();
+        let stale_skip_cache = stale_price_skip_cache();
+        let order = mock_order_for_chain(
+            8453,
+            "0x000000000000000000000000000000000000000000000000000000000000beef",
+        );
+        // Pre-mark the order: NYSE-open should still quote it.
+        stale_skip_cache.insert(order.order_hash(), ()).await;
+
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::from([(8453, Ok(vec![vec![mock_quote("3.14")]]))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let fields = fetch_quote_fields_with_caches(
+            &ds,
+            &limit_cache,
+            &stale_skip_cache,
+            true, // NYSE open
+            std::slice::from_ref(&order),
+        )
+        .await;
+
+        assert_eq!(fields[0].io_ratio, "3.14");
+        assert_eq!(batch_calls.lock().expect("lock").len(), 1);
     }
 }

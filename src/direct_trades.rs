@@ -1,26 +1,57 @@
 /// Direct SQLite trade fetcher
 ///
 /// Bypasses the rain.orderbook library's per-query connection model by
-/// maintaining a single shared connection. Runs a batch SQL query for
-/// multiple order hashes in one call instead of N individual queries
-/// that each open their own connection.
+/// running batch SQL queries for multiple order hashes in one call instead
+/// of N individual queries that each open their own connection.
+///
+/// Opens a fresh read-only connection per query so that concurrent API
+/// requests can read in parallel under SQLite WAL mode without blocking
+/// each other or the background sync writer.
 use crate::error::ApiError;
 use crate::types::order::OrderTradeEntry;
 use alloy::primitives::{Address, B256};
 use rain_math_float::Float;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::task::spawn_blocking;
 
-/// Holds a shared SQLite connection to the raindex local database.
+/// Holds configuration for opening read-only SQLite connections to the
+/// raindex local database. Each query opens its own connection so that
+/// concurrent readers never block each other (SQLite WAL allows this).
 pub(crate) struct DirectTradesFetcher {
-    conn: Arc<Mutex<Connection>>,
+    db_path: PathBuf,
     chain_id: i64,
     orderbook_address: String,
+}
+
+/// Open a read-only connection with WAL mode and appropriate timeouts.
+fn open_read_connection(db_path: &Path) -> Result<Connection, ApiError> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| {
+        tracing::error!(error = %e, "failed to open raindex db for reading");
+        ApiError::Internal("trade query failed".into())
+    })?;
+
+    conn.pragma_update(None, "journal_mode", "wal")
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to set WAL");
+            ApiError::Internal("trade query failed".into())
+        })?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to set busy_timeout");
+            ApiError::Internal("trade query failed".into())
+        })?;
+
+    Ok(conn)
 }
 
 impl DirectTradesFetcher {
@@ -29,6 +60,7 @@ impl DirectTradesFetcher {
         chain_id: u32,
         orderbook_address: Address,
     ) -> Result<Self, String> {
+        // Open a temporary connection to create indexes, then drop it.
         let conn =
             Connection::open(db_path).map_err(|e| format!("failed to open raindex db: {e}"))?;
 
@@ -47,6 +79,8 @@ impl DirectTradesFetcher {
              ON vault_balance_changes (chain_id, orderbook_address, owner, token, vault_id, block_number, log_index)",
             "CREATE INDEX IF NOT EXISTS idx_take_orders_sender \
              ON take_orders (chain_id, orderbook_address, sender)",
+            "CREATE INDEX IF NOT EXISTS idx_take_orders_sender_covering \
+             ON take_orders (chain_id, orderbook_address, sender, transaction_hash, block_timestamp)",
         ];
         for sql in &indexes {
             if let Err(e) = conn.execute_batch(sql) {
@@ -54,8 +88,10 @@ impl DirectTradesFetcher {
             }
         }
 
+        drop(conn);
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            db_path: db_path.to_path_buf(),
             chain_id: chain_id as i64,
             orderbook_address: format!("{:#x}", orderbook_address),
         })
@@ -70,17 +106,14 @@ impl DirectTradesFetcher {
             return Ok(HashMap::new());
         }
 
-        let conn = Arc::clone(&self.conn);
+        let db_path = self.db_path.clone();
         let chain_id = self.chain_id;
         let ob_addr = self.orderbook_address.clone();
         let hash_strings: Vec<String> = hashes.iter().map(|h| format!("{:#x}", h)).collect();
 
         spawn_blocking(move || {
             let start = Instant::now();
-            let conn = conn.lock().map_err(|e| {
-                tracing::error!(error = %e, "failed to lock direct trades connection");
-                ApiError::Internal("trade query failed".into())
-            })?;
+            let conn = open_read_connection(&db_path)?;
 
             let placeholders: Vec<String> = (0..hash_strings.len())
                 .map(|i| format!("?{}", i + 3))
@@ -168,17 +201,14 @@ impl DirectTradesFetcher {
         &self,
         sender: &Address,
     ) -> Result<Vec<(B256, u64)>, ApiError> {
-        let conn = Arc::clone(&self.conn);
+        let db_path = self.db_path.clone();
         let chain_id = self.chain_id;
         let ob_addr = self.orderbook_address.clone();
         let sender_hex = format!("{:#x}", sender);
 
         spawn_blocking(move || {
             let start = Instant::now();
-            let conn = conn.lock().map_err(|e| {
-                tracing::error!(error = %e, "failed to lock direct trades connection");
-                ApiError::Internal("taker trades query failed".into())
-            })?;
+            let conn = open_read_connection(&db_path)?;
 
             let mut stmt = conn
                 .prepare(
@@ -239,17 +269,14 @@ impl DirectTradesFetcher {
         &self,
         tx_hash: &B256,
     ) -> Result<HashMap<B256, Vec<OrderTradeEntry>>, ApiError> {
-        let conn = Arc::clone(&self.conn);
+        let db_path = self.db_path.clone();
         let chain_id = self.chain_id;
         let ob_addr = self.orderbook_address.clone();
         let tx_hex = format!("{:#x}", tx_hash);
 
         spawn_blocking(move || {
             let start = Instant::now();
-            let conn = conn.lock().map_err(|e| {
-                tracing::error!(error = %e, "failed to lock direct trades connection");
-                ApiError::Internal("trade query failed".into())
-            })?;
+            let conn = open_read_connection(&db_path)?;
 
             let query = build_tx_hash_query();
             let mut stmt = conn.prepare(&query).map_err(|e| {
@@ -314,6 +341,116 @@ impl DirectTradesFetcher {
             ApiError::Internal("trade query failed".into())
         })?
     }
+
+    /// Fetch enriched trades for multiple transaction hashes in a single batch query.
+    /// Returns trades grouped by tx_hash with all fields needed for TradesByTxResponse
+    /// (order_owner, token addresses, block_number, etc.).
+    /// This avoids the slow library path entirely.
+    pub(crate) async fn fetch_taker_tx_trades(
+        &self,
+        tx_hashes: &[B256],
+    ) -> Result<HashMap<B256, Vec<EnrichedTradeRow>>, ApiError> {
+        if tx_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let db_path = self.db_path.clone();
+        let chain_id = self.chain_id;
+        let ob_addr = self.orderbook_address.clone();
+        let tx_hex_strings: Vec<String> = tx_hashes.iter().map(|h| format!("{:#x}", h)).collect();
+
+        spawn_blocking(move || {
+            let start = Instant::now();
+            let conn = open_read_connection(&db_path)?;
+
+            let placeholders: Vec<String> = (0..tx_hex_strings.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect();
+            let in_clause = placeholders.join(", ");
+            let query = build_taker_tx_batch_query(&in_clause);
+
+            let mut stmt = conn.prepare(&query).map_err(|e| {
+                tracing::error!(error = %e, "failed to prepare taker tx batch query");
+                ApiError::Internal("trade query failed".into())
+            })?;
+
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                Vec::with_capacity(tx_hex_strings.len() + 2);
+            params.push(Box::new(chain_id));
+            params.push(Box::new(ob_addr));
+            for h in &tx_hex_strings {
+                params.push(Box::new(h.clone()));
+            }
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt
+                .query_map(param_refs.as_slice(), |row| {
+                    Ok(RawEnrichedTradeRow {
+                        order_hash: row.get(0)?,
+                        transaction_hash: row.get(1)?,
+                        block_number: row.get(2)?,
+                        block_timestamp: row.get(3)?,
+                        sender: row.get(4)?,
+                        order_owner: row.get(5)?,
+                        input_delta: row.get(6)?,
+                        output_delta_raw: row.get(7)?,
+                        input_token: row.get(8)?,
+                        output_token: row.get(9)?,
+                        input_token_symbol: row.get(10)?,
+                        output_token_symbol: row.get(11)?,
+                        input_token_decimals: row.get(12)?,
+                        output_token_decimals: row.get(13)?,
+                    })
+                })
+                .map_err(|e| {
+                    tracing::error!(error = %e, "taker tx batch query failed");
+                    ApiError::Internal("trade query failed".into())
+                })?;
+
+            let mut result: HashMap<B256, Vec<EnrichedTradeRow>> = HashMap::new();
+            let mut row_count = 0u32;
+
+            for row_result in rows {
+                let raw = row_result.map_err(|e| {
+                    tracing::error!(error = %e, "failed to read enriched trade row");
+                    ApiError::Internal("trade query failed".into())
+                })?;
+
+                row_count += 1;
+
+                match convert_enriched_trade(&raw) {
+                    Ok(enriched) => {
+                        result
+                            .entry(enriched.transaction_hash)
+                            .or_default()
+                            .push(enriched);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            order_hash = %raw.order_hash,
+                            "skipping malformed enriched trade row"
+                        );
+                    }
+                }
+            }
+
+            tracing::info!(
+                tx_count = tx_hex_strings.len(),
+                trade_rows = row_count,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "direct taker tx batch query completed"
+            );
+
+            Ok(result)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "taker tx batch blocking task failed");
+            ApiError::Internal("trade query failed".into())
+        })?
+    }
 }
 
 struct RawTradeRow {
@@ -324,6 +461,25 @@ struct RawTradeRow {
     input_delta: String,
     output_delta_raw: String,
     trade_id: String,
+}
+
+/// Enriched trade row with token and owner info for building TradesByTxResponse directly.
+#[allow(dead_code)]
+pub(crate) struct EnrichedTradeRow {
+    pub order_hash: B256,
+    pub transaction_hash: B256,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub sender: Address,
+    pub order_owner: Address,
+    pub input_amount: String,
+    pub output_amount: String,
+    pub input_token: Address,
+    pub output_token: Address,
+    pub input_token_symbol: String,
+    pub output_token_symbol: String,
+    pub input_token_decimals: u8,
+    pub output_token_decimals: u8,
 }
 
 fn convert_raw_trade(raw: &RawTradeRow) -> Result<(B256, OrderTradeEntry), ApiError> {
@@ -381,6 +537,141 @@ fn negate_and_format_float_hex(hex: &str) -> Result<String, ApiError> {
         tracing::error!(error = %e, "failed to format negated float");
         ApiError::Internal("float formatting failed".into())
     })
+}
+
+struct RawEnrichedTradeRow {
+    order_hash: String,
+    transaction_hash: String,
+    block_number: i64,
+    block_timestamp: i64,
+    sender: String,
+    order_owner: String,
+    input_delta: String,
+    output_delta_raw: String,
+    input_token: Option<String>,
+    output_token: Option<String>,
+    input_token_symbol: Option<String>,
+    output_token_symbol: Option<String>,
+    input_token_decimals: Option<i32>,
+    output_token_decimals: Option<i32>,
+}
+
+fn convert_enriched_trade(raw: &RawEnrichedTradeRow) -> Result<EnrichedTradeRow, ApiError> {
+    let order_hash = B256::from_str(&raw.order_hash)
+        .map_err(|e| ApiError::Internal(format!("invalid order hash: {e}")))?;
+    let tx_hash = B256::from_str(&raw.transaction_hash)
+        .map_err(|e| ApiError::Internal(format!("invalid tx hash: {e}")))?;
+    let sender = Address::from_str(&raw.sender)
+        .map_err(|e| ApiError::Internal(format!("invalid sender address: {e}")))?;
+    let order_owner = Address::from_str(&raw.order_owner)
+        .map_err(|e| ApiError::Internal(format!("invalid order owner: {e}")))?;
+    let input_token = raw
+        .input_token
+        .as_deref()
+        .map(Address::from_str)
+        .transpose()
+        .map_err(|e| ApiError::Internal(format!("invalid input token: {e}")))?
+        .unwrap_or(Address::ZERO);
+    let output_token = raw
+        .output_token
+        .as_deref()
+        .map(Address::from_str)
+        .transpose()
+        .map_err(|e| ApiError::Internal(format!("invalid output token: {e}")))?
+        .unwrap_or(Address::ZERO);
+
+    let input_amount = format_float_hex(&raw.input_delta)?;
+    let output_amount = negate_and_format_float_hex(&raw.output_delta_raw)?;
+
+    Ok(EnrichedTradeRow {
+        order_hash,
+        transaction_hash: tx_hash,
+        block_number: raw.block_number as u64,
+        block_timestamp: raw.block_timestamp as u64,
+        sender,
+        order_owner,
+        input_amount,
+        output_amount,
+        input_token,
+        output_token,
+        input_token_symbol: raw.input_token_symbol.clone().unwrap_or_default(),
+        output_token_symbol: raw.output_token_symbol.clone().unwrap_or_default(),
+        input_token_decimals: raw.input_token_decimals.unwrap_or(0) as u8,
+        output_token_decimals: raw.output_token_decimals.unwrap_or(0) as u8,
+    })
+}
+
+/// Build a batch query for trades across multiple transaction hashes.
+/// Joins order_ios + erc20_tokens to get token addresses and metadata.
+/// ?1 = chain_id, ?2 = orderbook_address, ?3..N = transaction hashes
+fn build_taker_tx_batch_query(in_clause: &str) -> String {
+    format!(
+        r#"
+SELECT
+  oe.order_hash,
+  t.transaction_hash,
+  t.block_number,
+  t.block_timestamp,
+  t.sender,
+  oe.order_owner,
+  t.taker_output AS input_delta,
+  t.taker_input AS output_delta_raw,
+  io_in.token AS input_token,
+  io_out.token AS output_token,
+  tok_in.symbol AS input_token_symbol,
+  tok_out.symbol AS output_token_symbol,
+  tok_in.decimals AS input_token_decimals,
+  tok_out.decimals AS output_token_decimals
+FROM take_orders t
+JOIN order_events oe
+  ON oe.chain_id = t.chain_id
+ AND oe.orderbook_address = t.orderbook_address
+ AND oe.order_owner = t.order_owner
+ AND oe.order_nonce = t.order_nonce
+ AND oe.event_type = 'AddOrderV3'
+ AND (oe.block_number < t.block_number
+   OR (oe.block_number = t.block_number AND oe.log_index <= t.log_index))
+ AND NOT EXISTS (
+   SELECT 1 FROM order_events newer
+   WHERE newer.chain_id = oe.chain_id
+    AND newer.orderbook_address = oe.orderbook_address
+    AND newer.order_owner = oe.order_owner
+    AND newer.order_nonce = oe.order_nonce
+    AND newer.event_type = 'AddOrderV3'
+    AND (newer.block_number < t.block_number
+      OR (newer.block_number = t.block_number AND newer.log_index <= t.log_index))
+    AND (newer.block_number > oe.block_number
+      OR (newer.block_number = oe.block_number AND newer.log_index > oe.log_index))
+ )
+LEFT JOIN order_ios io_in
+  ON io_in.chain_id = oe.chain_id
+ AND io_in.orderbook_address = oe.orderbook_address
+ AND io_in.transaction_hash = oe.transaction_hash
+ AND io_in.log_index = oe.log_index
+ AND io_in.io_index = t.input_io_index
+ AND io_in.io_type = 'input'
+LEFT JOIN order_ios io_out
+  ON io_out.chain_id = oe.chain_id
+ AND io_out.orderbook_address = oe.orderbook_address
+ AND io_out.transaction_hash = oe.transaction_hash
+ AND io_out.log_index = oe.log_index
+ AND io_out.io_index = t.output_io_index
+ AND io_out.io_type = 'output'
+LEFT JOIN erc20_tokens tok_in
+  ON tok_in.chain_id = oe.chain_id
+ AND tok_in.orderbook_address = oe.orderbook_address
+ AND tok_in.token_address = io_in.token
+LEFT JOIN erc20_tokens tok_out
+  ON tok_out.chain_id = oe.chain_id
+ AND tok_out.orderbook_address = oe.orderbook_address
+ AND tok_out.token_address = io_out.token
+WHERE t.chain_id = ?1
+  AND t.orderbook_address = ?2
+  AND t.transaction_hash IN ({in_clause})
+ORDER BY t.transaction_hash, t.block_timestamp DESC, t.log_index DESC
+"#,
+        in_clause = in_clause
+    )
 }
 
 /// Build a batch trade query with a dynamic IN-clause. This is a simplified

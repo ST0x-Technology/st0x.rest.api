@@ -18,6 +18,42 @@ pub struct DetailedHealthResponse {
 
     /// raindex local database connectivity and sync status
     pub raindex_db: RaindexDbStatus,
+
+    /// Background cache warmer health
+    pub cache_warmer: CacheWarmerStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CacheWarmerStatus {
+    /// True if the warmer has completed at least one cycle
+    pub running: bool,
+
+    /// Total number of cycles completed since process start
+    #[schema(example = 42)]
+    pub total_cycles: u64,
+
+    /// Duration of the most recently completed cycle, in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 9500)]
+    pub last_cycle_ms: Option<u64>,
+
+    /// Number of orders refreshed in the last cycle (`tokens` × per-token orders implicit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 11)]
+    pub last_tokens: Option<u32>,
+
+    /// Errors observed in the last cycle (per-token failures)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_errors: Option<u32>,
+
+    /// Seconds elapsed since the warmer last completed a cycle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 7)]
+    pub seconds_since_last_complete: Option<u64>,
+
+    /// Human-readable age of the last completion (e.g. `12s ago`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_complete_age: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

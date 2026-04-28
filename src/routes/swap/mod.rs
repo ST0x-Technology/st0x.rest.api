@@ -1,8 +1,9 @@
 mod calldata;
 mod quote;
 
+use crate::cache::AppCache;
 use crate::error::ApiError;
-use crate::types::swap::SwapCalldataResponse;
+use crate::types::swap::{SwapCalldataResponse, SwapQuoteResponse};
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::orders::{
@@ -15,6 +16,20 @@ use rain_orderbook_common::take_orders::{
     build_take_order_candidates_for_pair, TakeOrderCandidate,
 };
 use rocket::Route;
+use std::time::Duration;
+
+const SWAP_QUOTE_CACHE_TTL: Duration = Duration::from_secs(5);
+const SWAP_QUOTE_CACHE_CAPACITY: u64 = 1_000;
+
+/// Cache of completed swap quotes keyed by `(input_token, output_token, output_amount)`.
+///
+/// 5s TTL keeps quotes within ~2 Base block times of staleness while
+/// coalescing concurrent or repeated requests for the same pair+amount.
+pub(crate) type SwapQuoteCache = AppCache<(Address, Address, String), SwapQuoteResponse>;
+
+pub(crate) fn swap_quote_cache() -> SwapQuoteCache {
+    AppCache::new(SWAP_QUOTE_CACHE_CAPACITY, SWAP_QUOTE_CACHE_TTL)
+}
 
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {

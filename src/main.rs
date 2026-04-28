@@ -3,6 +3,7 @@ extern crate rocket;
 
 mod auth;
 mod cache;
+mod cache_warmer;
 mod catchers;
 mod cli;
 mod config;
@@ -10,6 +11,7 @@ mod db;
 mod direct_trades;
 mod error;
 mod fairings;
+mod market_calendar;
 mod raindex;
 mod routes;
 mod telemetry;
@@ -119,12 +121,19 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     .to_cors()?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     docs_dir: String,
     direct_trades_fetcher: Option<direct_trades::DirectTradesFetcher>,
+    orders_by_token_cache: routes::orders::OrdersByTokenCache,
+    block_number_cache: raindex::BlockNumberCache,
+    limit_ratio_cache: routes::orders::LimitOrderRatioCache,
+    stale_price_skip_cache: routes::orders::StalePriceSkipCache,
+    swap_quote_cache: routes::swap::SwapQuoteCache,
+    cache_warmer_stats: cache_warmer::SharedCacheWarmerStats,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
@@ -137,7 +146,6 @@ pub(crate) fn rocket(
     let trades_by_order_hash_cache = routes::trades::trades_by_order_hash_cache();
     let taker_trades_tx_hash_cache = routes::trades::taker_trades_tx_hash_cache();
     let trades_by_token_cache = routes::trades::trades_by_token_cache();
-    let orders_by_token_cache = routes::orders::orders_by_token_cache();
     let orders_by_owner_cache = routes::orders::orders_by_owner_cache();
 
     Ok(rocket::custom(figment)
@@ -151,6 +159,11 @@ pub(crate) fn rocket(
         .manage(trades_by_token_cache)
         .manage(orders_by_token_cache)
         .manage(orders_by_owner_cache)
+        .manage(block_number_cache)
+        .manage(limit_ratio_cache)
+        .manage(stale_price_skip_cache)
+        .manage(swap_quote_cache)
+        .manage(cache_warmer_stats)
         .manage(direct_trades_fetcher)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
@@ -262,6 +275,7 @@ async fn main() {
             let raindex_config = match raindex::RaindexProvider::load(
                 &registry_url,
                 Some(local_db_path),
+                cfg.rpc_override.clone(),
             )
             .await
             {
@@ -326,7 +340,7 @@ async fn main() {
                 }
             };
 
-            let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+            let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
 
@@ -337,12 +351,47 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
+            let orders_by_token_cache = routes::orders::orders_by_token_cache();
+            let block_number_cache = raindex::block_number_cache();
+            let limit_ratio_cache = routes::orders::limit_order_ratio_cache();
+            let stale_price_skip_cache = routes::orders::stale_price_skip_cache();
+            let swap_quote_cache = routes::swap::swap_quote_cache();
+            let cache_warmer_stats = cache_warmer::shared_cache_warmer_stats();
+
+            // Spawn background task to keep the orders-by-token cache warm.
+            // Refreshes every 10s so real requests almost always hit the cache.
+            {
+                let cache = orders_by_token_cache.clone();
+                let raindex = std::sync::Arc::clone(&shared_raindex);
+                let block_cache = block_number_cache.clone();
+                let limit_cache = limit_ratio_cache.clone();
+                let stale_cache = stale_price_skip_cache.clone();
+                let stats = std::sync::Arc::clone(&cache_warmer_stats);
+                tokio::spawn(async move {
+                    cache_warmer::run_orders_by_token_warmer(
+                        cache,
+                        raindex,
+                        block_cache,
+                        limit_cache,
+                        stale_cache,
+                        stats,
+                    )
+                    .await;
+                });
+            }
+
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
                 cfg.docs_dir,
                 direct_trades_fetcher,
+                orders_by_token_cache,
+                block_number_cache,
+                limit_ratio_cache,
+                stale_price_skip_cache,
+                swap_quote_cache,
+                cache_warmer_stats,
             ) {
                 Ok(r) => r,
                 Err(e) => {

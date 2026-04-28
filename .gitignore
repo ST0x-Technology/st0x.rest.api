@@ -4,3 +4,4 @@ logs/
 data/*
 !data/.gitkeep
 docs/book/
+.claude/

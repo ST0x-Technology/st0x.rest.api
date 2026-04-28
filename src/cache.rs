@@ -3,6 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Thread-safe cache backed by moka. Cloning is cheap (Arc-based).
+#[derive(Clone)]
 pub(crate) struct AppCache<K, V>(Cache<K, V>)
 where
     K: std::hash::Hash + Eq + Send + Sync + 'static,

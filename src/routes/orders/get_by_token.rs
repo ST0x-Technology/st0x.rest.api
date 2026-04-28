@@ -1,6 +1,6 @@
 use super::{
-    build_order_summary, build_pagination, extract_quote_fields, OrdersListDataSource,
-    QuoteFields, RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    build_order_summary, build_pagination, OrdersListDataSource, QuoteFields,
+    RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::auth::AuthenticatedKey;
 use crate::cache::AppCache;
@@ -92,10 +92,11 @@ pub(crate) async fn process_get_orders_by_token(
         skipped_zero_balance = orders.len() - quotable_orders.len(),
         "fetching batched quotes for orders by token"
     );
-    let quote_results = ds.get_order_quotes_batch(&quotable_orders).await;
+    let quotable_fields = ds.fetch_quote_fields(&quotable_orders).await;
     let quotes_stage_duration_ms = quotes_stage_start.elapsed().as_millis();
 
-    // Map quote results back to original order positions
+    // Map quote fields back to original order positions; orders skipped above
+    // (zero output balance) keep the placeholder fields.
     let mut quote_fields: Vec<QuoteFields> = (0..orders.len())
         .map(|_| QuoteFields {
             io_ratio: "-".into(),
@@ -103,13 +104,9 @@ pub(crate) async fn process_get_orders_by_token(
         })
         .collect();
     for (qi, &original_idx) in quotable_indices.iter().enumerate() {
-        quote_fields[original_idx] = extract_quote_fields(
-            &orders[original_idx],
-            quote_results
-                .get(qi)
-                .cloned()
-                .unwrap_or_else(|| Err(ApiError::Internal("missing quote".into()))),
-        );
+        if let Some(field) = quotable_fields.get(qi) {
+            quote_fields[original_idx] = field.clone();
+        }
     }
 
     let mut summaries = Vec::with_capacity(orders.len());
@@ -152,12 +149,16 @@ pub(crate) async fn process_get_orders_by_token(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/token/<address>?<params..>")]
 pub async fn get_orders_by_token(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     orders_cache: &State<OrdersByTokenCache>,
+    block_number_cache: &State<crate::raindex::BlockNumberCache>,
+    limit_ratio_cache: &State<super::LimitOrderRatioCache>,
+    stale_price_skip_cache: &State<super::StalePriceSkipCache>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersByTokenParams,
@@ -178,6 +179,9 @@ pub async fn get_orders_by_token(
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexOrdersListDataSource {
                     client: raindex.client(),
+                    block_number_cache: block_number_cache.inner(),
+                    limit_ratio_cache: limit_ratio_cache.inner(),
+                    stale_price_skip_cache: stale_price_skip_cache.inner(),
                 };
                 process_get_orders_by_token(&ds, addr, side, Some(page), Some(page_size)).await
             })

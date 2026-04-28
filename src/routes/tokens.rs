@@ -157,9 +157,13 @@ tokens:
 "#;
         let registry_url =
             crate::test_helpers::mock_raindex_registry_url_with_settings(settings).await;
-        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
-            .await
-            .expect("load raindex config");
+        let config = crate::raindex::RaindexProvider::load(
+            &registry_url,
+            None,
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("load raindex config");
         let client = TestClientBuilder::new()
             .raindex_config(config)
             .build()
@@ -227,9 +231,13 @@ using-tokens-from:
 }"#;
         let registry_url =
             mock_raindex_registry_url_with_settings_and_tokens(settings, remote_tokens).await;
-        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
-            .await
-            .expect("load raindex config");
+        let config = crate::raindex::RaindexProvider::load(
+            &registry_url,
+            None,
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("load raindex config");
         let client = TestClientBuilder::new()
             .raindex_config(config)
             .build()

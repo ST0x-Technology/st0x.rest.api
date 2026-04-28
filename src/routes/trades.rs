@@ -909,14 +909,8 @@ async fn process_get_taker_trades(
     sender: Address,
     params: TradesPaginationParams,
 ) -> Result<TakerTradesResponse, ApiError> {
-    // Step 1: Get tx hashes (cached)
-    let tx_hashes = match direct_trades {
-        Some(fetcher) => taker_tx_cache
-            .get_or_try_insert(sender, || async {
-                fetcher.fetch_taker_tx_hashes(&sender).await
-            })
-            .await
-            .map_err(ApiError::from)?,
+    let fetcher = match direct_trades {
+        Some(f) => f,
         None => {
             tracing::warn!("direct trades fetcher unavailable; returning empty taker trades");
             return Ok(TakerTradesResponse {
@@ -931,6 +925,14 @@ async fn process_get_taker_trades(
             });
         }
     };
+
+    // Step 1: Get tx hashes (cached)
+    let tx_hashes = taker_tx_cache
+        .get_or_try_insert(sender, || async {
+            fetcher.fetch_taker_tx_hashes(&sender).await
+        })
+        .await
+        .map_err(ApiError::from)?;
 
     // Step 2: Paginate
     let page = params.page.unwrap_or(1);
@@ -949,16 +951,32 @@ async fn process_get_taker_trades(
         tx_hashes[offset..end].iter().map(|(h, _)| *h).collect()
     };
 
-    // Step 3: Resolve each tx via existing cached trade-by-tx lookup
+    // Step 3: Batch fetch all trades for the page via DirectTradesFetcher (fast SQLite path)
+    let trades_by_tx = fetcher.fetch_taker_tx_trades(&page_hashes).await?;
+
+    // Step 4: Build TradesByTxResponse for each tx hash, preserving order
     let mut market_orders = Vec::with_capacity(page_hashes.len());
-    for tx_hash in page_hashes {
-        match get_cached_trades_by_tx(trades_by_tx_cache, ds, tx_hash, None).await {
-            Ok(tx_trades) => market_orders.push(tx_trades),
+    for tx_hash in &page_hashes {
+        let enriched_trades = match trades_by_tx.get(tx_hash) {
+            Some(trades) if !trades.is_empty() => trades,
+            _ => {
+                tracing::warn!(tx_hash = %tx_hash, "no trades found for taker tx; skipping");
+                continue;
+            }
+        };
+
+        match build_trades_by_tx_from_enriched(*tx_hash, enriched_trades) {
+            Ok(response) => market_orders.push(response),
             Err(e) => {
-                tracing::warn!(tx_hash = %tx_hash, error = %e, "failed to resolve taker tx; skipping");
+                tracing::warn!(tx_hash = %tx_hash, error = %e, "failed to build taker tx response; skipping");
             }
         }
     }
+
+    // Suppress unused variable warnings — these params are kept for backward
+    // compatibility (the test passes None for direct_trades and exercises the
+    // early-return path above, which never reaches here).
+    let _ = (ds, trades_by_tx_cache);
 
     Ok(TakerTradesResponse {
         market_orders,
@@ -968,6 +986,112 @@ async fn process_get_taker_trades(
             total_trades: total,
             total_pages,
             has_more: u64::from(page) < total_pages,
+        },
+    })
+}
+
+/// Build a `TradesByTxResponse` from enriched trade rows returned by DirectTradesFetcher.
+fn build_trades_by_tx_from_enriched(
+    tx_hash: B256,
+    trades: &[crate::direct_trades::EnrichedTradeRow],
+) -> Result<TradesByTxResponse, ApiError> {
+    let first = &trades[0];
+
+    let mut total_input = Float::zero().map_err(|e| {
+        tracing::error!(error = %e, "float zero construction failed");
+        ApiError::Internal("trade totals calculation failed".into())
+    })?;
+    let mut total_output = Float::zero().map_err(|e| {
+        tracing::error!(error = %e, "float zero construction failed");
+        ApiError::Internal("trade totals calculation failed".into())
+    })?;
+
+    let mut entries = Vec::with_capacity(trades.len());
+    for trade in trades {
+        let input_float = Float::parse(trade.input_amount.clone()).map_err(|e| {
+            tracing::error!(error = %e, "failed to parse input amount");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?;
+        let output_float = Float::parse(trade.output_amount.clone()).map_err(|e| {
+            tracing::error!(error = %e, "failed to parse output amount");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?;
+
+        let io_ratio = {
+            let zero = Float::zero().map_err(|e| {
+                tracing::error!(error = %e, "float zero construction failed");
+                ApiError::Internal("io ratio calculation failed".into())
+            })?;
+            if output_float.eq(zero).unwrap_or(true) {
+                "0".to_string()
+            } else {
+                let ratio = input_float.div(output_float).map_err(|e| {
+                    tracing::error!(error = %e, "failed to compute io ratio");
+                    ApiError::Internal("io ratio calculation failed".into())
+                })?;
+                format_float(ratio, "io ratio")?
+            }
+        };
+
+        // Re-parse for totals accumulation (parse is cheap)
+        let input_for_total = Float::parse(trade.input_amount.clone()).map_err(|e| {
+            tracing::error!(error = %e, "failed to parse input amount for total");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?;
+        let output_for_total = Float::parse(trade.output_amount.clone()).map_err(|e| {
+            tracing::error!(error = %e, "failed to parse output amount for total");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?;
+
+        total_input = total_input.add(input_for_total).map_err(|e| {
+            tracing::error!(error = %e, "failed to sum total input");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?;
+        total_output = total_output.add(output_for_total).map_err(|e| {
+            tracing::error!(error = %e, "failed to sum total output");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?;
+
+        entries.push(TradeByTxEntry {
+            order_hash: trade.order_hash,
+            order_owner: trade.order_owner,
+            request: TradeRequest {
+                input_token: trade.input_token,
+                output_token: trade.output_token,
+                maximum_input: trade.input_amount.clone(),
+                maximum_io_ratio: io_ratio.clone(),
+            },
+            result: TradeResult {
+                input_amount: trade.input_amount.clone(),
+                output_amount: trade.output_amount.clone(),
+                actual_io_ratio: io_ratio,
+            },
+        });
+    }
+
+    let zero = Float::zero().map_err(|e| {
+        tracing::error!(error = %e, "float zero construction failed");
+        ApiError::Internal("trade totals calculation failed".into())
+    })?;
+    let average_io_ratio = if total_output.eq(zero).unwrap_or(true) {
+        zero
+    } else {
+        total_input.div(total_output).map_err(|e| {
+            tracing::error!(error = %e, "failed to compute average io ratio");
+            ApiError::Internal("trade totals calculation failed".into())
+        })?
+    };
+
+    Ok(TradesByTxResponse {
+        tx_hash,
+        block_number: first.block_number,
+        timestamp: first.block_timestamp,
+        sender: first.sender,
+        trades: entries,
+        totals: TradesTotals {
+            total_input_amount: format_float(total_input, "trade totals")?,
+            total_output_amount: format_float(total_output, "trade totals")?,
+            average_io_ratio: format_float(average_io_ratio, "trade totals")?,
         },
     })
 }

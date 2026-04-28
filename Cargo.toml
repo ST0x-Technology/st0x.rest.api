@@ -34,6 +34,8 @@ rain-math-float = { path = "lib/rain.orderbook/lib/rain.interpreter/lib/rain.int
 wasm-bindgen = "=0.2.100"
 moka = { version = "0.12", features = ["future"] }
 rusqlite = { version = "0.32" }
+chrono = "0.4"
+chrono-tz = "0.10"
 
 [dev-dependencies]
 tracing-test = "0.2"

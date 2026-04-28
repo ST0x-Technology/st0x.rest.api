@@ -9,7 +9,7 @@ pub(super) async fn create(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(20)
         .connect_with(options)
         .await?;
 

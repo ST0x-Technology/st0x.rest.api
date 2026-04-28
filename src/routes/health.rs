@@ -1,9 +1,11 @@
+use crate::cache_warmer::SharedCacheWarmerStats;
 use crate::db::DbPool;
 use crate::error::ApiError;
 use crate::fairings::TracingSpan;
 use crate::raindex::SharedRaindexProvider;
 use crate::types::health::{
-    DbStatus, DetailedHealthResponse, HealthResponse, OrderbookSyncInfo, RaindexDbStatus,
+    CacheWarmerStatus, DbStatus, DetailedHealthResponse, HealthResponse, OrderbookSyncInfo,
+    RaindexDbStatus,
 };
 use rocket::serde::json::Json;
 use rocket::{Route, State};
@@ -43,6 +45,7 @@ pub async fn get_health_detailed(
     span: TracingSpan,
     pool: &State<DbPool>,
     shared_raindex: &State<SharedRaindexProvider>,
+    cache_warmer_stats: &State<SharedCacheWarmerStats>,
 ) -> Result<Json<DetailedHealthResponse>, ApiError> {
     async move {
         tracing::info!("detailed health check request received");
@@ -53,24 +56,52 @@ pub async fn get_health_detailed(
         // 2. Check raindex database and sync status
         let raindex_db = check_raindex_db(shared_raindex).await;
 
-        // 3. Determine overall status
-        let status = if app_db.connected && raindex_db.connected && !raindex_db.orderbooks.is_empty()
-        {
-            "ok".to_string()
-        } else if app_db.connected || raindex_db.connected {
-            "degraded".to_string()
-        } else {
-            "error".to_string()
-        };
+        // 3. Snapshot cache warmer stats
+        let cache_warmer = build_cache_warmer_status(cache_warmer_stats).await;
+
+        // 4. Determine overall status
+        let status =
+            if app_db.connected && raindex_db.connected && !raindex_db.orderbooks.is_empty() {
+                "ok".to_string()
+            } else if app_db.connected || raindex_db.connected {
+                "degraded".to_string()
+            } else {
+                "error".to_string()
+            };
 
         Ok(Json(DetailedHealthResponse {
             status,
             app_db,
             raindex_db,
+            cache_warmer,
         }))
     }
     .instrument(span.0)
     .await
+}
+
+async fn build_cache_warmer_status(stats: &SharedCacheWarmerStats) -> CacheWarmerStatus {
+    let snapshot = stats.read().await.clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (seconds_since_last_complete, last_complete_age) = match snapshot.last_complete_at_unix {
+        Some(ts) => (
+            Some(now.saturating_sub(ts)),
+            Some(format_age(now, ts)),
+        ),
+        None => (None, None),
+    };
+    CacheWarmerStatus {
+        running: snapshot.total_cycles > 0,
+        total_cycles: snapshot.total_cycles,
+        last_cycle_ms: snapshot.last_cycle_ms,
+        last_tokens: snapshot.last_tokens,
+        last_errors: snapshot.last_errors,
+        seconds_since_last_complete,
+        last_complete_age,
+    }
 }
 
 async fn check_app_db(pool: &DbPool) -> DbStatus {
@@ -136,10 +167,8 @@ async fn check_raindex_db(shared_raindex: &SharedRaindexProvider) -> RaindexDbSt
         .map(|ob| (ob.network.chain_id, format!("{:#x}", ob.address)))
         .collect();
 
-    let query_result = spawn_blocking(move || {
-        query_raindex_sync_status(&db_path_clone, &orderbook_configs)
-    })
-    .await;
+    let query_result =
+        spawn_blocking(move || query_raindex_sync_status(&db_path_clone, &orderbook_configs)).await;
 
     match query_result {
         Ok(Ok(orderbook_infos)) => RaindexDbStatus {
@@ -332,5 +361,57 @@ mod tests {
     #[test]
     fn test_format_age_exact_day() {
         assert_eq!(format_age(86400, 0), "1d ago");
+    }
+
+    #[rocket::async_test]
+    async fn test_build_cache_warmer_status_no_cycles() {
+        let stats = crate::cache_warmer::shared_cache_warmer_stats();
+        let s = build_cache_warmer_status(&stats).await;
+        assert!(!s.running);
+        assert_eq!(s.total_cycles, 0);
+        assert!(s.last_cycle_ms.is_none());
+        assert!(s.last_complete_age.is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_build_cache_warmer_status_after_cycle() {
+        let stats = crate::cache_warmer::shared_cache_warmer_stats();
+        {
+            let mut w = stats.write().await;
+            w.total_cycles = 3;
+            w.last_cycle_ms = Some(7500);
+            w.last_tokens = Some(11);
+            w.last_errors = Some(0);
+            w.last_complete_at_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+        }
+        let s = build_cache_warmer_status(&stats).await;
+        assert!(s.running);
+        assert_eq!(s.total_cycles, 3);
+        assert_eq!(s.last_cycle_ms, Some(7500));
+        assert_eq!(s.last_tokens, Some(11));
+        assert_eq!(s.last_errors, Some(0));
+        // age may be 0 or 1 second depending on test timing
+        assert!(s.seconds_since_last_complete.is_some());
+        assert!(s.last_complete_age.is_some());
+    }
+
+    #[rocket::async_test]
+    async fn test_health_detailed_includes_cache_warmer_field() {
+        use crate::test_helpers::TestClientBuilder;
+        use rocket::http::Status;
+        let client = TestClientBuilder::new().build().await;
+        let resp = client.get("/health/detailed").dispatch().await;
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.into_string().await.unwrap()).unwrap();
+        // cache_warmer object must always be present
+        assert!(body.get("cache_warmer").is_some());
+        let cw = &body["cache_warmer"];
+        // Before any cycle has run, totalCycles == 0 and running == false
+        assert_eq!(cw["running"], serde_json::json!(false));
+        assert_eq!(cw["total_cycles"], serde_json::json!(0));
     }
 }

@@ -1,4 +1,4 @@
-{ pkgs, lib, modulesPath, docsRoot, ... }:
+{ pkgs, lib, modulesPath, docsRoot, siteHostname, ... }:
 
 let
   inherit (import ./keys.nix) roles;
@@ -105,9 +105,14 @@ in {
       # Rate-limit zone: 10 req/s per IP, burst 20
       appendHttpConfig = ''
         limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+
+        # UptimeRobot's keyword monitor operates on the raw response bytes
+        # without decompressing, so a gzip'd JSON response causes false
+        # "Keyword Not Found" alarms. Send uncompressed bodies to UR only.
+        gzip_disable "UptimeRobot";
       '';
 
-      virtualHosts."api.st0x.io" = {
+      virtualHosts."${siteHostname}" = {
         enableACME = true;
         forceSSL = true;
 

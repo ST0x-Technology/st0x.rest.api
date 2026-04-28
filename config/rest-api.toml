@@ -5,3 +5,19 @@ rate_limit_global_rpm = 600
 rate_limit_per_key_rpm = 60
 docs_dir = "/var/lib/st0x-docs"
 local_db_path = "/mnt/data/st0x-rest-api/raindex.db"
+
+# Replace the registry's single-URL `rpcs:` list with a pool of public Base
+# RPCs. alloy's FallbackLayer (active_transport_count = 1, see
+# `mk_read_provider`) health-routes to the best-scored transport and demotes
+# any that 429 or error.
+[rpc_override]
+base = [
+    "https://mainnet.base.org",
+    "https://base.llamarpc.com",
+    "https://base.drpc.org",
+    "https://base-rpc.publicnode.com",
+    "https://base.meowrpc.com",
+    "https://base-mainnet.public.blastapi.io",
+    "https://base.gateway.tenderly.co",
+    "https://base.rpc.subquery.network/public",
+]
