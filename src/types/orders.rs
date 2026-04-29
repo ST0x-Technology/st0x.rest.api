@@ -1,5 +1,6 @@
 use crate::types::common::TokenRef;
 use alloy::primitives::{Address, Bytes, FixedBytes};
+use rain_orderbook_common::parsed_meta::ParsedMeta;
 use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -62,6 +63,19 @@ pub struct OrderSummary {
     pub created_at: u64,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub orderbook_id: Address,
+    /// Parsed Rain metadata items attached to the order. Orders that quote off
+    /// a signed-context oracle (`RaindexSignedContextOracleV1`) are quoted
+    /// server-side — the API fetches the maker's signed payload before calling
+    /// `quote()` — so consumers can rely on `io_ratio` directly without needing
+    /// any oracle plumbing of their own. This field is exposed so clients that
+    /// want extra detail (tagging oracle-driven orders, inspecting strategy
+    /// configuration via `DotrainSourceV1`, etc.) can read it.
+    ///
+    /// Schema is opaque JSON because `ParsedMeta` lives outside this crate;
+    /// the serialized shape matches the Rain SDK's `ParsedMeta` enum
+    /// (`{"RaindexSignedContextOracleV1": "<url>"}` etc.).
+    #[schema(value_type = Vec<serde_json::Value>)]
+    pub parsed_meta: Vec<ParsedMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
