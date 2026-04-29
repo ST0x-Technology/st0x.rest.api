@@ -8,7 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Snapshot of the cache warmer's most recent activity, exposed via
 /// `/v1/health/detailed`. Mutated under a short-lived write lock at the end

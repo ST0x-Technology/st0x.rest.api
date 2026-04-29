@@ -7,9 +7,11 @@ mod stale_price_skip;
 use crate::error::ApiError;
 use crate::types::common::TokenRef;
 use crate::types::orders::{OrderSummary, OrdersListResponse, OrdersPagination};
+use alloy::primitives::{Address, U256};
+use alloy::sol_types::SolValue;
 use async_trait::async_trait;
 use futures::{future::join_all, stream, StreamExt};
-use rain_orderbook_bindings::IOrderBookV6::SignedContextV1;
+use rain_orderbook_bindings::IOrderBookV6::{OrderV4, SignedContextV1};
 use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch as fetch_order_quotes_batch, RaindexOrderQuote,
 };
@@ -22,29 +24,69 @@ pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
 pub(crate) const MAX_PAGE_SIZE: u16 = 50;
 const MAX_CHAIN_BATCH_CONCURRENCY: usize = 4;
 
-/// Fetch signed oracle context from an order's oracle URL.
-/// Returns an empty vec if the order has no oracle URL or the fetch fails.
+/// Fetch signed oracle context for a specific order from its oracle URL.
 ///
-/// The oracle server expects a POST with an ABI-encoded `bytes` body.
-/// An empty bytes value is: offset (0x20) + length (0x00), each as a 32-byte word.
-async fn fetch_oracle_context(oracle_url: &str) -> Vec<SignedContextV1> {
-    // ABI-encode an empty `bytes` value: offset=0x20, length=0
-    let mut abi_body = vec![0u8; 64];
-    abi_body[31] = 0x20; // offset = 32
+/// The oracle server (e.g. `st0x-oracle-server`) expects a POST whose body is
+/// the ABI-encoding of `(OrderV4, uint256 inputIOIndex, uint256 outputIOIndex,
+/// address counterparty)` — either as a single tuple or as a `Vec` of tuples
+/// for batched requests. The server uses the IO indices to look up which
+/// underlying symbol pair to sign a price for, then returns a JSON array of
+/// `SignedContextV1`-shaped objects.
+///
+/// We send a single tuple with `(input_io_index, output_io_index) = (0, 0)`
+/// and `counterparty = Address::ZERO` (the server destructures counterparty as
+/// `_counterparty`, so any value works). For st0x orders today (single input
+/// × single output) this is the only valid pair; multi-IO orders would need
+/// per-pair contexts which we don't support here yet.
+///
+/// Returns an empty vec on any failure (network, ABI, JSON, etc.) so that
+/// downstream quoting falls back gracefully — quote() will revert with no
+/// signed context, the order will quote `"-"`, and the frontend will drop it.
+async fn fetch_oracle_context(
+    order: &RaindexOrder,
+    oracle_url: &str,
+) -> Vec<SignedContextV1> {
+    let sg_order = match order.clone().into_sg_order() {
+        Ok(sg) => sg,
+        Err(e) => {
+            tracing::warn!(
+                oracle_url,
+                error = %e,
+                "failed to convert RaindexOrder to SgOrder for oracle request"
+            );
+            return vec![];
+        }
+    };
+    let order_v4: OrderV4 = match sg_order.try_into() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                oracle_url,
+                error = %e,
+                "failed to convert SgOrder to OrderV4 for oracle request"
+            );
+            return vec![];
+        }
+    };
+
+    let request_body = (order_v4, U256::ZERO, U256::ZERO, Address::ZERO).abi_encode();
 
     let client = reqwest::Client::new();
     let resp = match client
         .post(oracle_url)
         .header("Content-Type", "application/octet-stream")
-        .body(abi_body)
+        .body(request_body)
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => resp,
         Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
             tracing::warn!(
                 oracle_url,
-                status = %resp.status(),
+                %status,
+                body = %body,
                 "oracle endpoint returned non-success status"
             );
             return vec![];
@@ -63,22 +105,29 @@ async fn fetch_oracle_context(oracle_url: &str) -> Vec<SignedContextV1> {
         }
     };
 
-    // Try parsing as array first, then as single object
+    // Server always returns a JSON array — even for single-tuple requests.
+    // Fall back to single-object parsing only as a defensive measure.
     if let Ok(contexts) = serde_json::from_str::<Vec<SignedContextV1>>(&body) {
-        tracing::debug!(
+        tracing::info!(
             oracle_url,
             count = contexts.len(),
+            order_hash = ?order.order_hash(),
             "fetched oracle signed context"
         );
         return contexts;
     }
     if let Ok(context) = serde_json::from_str::<SignedContextV1>(&body) {
-        tracing::debug!(oracle_url, "fetched single oracle signed context");
+        tracing::info!(
+            oracle_url,
+            order_hash = ?order.order_hash(),
+            "fetched single oracle signed context"
+        );
         return vec![context];
     }
 
     tracing::warn!(
         oracle_url,
+        body = %body,
         "failed to parse oracle response as SignedContextV1"
     );
     vec![]
@@ -91,7 +140,7 @@ async fn fetch_oracle_contexts_for_orders(orders: &[RaindexOrder]) -> Vec<Vec<Si
         .iter()
         .map(|order| async move {
             match order.oracle_url() {
-                Some(url) => fetch_oracle_context(&url).await,
+                Some(url) => fetch_oracle_context(order, &url).await,
                 None => vec![],
             }
         })
@@ -305,7 +354,6 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
             .first()
             .map(RaindexOrder::chain_id)
             .unwrap_or_default();
-
         // Fetch oracle signed context for orders that have an oracle URL.
         // This enables accurate quoting for oracle-dependent orders (e.g. SPYM).
         let signed_contexts = fetch_oracle_contexts_for_orders(orders).await;
@@ -498,6 +546,7 @@ pub(crate) fn build_order_summary(
         io_ratio: quote.io_ratio.clone(),
         created_at,
         orderbook_id: order.orderbook(),
+        parsed_meta: order.parsed_meta(),
     })
 }
 

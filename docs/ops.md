@@ -14,8 +14,8 @@ curl -sS https://api.preview.st0x.io/health/detailed | jq
 
 Key fields in `/health/detailed.cache_warmer`:
 - `running` — `false` until the warmer completes its first cycle (~15-30s after restart while caches are cold)
-- `last_cycle_ms` — should track the steady-state cycle duration; sustained > 10s suggests upstream RPC slowness
-- `seconds_since_last_complete` — should bounce between `0` and `~20` (cycle duration + REFRESH_INTERVAL); much higher means the warmer has frozen
+- `last_cycle_ms` — should track the steady-state cycle duration; sustained high values suggest upstream RPC slowness
+- `seconds_since_last_complete` — should bounce between `0` and roughly the 5 minute refresh interval plus cycle duration; much higher means the warmer has frozen
 - `last_errors` — per-token failures during the last cycle; non-zero is worth investigating
 
 ## Common journalctl queries

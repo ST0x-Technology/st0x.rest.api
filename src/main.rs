@@ -359,7 +359,7 @@ async fn main() {
             let cache_warmer_stats = cache_warmer::shared_cache_warmer_stats();
 
             // Spawn background task to keep the orders-by-token cache warm.
-            // Refreshes every 10s so real requests almost always hit the cache.
+            // Refreshes every 5 minutes to limit quote RPC volume.
             {
                 let cache = orders_by_token_cache.clone();
                 let raindex = std::sync::Arc::clone(&shared_raindex);
