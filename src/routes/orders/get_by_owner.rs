@@ -12,7 +12,7 @@ use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rocket::serde::json::Json;
 use rocket::State;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 const ORDERS_BY_OWNER_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -33,30 +33,48 @@ pub(crate) async fn process_get_orders_by_owner(
     let filters = GetOrdersFilters {
         owners: vec![address],
         active: Some(true),
+        has_positive_output_vault_balance: Some(true),
         ..Default::default()
     };
 
+    let total_start = Instant::now();
     let page_num = page.unwrap_or(1);
     let effective_page_size = page_size
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
+
+    let orders_stage_start = Instant::now();
     let (orders, total_count) = ds
         .get_orders_list(filters, Some(page_num), Some(effective_page_size))
         .await?;
+    let orders_stage_duration_ms = orders_stage_start.elapsed().as_millis();
 
+    let quotes_stage_start = Instant::now();
     tracing::info!(
-        quoted_orders = orders.len(),
+        total_orders = orders.len(),
         "fetching batched quotes for orders by owner"
     );
     let quote_results = ds.get_order_quotes_batch(&orders).await;
+    let quotes_stage_duration_ms = quotes_stage_start.elapsed().as_millis();
 
-    build_orders_list_response(
+    let response = build_orders_list_response(
         &orders,
         total_count,
         page_num.into(),
         effective_page_size.into(),
         quote_results,
-    )
+    )?;
+    tracing::info!(
+        page = page_num,
+        page_size = effective_page_size,
+        returned_orders = response.orders.len(),
+        total_orders = total_count,
+        orders_stage_duration_ms,
+        quotes_stage_duration_ms,
+        total_duration_ms = total_start.elapsed().as_millis(),
+        "orders by owner request processed"
+    );
+    Ok(response)
 }
 
 #[utoipa::path(
