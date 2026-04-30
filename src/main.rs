@@ -6,6 +6,7 @@ mod catchers;
 mod cli;
 mod config;
 mod db;
+mod direct_trades;
 mod error;
 mod fairings;
 mod raindex;
@@ -118,6 +119,7 @@ pub(crate) fn rocket(
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     docs_dir: String,
+    direct_trades_fetcher: Option<direct_trades::DirectTradesFetcher>,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
@@ -129,6 +131,7 @@ pub(crate) fn rocket(
         .manage(pool)
         .manage(rate_limiter)
         .manage(raindex_config)
+        .manage(direct_trades_fetcher)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -253,6 +256,56 @@ async fn main() {
                 }
             };
 
+            // Create direct trades fetcher for fast batch trade lookups.
+            // Bypasses the library's per-query connection model.
+            let direct_trades_fetcher = match raindex_config.db_path() {
+                Some(db_path) if db_path.exists() => {
+                    match raindex_config.client().get_all_orderbooks() {
+                        Ok(orderbooks) => {
+                            if let Some(ob) = orderbooks.values().next() {
+                                match direct_trades::DirectTradesFetcher::new(
+                                    &db_path,
+                                    ob.network.chain_id,
+                                    ob.address,
+                                ) {
+                                    Ok(fetcher) => {
+                                        tracing::info!(
+                                            chain_id = ob.network.chain_id,
+                                            orderbook = %ob.address,
+                                            "direct trades fetcher initialized"
+                                        );
+                                        Some(fetcher)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "failed to create direct trades fetcher; using fallback"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "no orderbooks configured; direct trades fetcher disabled"
+                                );
+                                None
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to get orderbooks; direct trades fetcher disabled"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    tracing::info!("no local db path; direct trades fetcher disabled");
+                    None
+                }
+            };
+
             let shared_raindex = tokio::sync::RwLock::new(raindex_config);
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
@@ -264,7 +317,13 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let rocket = match rocket(pool, rate_limiter, shared_raindex, cfg.docs_dir) {
+            let rocket = match rocket(
+                pool,
+                rate_limiter,
+                shared_raindex,
+                cfg.docs_dir,
+                direct_trades_fetcher,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");
