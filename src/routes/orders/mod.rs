@@ -233,6 +233,7 @@ pub(crate) fn build_order_summary(
     Ok(OrderSummary {
         order_hash: order.order_hash(),
         owner: order.owner(),
+        order_bytes: order.order_bytes(),
         input_token: TokenRef {
             address: input_token_info.address(),
             symbol: input_token_info.symbol().unwrap_or_default(),

@@ -1,5 +1,5 @@
 use crate::types::common::TokenRef;
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, Bytes, FixedBytes};
 use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -44,6 +44,8 @@ pub struct OrderSummary {
     pub order_hash: FixedBytes<32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub owner: Address,
+    #[schema(value_type = String, example = "0x01")]
+    pub order_bytes: Bytes,
     pub input_token: TokenRef,
     pub output_token: TokenRef,
     #[schema(example = "500000")]
