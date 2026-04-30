@@ -50,6 +50,9 @@ async fn process_swap_calldata(
     ds: &dyn SwapDataSource,
     req: SwapCalldataRequest,
 ) -> Result<SwapCalldataResponse, ApiError> {
+    ds.validate_supported_tokens(req.input_token, req.output_token)
+        .await?;
+
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
         chain_id: crate::CHAIN_ID,
@@ -116,6 +119,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_ready() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Ok(ready_response()),
@@ -134,6 +138,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_needs_approval() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Ok(approval_response()),
@@ -152,6 +157,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_not_found() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Err(ApiError::NotFound(
@@ -165,6 +171,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_bad_request() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Err(ApiError::BadRequest("invalid parameters".into())),
@@ -176,12 +183,29 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_calldata_internal_error() {
         let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_rejects_unsupported_tokens() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::BadRequest(
+                "unsupported token for this API".into(),
+            )),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
+        );
     }
 
     #[rocket::async_test]
@@ -194,5 +218,20 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_calldata_400_for_unsupported_tokens() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let response = client
+            .post("/v1/swap/calldata")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new("Authorization", header))
+            .body(r#"{"taker":"0x1111111111111111111111111111111111111111","inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100","maximumIoRatio":"2.5"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
     }
 }
