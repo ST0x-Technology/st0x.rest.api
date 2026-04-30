@@ -126,6 +126,7 @@ mod tests {
     use alloy::primitives::address;
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::trades::RaindexTradesListResult;
+    use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
     use rocket::http::{Header, Status};
 
     struct MockTradesDataSource {
@@ -142,6 +143,15 @@ mod tests {
                 Ok(r) => Ok(r.clone()),
                 Err(e) => Err(e.clone()),
             }
+        }
+
+        async fn get_trades_for_owner(
+            &self,
+            _owner: Address,
+            _pagination: PaginationParams,
+            _time_filter: TimeFilter,
+        ) -> Result<RaindexTradesListResult, ApiError> {
+            unimplemented!()
         }
     }
 
