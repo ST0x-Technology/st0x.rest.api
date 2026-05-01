@@ -2,15 +2,17 @@ use crate::cache::AppCache;
 use alloy::primitives::B256;
 use std::time::Duration;
 
-const STALE_SKIP_TTL: Duration = Duration::from_secs(7 * 86_400);
+const STALE_SKIP_TTL: Duration = Duration::from_secs(300);
 const STALE_SKIP_CAPACITY: u64 = 10_000;
 
 /// Set of order_hashes that have returned `StalePrice` from a quote.
 ///
-/// The TTL is long (7 days) because the marker only becomes a no-op when
-/// NYSE re-opens (callers consult `market_calendar::is_nyse_open` before
-/// honoring it). The TTL exists purely as a safety valve so a stale-marker
-/// for a permanently-removed order eventually falls out of memory.
+/// The TTL is short (5 minutes) so the marker is a brief debounce against
+/// repeated reverts on a feed that's momentarily stale, not a long-lived
+/// quarantine. Callers also consult `market_calendar::is_nyse_open` before
+/// honoring it, but the TTL ensures recovery as soon as the next feed
+/// update lands — including for pre/post-market Pyth feeds (`.PRE`) that
+/// publish outside the NYSE cash session.
 pub(crate) type StalePriceSkipCache = AppCache<B256, ()>;
 
 pub(crate) fn stale_price_skip_cache() -> StalePriceSkipCache {
