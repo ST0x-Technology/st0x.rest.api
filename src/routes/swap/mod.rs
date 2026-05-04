@@ -16,6 +16,8 @@ use rain_orderbook_common::take_orders::{
 };
 use rocket::Route;
 
+const SWAP_QUOTE_CHUNK_SIZE: u32 = 4;
+
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
     async fn validate_supported_tokens(
@@ -114,7 +116,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             input_token,
             output_token,
             None,
-            None,
+            Some(SWAP_QUOTE_CHUNK_SIZE),
             Address::ZERO,
             &NoopInjector,
         )
