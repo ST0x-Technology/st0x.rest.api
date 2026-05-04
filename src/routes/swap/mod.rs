@@ -12,9 +12,11 @@ use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rain_orderbook_common::take_orders::{
-    build_take_order_candidates_for_pair, TakeOrderCandidate,
+    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate,
 };
 use rocket::Route;
+
+const SWAP_QUOTE_CHUNK_SIZE: u32 = 4;
 
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
@@ -109,12 +111,20 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
-        build_take_order_candidates_for_pair(orders, input_token, output_token, None, None)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to build order candidates");
-                ApiError::Internal("failed to build order candidates".into())
-            })
+        build_take_order_candidates_for_pair(
+            orders,
+            input_token,
+            output_token,
+            None,
+            Some(SWAP_QUOTE_CHUNK_SIZE),
+            Address::ZERO,
+            &NoopInjector,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build order candidates");
+            ApiError::Internal("failed to build order candidates".into())
+        })
     }
 
     async fn get_calldata(

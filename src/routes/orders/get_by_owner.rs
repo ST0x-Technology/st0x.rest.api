@@ -11,6 +11,7 @@ use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rocket::serde::json::Json;
 use rocket::State;
+use std::time::Instant;
 use tracing::Instrument;
 
 pub(crate) async fn process_get_orders_by_owner(
@@ -22,30 +23,48 @@ pub(crate) async fn process_get_orders_by_owner(
     let filters = GetOrdersFilters {
         owners: vec![address],
         active: Some(true),
+        has_positive_output_vault_balance: Some(true),
         ..Default::default()
     };
 
+    let total_start = Instant::now();
     let page_num = page.unwrap_or(1);
     let effective_page_size = page_size
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
+
+    let orders_stage_start = Instant::now();
     let (orders, total_count) = ds
         .get_orders_list(filters, Some(page_num), Some(effective_page_size))
         .await?;
+    let orders_stage_duration_ms = orders_stage_start.elapsed().as_millis();
 
+    let quotes_stage_start = Instant::now();
     tracing::info!(
-        quoted_orders = orders.len(),
+        total_orders = orders.len(),
         "fetching batched quotes for orders by owner"
     );
     let quote_results = ds.get_order_quotes_batch(&orders).await;
+    let quotes_stage_duration_ms = quotes_stage_start.elapsed().as_millis();
 
-    build_orders_list_response(
+    let response = build_orders_list_response(
         &orders,
         total_count,
         page_num.into(),
         effective_page_size.into(),
         quote_results,
-    )
+    )?;
+    tracing::info!(
+        page = page_num,
+        page_size = effective_page_size,
+        returned_orders = response.orders.len(),
+        total_orders = total_count,
+        orders_stage_duration_ms,
+        quotes_stage_duration_ms,
+        total_duration_ms = total_start.elapsed().as_millis(),
+        "orders by owner request processed"
+    );
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -99,7 +118,35 @@ mod tests {
     };
     use crate::routes::orders::test_fixtures::MockOrdersListDataSource;
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
+    use async_trait::async_trait;
+    use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
+    use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rocket::http::{Header, Status};
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingOrdersListDataSource {
+        filters: Arc<Mutex<Vec<GetOrdersFilters>>>,
+    }
+
+    #[async_trait]
+    impl OrdersListDataSource for CapturingOrdersListDataSource {
+        async fn get_orders_list(
+            &self,
+            filters: GetOrdersFilters,
+            _page: Option<u16>,
+            _page_size: Option<u16>,
+        ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
+            self.filters.lock().expect("lock filters").push(filters);
+            Ok((vec![], 0))
+        }
+
+        async fn get_order_quotes(
+            &self,
+            _order: &RaindexOrder,
+        ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
+            Ok(vec![])
+        }
+    }
 
     #[rocket::async_test]
     async fn test_process_get_orders_by_owner_success() {
@@ -142,6 +189,27 @@ mod tests {
         assert!(result.orders.is_empty());
         assert_eq!(result.pagination.total_orders, 0);
         assert_eq!(result.pagination.total_pages, 0);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_filters_positive_output_vault_balance() {
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let ds = CapturingOrdersListDataSource {
+            filters: Arc::clone(&filters),
+        };
+        let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            .parse()
+            .unwrap();
+
+        process_get_orders_by_owner(&ds, addr, None, None)
+            .await
+            .unwrap();
+
+        let filters = filters.lock().expect("lock filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].owners, vec![addr]);
+        assert_eq!(filters[0].active, Some(true));
+        assert_eq!(filters[0].has_positive_output_vault_balance, Some(true));
     }
 
     #[rocket::async_test]

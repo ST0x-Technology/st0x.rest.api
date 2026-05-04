@@ -207,7 +207,10 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
             .first()
             .map(RaindexOrder::chain_id)
             .unwrap_or_default();
-        fetch_order_quotes_batch(orders, None, None)
+        // Use small chunk size (4) to avoid exceeding public RPC eth_call gas
+        // limits, which would trigger expensive probe-and-split retries in the
+        // quote library.
+        fetch_order_quotes_batch(orders, None, Some(4))
             .await
             .map_err(|error| {
                 tracing::error!(
