@@ -1,3 +1,4 @@
+mod active_tokens;
 mod get_by_owner;
 mod get_by_token;
 mod get_by_tx;
@@ -42,10 +43,7 @@ const MAX_CHAIN_BATCH_CONCURRENCY: usize = 4;
 /// Returns an empty vec on any failure (network, ABI, JSON, etc.) so that
 /// downstream quoting falls back gracefully — quote() will revert with no
 /// signed context, the order will quote `"-"`, and the frontend will drop it.
-async fn fetch_oracle_context(
-    order: &RaindexOrder,
-    oracle_url: &str,
-) -> Vec<SignedContextV1> {
+async fn fetch_oracle_context(order: &RaindexOrder, oracle_url: &str) -> Vec<SignedContextV1> {
     let sg_order = match order.clone().into_sg_order() {
         Ok(sg) => sg,
         Err(e) => {
@@ -637,6 +635,7 @@ pub use get_by_owner::*;
 pub use get_by_token::*;
 pub use get_by_tx::*;
 
+pub(crate) use active_tokens::{active_token_cache, ActiveTokenCache};
 pub(crate) use get_by_owner::orders_by_owner_cache;
 pub(crate) use get_by_token::{
     orders_by_token_cache, process_get_orders_by_token, OrdersByTokenCache,

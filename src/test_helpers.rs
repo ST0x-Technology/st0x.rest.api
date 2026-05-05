@@ -49,9 +49,13 @@ impl TestClientBuilder {
                     Some(url) => url,
                     None => mock_raindex_registry_url().await,
                 };
-                crate::raindex::RaindexProvider::load(&registry_url, None, std::collections::HashMap::new())
-                    .await
-                    .expect("mock raindex config from registry url")
+                crate::raindex::RaindexProvider::load(
+                    &registry_url,
+                    None,
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .expect("mock raindex config from registry url")
             }
         };
 
@@ -61,6 +65,7 @@ impl TestClientBuilder {
         let block_number_cache = crate::raindex::block_number_cache();
         let limit_ratio_cache = crate::routes::orders::limit_order_ratio_cache();
         let stale_price_skip_cache = crate::routes::orders::stale_price_skip_cache();
+        let active_token_cache = crate::routes::orders::active_token_cache();
         let swap_quote_cache = crate::routes::swap::swap_quote_cache();
         let cache_warmer_stats = crate::cache_warmer::shared_cache_warmer_stats();
         let rocket = crate::rocket(
@@ -73,6 +78,7 @@ impl TestClientBuilder {
             block_number_cache,
             limit_ratio_cache,
             stale_price_skip_cache,
+            active_token_cache,
             swap_quote_cache,
             cache_warmer_stats,
         )

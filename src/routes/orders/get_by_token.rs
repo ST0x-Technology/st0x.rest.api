@@ -159,6 +159,7 @@ pub async fn get_orders_by_token(
     block_number_cache: &State<crate::raindex::BlockNumberCache>,
     limit_ratio_cache: &State<super::LimitOrderRatioCache>,
     stale_price_skip_cache: &State<super::StalePriceSkipCache>,
+    active_token_cache: &State<super::ActiveTokenCache>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersByTokenParams,
@@ -166,6 +167,10 @@ pub async fn get_orders_by_token(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
+        // Mark this token "active" so the cache warmer knows it has live demand.
+        // Insertions only happen on user-facing requests; the warmer never bumps
+        // its own activity, so tokens that go quiet age out and stop being warmed.
+        active_token_cache.insert(addr, ()).await;
         let side = params.side;
         let page = params.page.unwrap_or(1);
         let page_size = params

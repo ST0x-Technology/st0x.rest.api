@@ -1,6 +1,6 @@
 use crate::raindex::{BlockNumberCache, SharedRaindexProvider};
 use crate::routes::orders::{
-    process_get_orders_by_token, LimitOrderRatioCache, OrdersByTokenCache,
+    process_get_orders_by_token, ActiveTokenCache, LimitOrderRatioCache, OrdersByTokenCache,
     RaindexOrdersListDataSource, StalePriceSkipCache, MAX_PAGE_SIZE,
 };
 use std::sync::Arc;
@@ -44,6 +44,7 @@ pub(crate) async fn run_orders_by_token_warmer(
     block_number_cache: BlockNumberCache,
     limit_ratio_cache: LimitOrderRatioCache,
     stale_price_skip_cache: StalePriceSkipCache,
+    active_token_cache: ActiveTokenCache,
     stats: SharedCacheWarmerStats,
 ) {
     loop {
@@ -72,8 +73,19 @@ pub(crate) async fn run_orders_by_token_warmer(
         let page_size: u16 = MAX_PAGE_SIZE;
         let mut ok_count: usize = 0;
         let mut err_count: usize = 0;
+        let mut skipped_count: usize = 0;
 
         for addr in &token_addresses {
+            // Skip tokens with no recent user request. The active-token cache is
+            // populated by `get_orders_by_token` and TTLs out after a few minutes
+            // of no traffic, so we only burn RPC on tokens someone is actually
+            // looking at. Tokens nobody hits stay un-warmed; the next user request
+            // pays one singleflighted multicall and re-marks the token active.
+            if active_token_cache.get(addr).await.is_none() {
+                skipped_count += 1;
+                continue;
+            }
+
             // Acquire the read lock per-token so other writers (e.g. admin
             // registry reload) are not blocked for the entire cycle.
             let result = {
@@ -109,6 +121,7 @@ pub(crate) async fn run_orders_by_token_warmer(
             tokens = token_addresses.len(),
             ok = ok_count,
             errors = err_count,
+            skipped = skipped_count,
             duration_ms = cycle_ms,
             "cache warmer: orders-by-token refresh complete"
         );

@@ -132,6 +132,7 @@ pub(crate) fn rocket(
     block_number_cache: raindex::BlockNumberCache,
     limit_ratio_cache: routes::orders::LimitOrderRatioCache,
     stale_price_skip_cache: routes::orders::StalePriceSkipCache,
+    active_token_cache: routes::orders::ActiveTokenCache,
     swap_quote_cache: routes::swap::SwapQuoteCache,
     cache_warmer_stats: cache_warmer::SharedCacheWarmerStats,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
@@ -162,6 +163,7 @@ pub(crate) fn rocket(
         .manage(block_number_cache)
         .manage(limit_ratio_cache)
         .manage(stale_price_skip_cache)
+        .manage(active_token_cache)
         .manage(swap_quote_cache)
         .manage(cache_warmer_stats)
         .manage(direct_trades_fetcher)
@@ -355,17 +357,20 @@ async fn main() {
             let block_number_cache = raindex::block_number_cache();
             let limit_ratio_cache = routes::orders::limit_order_ratio_cache();
             let stale_price_skip_cache = routes::orders::stale_price_skip_cache();
+            let active_token_cache = routes::orders::active_token_cache();
             let swap_quote_cache = routes::swap::swap_quote_cache();
             let cache_warmer_stats = cache_warmer::shared_cache_warmer_stats();
 
             // Spawn background task to keep the orders-by-token cache warm.
-            // Refreshes every 5 minutes to limit quote RPC volume.
+            // Refreshes every 5 minutes, scoped to tokens with recent user demand
+            // (see ActiveTokenCache) to avoid burning RPC on cold tokens.
             {
                 let cache = orders_by_token_cache.clone();
                 let raindex = std::sync::Arc::clone(&shared_raindex);
                 let block_cache = block_number_cache.clone();
                 let limit_cache = limit_ratio_cache.clone();
                 let stale_cache = stale_price_skip_cache.clone();
+                let active_cache = active_token_cache.clone();
                 let stats = std::sync::Arc::clone(&cache_warmer_stats);
                 tokio::spawn(async move {
                     cache_warmer::run_orders_by_token_warmer(
@@ -374,6 +379,7 @@ async fn main() {
                         block_cache,
                         limit_cache,
                         stale_cache,
+                        active_cache,
                         stats,
                     )
                     .await;
@@ -390,6 +396,7 @@ async fn main() {
                 block_number_cache,
                 limit_ratio_cache,
                 stale_price_skip_cache,
+                active_token_cache,
                 swap_quote_cache,
                 cache_warmer_stats,
             ) {
