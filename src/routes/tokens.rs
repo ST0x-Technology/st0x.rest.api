@@ -122,7 +122,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_get_tokens_returns_multiple_tokens() {
-        let settings = r#"version: 4
+        let settings = r#"version: 5
 networks:
   base:
     rpcs:
@@ -180,7 +180,7 @@ tokens:
 
     #[rocket::async_test]
     async fn test_get_tokens_adds_name_and_isin_from_remote_tokens() {
-        let settings = r#"version: 4
+        let settings = r#"version: 5
 networks:
   base:
     rpcs:

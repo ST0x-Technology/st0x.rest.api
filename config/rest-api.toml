@@ -5,3 +5,4 @@ rate_limit_global_rpm = 600
 rate_limit_per_key_rpm = 60
 docs_dir = "/var/lib/st0x-docs"
 local_db_path = "/mnt/data/st0x-rest-api/raindex.db"
+gating_signature_ttl_seconds = 60
