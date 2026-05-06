@@ -172,6 +172,7 @@
           '';
           buildInputs = with pkgs;
             [
+              cargo-nextest
               sqlx-cli
               terraform
               mdbook
