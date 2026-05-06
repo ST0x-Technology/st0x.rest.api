@@ -39,6 +39,7 @@ pub(crate) async fn process_get_orders_by_token(
     let filters = GetOrdersFilters {
         active: Some(true),
         tokens: Some(token_filter),
+        has_positive_output_vault_balance: Some(true),
         ..Default::default()
     };
 

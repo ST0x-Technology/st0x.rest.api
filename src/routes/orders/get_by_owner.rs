@@ -22,6 +22,7 @@ pub(crate) async fn process_get_orders_by_owner(
     let filters = GetOrdersFilters {
         owners: vec![address],
         active: Some(true),
+        has_positive_output_vault_balance: Some(true),
         ..Default::default()
     };
 
