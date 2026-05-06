@@ -46,7 +46,11 @@ import json, sys
 try:
     import tomllib
 except ImportError:
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit("ERROR: bench/run.sh requires Python 3.11+ (for tomllib) "
+                 "or the 'tomli' package (pip install tomli).")
 with open("bench/endpoints.toml", "rb") as f:
     print(json.dumps(tomllib.load(f)))
 PY
@@ -86,12 +90,14 @@ for i in $(seq 0 $((n_endpoints - 1))); do
 
   # Skip if any required placeholder still unresolved.
   skip_reason=""
-  for key in $discover_keys; do
-    if grep -q "{$key}" <<<"$path$body"; then
-      skip_reason="missing fixture: $key"
-      break
-    fi
-  done
+  if [ -n "$discover_keys" ]; then
+    for key in $discover_keys; do
+      if grep -q "{$key}" <<<"$path$body"; then
+        skip_reason="missing fixture: $key"
+        break
+      fi
+    done
+  fi
 
   if [ -n "$skip_reason" ]; then
     echo "[run] SKIP $name — $skip_reason" >&2
@@ -115,8 +121,11 @@ for i in $(seq 0 $((n_endpoints - 1))); do
   fi
 
   oha_out="$tmp/${name}.json"
-  if ! oha "${oha_args[@]}" "$url" > "$oha_out" 2>"$tmp/${name}.err"; then
-    echo "[run] WARN oha exited non-zero for $name (see $tmp/${name}.err)" >&2
+  oha_err="$tmp/${name}.err"
+  if ! oha "${oha_args[@]}" "$url" > "$oha_out" 2>"$oha_err"; then
+    err_persist="bench/results/.${name}.err"
+    cp "$oha_err" "$err_persist" 2>/dev/null || true
+    echo "[run] WARN oha exited non-zero for $name (err saved to $err_persist)" >&2
     # Still capture output if any; mark skipped on parse failure below.
   fi
 
@@ -133,16 +142,16 @@ for i in $(seq 0 $((n_endpoints - 1))); do
   # Build the summary block from oha's JSON. Field names match `oha -j` schema.
   summary="$(jq '{
     total_requests:        (.summary.requests          // .summary.total           // 0),
-    success_count:         ((.statusCodeDistribution // {}) | to_entries
+    success_count:         ((.statusCodeDistribution // {}) | (if type == "object" then to_entries else [] end)
                               | map(select(.key|tonumber < 400)) | map(.value) | add // 0),
-    success_rate:          (((.statusCodeDistribution // {}) | to_entries
+    success_rate:          (((.statusCodeDistribution // {}) | (if type == "object" then to_entries else [] end)
                               | map(select(.key|tonumber < 400)) | map(.value) | add // 0)
                             / ((.summary.requests // .summary.total // 1) | if . == 0 then 1 else . end)),
-    p50_ms:                ((.latencyPercentiles.p50  // .latency_percentiles.p50  // 0) * 1000),
-    p95_ms:                ((.latencyPercentiles.p95  // .latency_percentiles.p95  // 0) * 1000),
-    p99_ms:                ((.latencyPercentiles.p99  // .latency_percentiles.p99  // 0) * 1000),
+    p50_ms:                ((.latencyPercentiles.p50  // .latency_percentiles.p50)  | if . == null then null else . * 1000 end),
+    p95_ms:                ((.latencyPercentiles.p95  // .latency_percentiles.p95)  | if . == null then null else . * 1000 end),
+    p99_ms:                ((.latencyPercentiles.p99  // .latency_percentiles.p99)  | if . == null then null else . * 1000 end),
     rps:                   (.summary.requestsPerSec   // .summary.rps              // 0),
-    error_rate:            (1 - (((.statusCodeDistribution // {}) | to_entries
+    error_rate:            (1 - (((.statusCodeDistribution // {}) | (if type == "object" then to_entries else [] end)
                               | map(select(.key|tonumber < 400)) | map(.value) | add // 0)
                             / ((.summary.requests // .summary.total // 1) | if . == 0 then 1 else . end)))
   }' "$oha_out")"

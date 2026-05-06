@@ -6,12 +6,10 @@ it can be wired into CI later.
 
 ## Prerequisites
 
-- `oha` (`cargo install oha` or `nix develop`)
+- `oha` — install via `cargo install oha` (not yet in `nix develop`)
 - `jq`
-- `python3` (for parsing `endpoints.toml`)
+- `python3` ≥ 3.11 (uses `tomllib`; falls back to `tomli` on older versions)
 - `curl`
-
-The provided `nix develop` shell already has the first three.
 
 ## Setup
 

@@ -10,8 +10,6 @@ cd "$(dirname "$0")/.."
 . bench/lib.sh
 load_env
 
-ts="$(date -u +%Y%m%dT%H%M%SZ)"
-
 echo "=== Discovering fixtures from prod ==="
 bench/discover.sh prod
 
@@ -21,7 +19,10 @@ prod_json="$(bench/run.sh prod)"
 echo "=== Benching preview ==="
 preview_json="$(bench/run.sh preview)"
 
-report="bench/results/${ts}-compare.md"
+# Use prod result's timestamp prefix so report and source JSONs share a stem.
+prod_ts="$(basename "$prod_json" | sed 's/-prod\.json$//')"
+report="bench/results/${prod_ts}-compare.md"
+
 echo "=== Comparing ==="
 bench/compare.sh "$prod_json" "$preview_json" "$report"
 
