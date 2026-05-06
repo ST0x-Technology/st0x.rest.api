@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod auth;
+mod cache;
 mod catchers;
 mod cli;
 mod config;
