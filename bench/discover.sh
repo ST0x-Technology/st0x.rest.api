@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Discover fixture params from a live host. Writes bench/results/.discovered.env.
+# Discover fixture params from a live host.
+# Writes bench/results/.discovered-<target>.env so each host has its own
+# fixtures (avoids cross-host data mismatches that produce 404s).
 # Usage: bench/discover.sh [prod|preview]   (default: prod)
 
 set -euo pipefail
@@ -26,7 +28,7 @@ fi
 b64="$(basic_b64 "$user" "$pass")"
 auth=( -H "Authorization: Basic $b64" )
 
-out="bench/results/.discovered.env"
+out="bench/results/.discovered-${target}.env"
 : > "$out"
 
 log() { echo "[discover] $*" >&2; }

@@ -29,9 +29,9 @@ reqs="${BENCH_REQUESTS:-50}"
 conc="${BENCH_CONCURRENCY:-5}"
 timeout_s="${BENCH_TIMEOUT_S:-30}"
 
-discovered="bench/results/.discovered.env"
+discovered="bench/results/.discovered-${target}.env"
 if [ ! -f "$discovered" ]; then
-  echo "ERROR: $discovered not found. Run bench/discover.sh first." >&2
+  echo "ERROR: $discovered not found. Run bench/discover.sh ${target} first." >&2
   exit 1
 fi
 

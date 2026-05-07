@@ -10,8 +10,9 @@ cd "$(dirname "$0")/.."
 . bench/lib.sh
 load_env
 
-echo "=== Discovering fixtures from prod ==="
+echo "=== Discovering fixtures (per host) ==="
 bench/discover.sh prod
+bench/discover.sh preview
 
 echo "=== Benching prod ==="
 prod_json="$(bench/run.sh prod)"
