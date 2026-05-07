@@ -39,11 +39,25 @@ nix develop -c bench/compare.sh bench/results/<ts>-prod.json bench/results/<ts>-
 
 Tunables (env vars):
 
-- `BENCH_REQUESTS` — total requests per endpoint (default 50)
-- `BENCH_CONCURRENCY` — concurrent workers (default 5)
+- `BENCH_REQUESTS` — total requests per endpoint (default 30)
+- `BENCH_CONCURRENCY` — concurrent workers (default 1)
+- `BENCH_QPS` — requests-per-second cap per endpoint (default 0.8 — sized to
+  stay under the API's 60 rpm per-key limit; set to `0` to disable)
+- `BENCH_INTER_ENDPOINT_SLEEP` — seconds to pause between endpoints so the
+  rolling rate-limit window decays (default 5)
 - `BENCH_TIMEOUT_S` — per-request timeout (default 30)
 - `BENCH_P95_THRESHOLD` — p95 regression threshold (default 0.25)
 - `BENCH_SUCCESS_DROP` — success rate drop threshold (default 0.02)
+
+At defaults, one host takes ~10 min, both hosts ~21 min total.
+
+### Why so slow?
+
+The API enforces `rate_limit_per_key_rpm = 60` (one req/sec per API key) and
+`rate_limit_global_rpm = 600` on the host. Earlier defaults (50 reqs at
+concurrency 5) blew the budget on every endpoint and produced 429-saturated
+results. The current defaults stay under the budget; raise them only if you've
+provisioned a key with a higher limit.
 
 ## What's covered
 

@@ -25,9 +25,14 @@ if [ -z "${host:-}" ]; then
   exit 1
 fi
 
-reqs="${BENCH_REQUESTS:-50}"
-conc="${BENCH_CONCURRENCY:-5}"
+reqs="${BENCH_REQUESTS:-30}"
+conc="${BENCH_CONCURRENCY:-1}"
 timeout_s="${BENCH_TIMEOUT_S:-30}"
+# Per-key rate limit on st0x is 60 rpm = 1 rps. Default below the limit so a
+# bench run doesn't trip 429s. Override per-run for soak/ceiling tests.
+qps="${BENCH_QPS:-0.8}"
+# Pause between endpoints to let the rolling 60s window decay.
+inter_sleep="${BENCH_INTER_ENDPOINT_SLEEP:-5}"
 
 discovered="bench/results/.discovered-${target}.env"
 if [ ! -f "$discovered" ]; then
@@ -68,14 +73,18 @@ jq -n \
   --arg started_at "$(date -u +%FT%TZ)" \
   --argjson reqs "$reqs" \
   --argjson conc "$conc" \
+  --arg qps "$qps" \
   '{target:$target, host:$host, started_at:$started_at,
-    load:{requests:$reqs, concurrency:$conc},
+    load:{requests:$reqs, concurrency:$conc, qps:$qps},
     endpoints:[]}' > "$out"
 
 n_endpoints="$(echo "$endpoints_json" | jq '.endpoint | length')"
-echo "[run] target=$target host=$host endpoints=$n_endpoints requests=$reqs concurrency=$conc" >&2
+echo "[run] target=$target host=$host endpoints=$n_endpoints requests=$reqs concurrency=$conc qps=$qps inter_sleep=${inter_sleep}s" >&2
 
 for i in $(seq 0 $((n_endpoints - 1))); do
+  if [ "$i" -gt 0 ] && [ "$inter_sleep" -gt 0 ] 2>/dev/null; then
+    sleep "$inter_sleep"
+  fi
   ep="$(echo "$endpoints_json" | jq -c ".endpoint[$i]")"
   name="$(echo "$ep" | jq -r '.name')"
   method="$(echo "$ep" | jq -r '.method')"
@@ -113,6 +122,9 @@ for i in $(seq 0 $((n_endpoints - 1))); do
   echo "[run] $method $url" >&2
 
   oha_args=( -n "$reqs" -c "$conc" -t "${timeout_s}s" --no-tui --output-format json -m "$method" )
+  if [ -n "$qps" ] && [ "$qps" != "0" ]; then
+    oha_args+=( -q "$qps" )
+  fi
   if [ "$auth_kind" = "basic" ] && [ -n "$b64" ]; then
     oha_args+=( -H "Authorization: Basic $b64" )
   fi
