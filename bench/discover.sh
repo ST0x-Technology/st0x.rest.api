@@ -33,38 +33,61 @@ log() { echo "[discover] $*" >&2; }
 
 log "Discovering fixtures from $target ($host)…"
 
-# 1. tokens → token_in, token_out
+# 1. tokens → list of candidate addresses
 tokens_json="$(curl -fsS "${auth[@]}" "$host/v1/tokens")" || {
   log "WARN: /v1/tokens failed; token_in/token_out unavailable"; tokens_json="[]"; }
 
-token_in="$(echo "$tokens_json"  | jq -r 'first(.[]?|.address) // empty')"
-token_out="$(echo "$tokens_json" | jq -r '[.[]?|.address]|.[1] // empty')"
-[ -n "$token_in"  ] && echo "token_in=$token_in"   >> "$out"
-[ -n "$token_out" ] && echo "token_out=$token_out" >> "$out"
+# Collect every token address; we'll walk them looking for one with trades.
+# `mapfile` is bash 4+; macOS ships bash 3.2, so use the portable idiom.
+token_addrs=()
+while IFS= read -r addr; do
+  [ -n "$addr" ] && token_addrs+=("$addr")
+done < <(echo "$tokens_json" | jq -r '.[]?|.address // empty')
+
+if [ "${#token_addrs[@]}" -eq 0 ]; then
+  log "ERROR: no token addresses returned"
+  log "Wrote $out"
+  exit 0
+fi
+
+# 2. Walk tokens until we find one whose /v1/trades/token/{addr} returns a trade.
+#    That gives us a token guaranteed to have orderHash + txHash.
+token_in=""; token_out=""; order_hash=""; tx_hash=""
+extract_first() { jq -r '(if type=="array" then .[0] else (.trades[0]? // .data[0]? // null) end) | '"$1"' // empty'; }
+
+for addr in "${token_addrs[@]}"; do
+  trades_json="$(curl -fsS "${auth[@]}" "$host/v1/trades/token/$addr?page=1&page_size=1")" || continue
+  oh="$(echo "$trades_json" | extract_first '(.orderHash // .order_hash)')"
+  th="$(echo "$trades_json" | extract_first '(.txHash // .tx_hash // .transactionHash)')"
+  if [ -n "$oh" ] && [ -n "$th" ]; then
+    token_in="$addr"
+    order_hash="$oh"
+    tx_hash="$th"
+    break
+  fi
+done
+
+if [ -z "$token_in" ]; then
+  # No token had trades — fall back to the first token so partial fixtures still work.
+  token_in="${token_addrs[0]}"
+  log "WARN: no token has trades on this host; order_hash/tx_hash unavailable"
+fi
+
+# token_out: any other token in the list (different from token_in).
+for addr in "${token_addrs[@]}"; do
+  if [ "$addr" != "$token_in" ]; then token_out="$addr"; break; fi
+done
+
+[ -n "$token_in"   ] && echo "token_in=$token_in"     >> "$out"
+[ -n "$token_out"  ] && echo "token_out=$token_out"   >> "$out"
+[ -n "$order_hash" ] && echo "order_hash=$order_hash" >> "$out"
+[ -n "$tx_hash"    ] && echo "tx_hash=$tx_hash"       >> "$out"
 log "  token_in=${token_in:-<none>}"
 log "  token_out=${token_out:-<none>}"
-
-# 2. trades by token → orderHash + txHash from a trade that actually exists.
-#    The orders-by-token endpoint can return orders with zero trades, so we
-#    can't derive tx_hash from there reliably. Trades-by-token gives both.
-order_hash=""; tx_hash=""
-if [ -n "$token_in" ]; then
-  trades_json="$(curl -fsS "${auth[@]}" "$host/v1/trades/token/$token_in?page=1&page_size=1")" || {
-    log "WARN: /v1/trades/token/$token_in failed"; trades_json='[]'; }
-  # Response can be either a bare array or wrapped {trades:[…]}. Handle both.
-  order_hash="$(echo "$trades_json" | jq -r '
-    (if type=="array" then .[0] else (.trades[0]? // .data[0]? // null) end)
-    | (.orderHash // .order_hash // empty)')"
-  tx_hash="$(echo "$trades_json" | jq -r '
-    (if type=="array" then .[0] else (.trades[0]? // .data[0]? // null) end)
-    | (.txHash // .tx_hash // .transactionHash // empty)')"
-  [ -n "$order_hash" ] && echo "order_hash=$order_hash" >> "$out"
-  [ -n "$tx_hash"    ] && echo "tx_hash=$tx_hash"       >> "$out"
-fi
 log "  order_hash=${order_hash:-<none>}"
 log "  tx_hash=${tx_hash:-<none>}"
 
-# 3. orders by token → owner (one of the orders that owns the token).
+# 3. orders by token → owner.
 owner=""
 if [ -n "$token_in" ]; then
   orders_json="$(curl -fsS "${auth[@]}" "$host/v1/orders/token/$token_in?page=1&page_size=1")" || {

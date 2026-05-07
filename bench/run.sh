@@ -140,9 +140,9 @@ for i in $(seq 0 $((n_endpoints - 1))); do
   fi
 
   # Build the summary block. Schema matches `oha --output-format json` (oha 1.14+).
-  # Total request count is derived by summing statusCodeDistribution values; oha
-  # does not emit a top-level request count. successRate is taken directly when
-  # present, with a derived fallback. Latency percentiles are in seconds.
+  # NOTE: oha's own `summary.successRate` is "request completed without transport
+  # error" — a 404/500 still counts. We must derive HTTP-level success ourselves
+  # from statusCodeDistribution (status < 400 = success).
   summary="$(jq '
     ((.statusCodeDistribution // {})
        | (if type == "object" then to_entries else [] end)) as $codes |
@@ -152,14 +152,13 @@ for i in $(seq 0 $((n_endpoints - 1))); do
     {
       total_requests: $total,
       success_count:  $ok,
-      success_rate:   (.summary.successRate // ($ok / $denom)),
-      error_rate:     (if (.summary.successRate // null) != null
-                       then 1 - .summary.successRate
-                       else 1 - ($ok / $denom) end),
+      success_rate:   ($ok / $denom),
+      error_rate:     (1 - ($ok / $denom)),
       p50_ms: (.latencyPercentiles.p50 | if . == null then null else . * 1000 end),
       p95_ms: (.latencyPercentiles.p95 | if . == null then null else . * 1000 end),
       p99_ms: (.latencyPercentiles.p99 | if . == null then null else . * 1000 end),
-      rps:    (.summary.requestsPerSec // 0)
+      rps:    (.summary.requestsPerSec // 0),
+      status_codes: ($codes | map({(.key): .value}) | add // {})
     }
   ' "$oha_out" 2>/dev/null)"
 
