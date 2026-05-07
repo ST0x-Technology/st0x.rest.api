@@ -112,7 +112,7 @@ for i in $(seq 0 $((n_endpoints - 1))); do
   url="$host$path"
   echo "[run] $method $url" >&2
 
-  oha_args=( -n "$reqs" -c "$conc" -t "${timeout_s}s" --no-tui -j -m "$method" )
+  oha_args=( -n "$reqs" -c "$conc" -t "${timeout_s}s" --no-tui --output-format json -m "$method" )
   if [ "$auth_kind" = "basic" ] && [ -n "$b64" ]; then
     oha_args+=( -H "Authorization: Basic $b64" )
   fi
@@ -139,22 +139,39 @@ for i in $(seq 0 $((n_endpoints - 1))); do
     continue
   fi
 
-  # Build the summary block from oha's JSON. Field names match `oha -j` schema.
-  summary="$(jq '{
-    total_requests:        (.summary.requests          // .summary.total           // 0),
-    success_count:         ((.statusCodeDistribution // {}) | (if type == "object" then to_entries else [] end)
-                              | map(select(.key|tonumber < 400)) | map(.value) | add // 0),
-    success_rate:          (((.statusCodeDistribution // {}) | (if type == "object" then to_entries else [] end)
-                              | map(select(.key|tonumber < 400)) | map(.value) | add // 0)
-                            / ((.summary.requests // .summary.total // 1) | if . == 0 then 1 else . end)),
-    p50_ms:                ((.latencyPercentiles.p50  // .latency_percentiles.p50)  | if . == null then null else . * 1000 end),
-    p95_ms:                ((.latencyPercentiles.p95  // .latency_percentiles.p95)  | if . == null then null else . * 1000 end),
-    p99_ms:                ((.latencyPercentiles.p99  // .latency_percentiles.p99)  | if . == null then null else . * 1000 end),
-    rps:                   (.summary.requestsPerSec   // .summary.rps              // 0),
-    error_rate:            (1 - (((.statusCodeDistribution // {}) | (if type == "object" then to_entries else [] end)
-                              | map(select(.key|tonumber < 400)) | map(.value) | add // 0)
-                            / ((.summary.requests // .summary.total // 1) | if . == 0 then 1 else . end)))
-  }' "$oha_out")"
+  # Build the summary block. Schema matches `oha --output-format json` (oha 1.14+).
+  # Total request count is derived by summing statusCodeDistribution values; oha
+  # does not emit a top-level request count. successRate is taken directly when
+  # present, with a derived fallback. Latency percentiles are in seconds.
+  summary="$(jq '
+    ((.statusCodeDistribution // {})
+       | (if type == "object" then to_entries else [] end)) as $codes |
+    ($codes | map(.value) | add // 0) as $total |
+    ($codes | map(select(.key|tonumber < 400)) | map(.value) | add // 0) as $ok |
+    ($total | if . == 0 then 1 else . end) as $denom |
+    {
+      total_requests: $total,
+      success_count:  $ok,
+      success_rate:   (.summary.successRate // ($ok / $denom)),
+      error_rate:     (if (.summary.successRate // null) != null
+                       then 1 - .summary.successRate
+                       else 1 - ($ok / $denom) end),
+      p50_ms: (.latencyPercentiles.p50 | if . == null then null else . * 1000 end),
+      p95_ms: (.latencyPercentiles.p95 | if . == null then null else . * 1000 end),
+      p99_ms: (.latencyPercentiles.p99 | if . == null then null else . * 1000 end),
+      rps:    (.summary.requestsPerSec // 0)
+    }
+  ' "$oha_out" 2>/dev/null)"
+
+  if [ -z "$summary" ]; then
+    echo "[run] ERROR $name summary computation failed; recording as skipped" >&2
+    jq --arg name "$name" --arg method "$method" --arg path "$raw_path" \
+       --arg reason "summary computation failed" \
+       '.endpoints += [{name:$name, method:$method, path:$path,
+         skipped:true, skip_reason:$reason, oha:null, summary:null}]' \
+       "$out" > "$tmp/next" && mv "$tmp/next" "$out"
+    continue
+  fi
 
   jq --arg name "$name" --arg method "$method" --arg path "$raw_path" \
      --slurpfile oha "$oha_out" --argjson summary "$summary" \

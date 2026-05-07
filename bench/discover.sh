@@ -44,33 +44,35 @@ token_out="$(echo "$tokens_json" | jq -r '[.[]?|.address]|.[1] // empty')"
 log "  token_in=${token_in:-<none>}"
 log "  token_out=${token_out:-<none>}"
 
-# 2. orders → order_hash, owner
-order_hash=""; owner=""
+# 2. trades by token → orderHash + txHash from a trade that actually exists.
+#    The orders-by-token endpoint can return orders with zero trades, so we
+#    can't derive tx_hash from there reliably. Trades-by-token gives both.
+order_hash=""; tx_hash=""
+if [ -n "$token_in" ]; then
+  trades_json="$(curl -fsS "${auth[@]}" "$host/v1/trades/token/$token_in?page=1&page_size=1")" || {
+    log "WARN: /v1/trades/token/$token_in failed"; trades_json='[]'; }
+  # Response can be either a bare array or wrapped {trades:[…]}. Handle both.
+  order_hash="$(echo "$trades_json" | jq -r '
+    (if type=="array" then .[0] else (.trades[0]? // .data[0]? // null) end)
+    | (.orderHash // .order_hash // empty)')"
+  tx_hash="$(echo "$trades_json" | jq -r '
+    (if type=="array" then .[0] else (.trades[0]? // .data[0]? // null) end)
+    | (.txHash // .tx_hash // .transactionHash // empty)')"
+  [ -n "$order_hash" ] && echo "order_hash=$order_hash" >> "$out"
+  [ -n "$tx_hash"    ] && echo "tx_hash=$tx_hash"       >> "$out"
+fi
+log "  order_hash=${order_hash:-<none>}"
+log "  tx_hash=${tx_hash:-<none>}"
+
+# 3. orders by token → owner (one of the orders that owns the token).
+owner=""
 if [ -n "$token_in" ]; then
   orders_json="$(curl -fsS "${auth[@]}" "$host/v1/orders/token/$token_in?page=1&page_size=1")" || {
     log "WARN: /v1/orders/token/$token_in failed"; orders_json='{"orders":[]}'; }
-  order_hash="$(echo "$orders_json" | jq -r '.orders[0].order_hash // .orders[0].hash // empty')"
-  owner="$(echo "$orders_json"      | jq -r '.orders[0].owner // empty')"
-  [ -n "$order_hash" ] && echo "order_hash=$order_hash" >> "$out"
-  [ -n "$owner"      ] && echo "owner=$owner"           >> "$out"
+  owner="$(echo "$orders_json" | jq -r '.orders[0].owner // empty')"
+  [ -n "$owner" ] && echo "owner=$owner" >> "$out"
 fi
-log "  order_hash=${order_hash:-<none>}"
 log "  owner=${owner:-<none>}"
-
-# 3. order detail → tx_hash
-tx_hash=""
-if [ -n "$order_hash" ]; then
-  order_json="$(curl -fsS "${auth[@]}" "$host/v1/order/$order_hash")" || {
-    log "WARN: /v1/order/$order_hash failed"; order_json='{}'; }
-  tx_hash="$(echo "$order_json" | jq -r '
-    .trades[0].tx_hash //
-    .trades[0].transaction_hash //
-    .order.transaction //
-    .transaction //
-    empty')"
-  [ -n "$tx_hash" ] && echo "tx_hash=$tx_hash" >> "$out"
-fi
-log "  tx_hash=${tx_hash:-<none>}"
 
 log "Wrote $out"
 cat "$out" >&2
