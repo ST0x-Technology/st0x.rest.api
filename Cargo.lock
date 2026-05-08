@@ -8966,6 +8966,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "strict-yaml-rust",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",

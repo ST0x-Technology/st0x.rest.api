@@ -50,5 +50,13 @@ jobs:
 
       - run: ./prep.sh
 
-      - name: Build and deploy
-        run: nix run .#deployAll
+      - name: Build and deploy system
+        run: nix run .#deployNixos
+
+      - name: Upload private RPC URLs
+        env:
+          PRIVATE_RPC_URLS: ${{ secrets.PRIVATE_RPC_URLS }}
+        run: nix run .#deployRpcSecrets
+
+      - name: Build and deploy REST API service
+        run: nix run .#deployService -- rest-api

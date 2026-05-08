@@ -6,6 +6,8 @@ pub struct Config {
     pub log_dir: String,
     pub database_url: String,
     pub registry_url: String,
+    #[serde(default)]
+    pub registry_rpc_urls_path: Option<String>,
     pub rate_limit_global_rpm: u64,
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,

@@ -52,9 +52,9 @@ pub async fn put_registry(
             ));
         }
 
-        let (previous_url, db_path) = {
+        let (previous_url, db_path, rpc_urls_path) = {
             let guard = shared_raindex.read().await;
-            (guard.registry_url(), guard.db_path())
+            (guard.registry_url(), guard.db_path(), guard.rpc_urls_path())
         };
 
         if previous_url == req.registry_url {
@@ -68,12 +68,13 @@ pub async fn put_registry(
             }));
         }
 
-        let new_provider = RaindexProvider::load(&req.registry_url, db_path)
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "failed to load new registry");
-                ApiError::BadRequest(format!("failed to load registry: {e}"))
-            })?;
+        let new_provider =
+            RaindexProvider::load(&req.registry_url, db_path, rpc_urls_path.as_deref())
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "failed to load new registry");
+                    ApiError::BadRequest(format!("failed to load registry: {e}"))
+                })?;
 
         let mut guard = shared_raindex.write().await;
         let previous_url = guard.registry_url();

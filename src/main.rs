@@ -238,9 +238,15 @@ async fn main() {
                 }
             }
 
+            let registry_rpc_urls_path = cfg
+                .registry_rpc_urls_path
+                .as_deref()
+                .map(std::path::Path::new);
+
             let raindex_config = match raindex::RaindexProvider::load(
                 &registry_url,
                 Some(local_db_path),
+                registry_rpc_urls_path,
             )
             .await
             {

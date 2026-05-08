@@ -222,6 +222,25 @@ systemctl cat rest-api
 nix develop -c deploy-service rest-api
 ```
 
+### Private registry RPCs
+The deploy workflow can prepend private RPC URLs to the public registry settings.
+Set the GitHub Actions secret `PRIVATE_RPC_URLS` to a comma-separated list:
+
+```text
+https://paid-rpc-1.example/key,https://paid-rpc-2.example/key
+```
+
+During deploy, the workflow writes this to:
+
+```text
+/mnt/data/st0x-rest-api/private-rpcs.txt
+```
+
+The service reads that file from `registry_rpc_urls_path`, prepends the URLs to
+the public registry's network for the configured chain, and serves the generated
+registry/settings only on loopback. If the file is missing, empty, or invalid,
+the service logs the issue and falls back to the public registry.
+
 ### SSH into the server
 ```bash
 nix develop -c remote

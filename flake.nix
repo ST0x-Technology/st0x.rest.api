@@ -181,6 +181,7 @@
               packages.prepSolArtifacts
               packages.remote
               packages.deployNixos
+              packages.deployRpcSecrets
               packages.deployService
               packages.deployAll
             ] ++ rainix.devShells.${system}.default.buildInputs;

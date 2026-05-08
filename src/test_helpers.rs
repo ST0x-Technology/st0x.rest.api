@@ -49,7 +49,7 @@ impl TestClientBuilder {
                     Some(url) => url,
                     None => mock_raindex_registry_url().await,
                 };
-                crate::raindex::RaindexProvider::load(&registry_url, None)
+                crate::raindex::RaindexProvider::load(&registry_url, None, None)
                     .await
                     .expect("mock raindex config from registry url")
             }
@@ -66,7 +66,7 @@ impl TestClientBuilder {
 
 pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
     let registry_url = mock_raindex_registry_url().await;
-    crate::raindex::RaindexProvider::load(&registry_url, None)
+    crate::raindex::RaindexProvider::load(&registry_url, None, None)
         .await
         .expect("mock raindex config")
 }
