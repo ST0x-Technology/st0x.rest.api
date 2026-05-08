@@ -2,15 +2,22 @@ pub(crate) mod get_by_address;
 pub(crate) mod get_by_tx;
 
 use crate::error::ApiError;
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::trades::RaindexTradesListResult;
+use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::Route;
 
 #[async_trait]
 pub(crate) trait TradesDataSource: Send + Sync {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError>;
+    async fn get_trades_for_owner(
+        &self,
+        owner: Address,
+        pagination: PaginationParams,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError>;
 }
 
 pub(crate) struct RaindexTradesDataSource<'a> {
@@ -33,6 +40,21 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
                     tracing::error!(error = %other, "failed to query trades for transaction");
                     ApiError::Internal("failed to query trades".into())
                 }
+            })
+    }
+
+    async fn get_trades_for_owner(
+        &self,
+        owner: Address,
+        pagination: PaginationParams,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.client
+            .get_trades_for_owner(None, None, owner, pagination, time_filter)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to query trades for owner");
+                ApiError::Internal("failed to query trades".into())
             })
     }
 }
