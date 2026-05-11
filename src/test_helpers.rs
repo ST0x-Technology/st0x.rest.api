@@ -15,6 +15,8 @@ pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
     raindex_registry_url: Option<String>,
     raindex_config: Option<crate::raindex::RaindexProvider>,
+    private_registry_path: Option<std::path::PathBuf>,
+    database_url: Option<String>,
 }
 
 impl TestClientBuilder {
@@ -23,6 +25,8 @@ impl TestClientBuilder {
             rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
             raindex_registry_url: None,
             raindex_config: None,
+            private_registry_path: None,
+            database_url: None,
         }
     }
 
@@ -36,18 +40,39 @@ impl TestClientBuilder {
         self
     }
 
+    pub(crate) fn private_registry_path(mut self, path: std::path::PathBuf) -> Self {
+        self.private_registry_path = Some(path);
+        self
+    }
+
+    pub(crate) fn database_url(mut self, url: String) -> Self {
+        self.database_url = Some(url);
+        self
+    }
+
     pub(crate) async fn build(self) -> Client {
         let id = uuid::Uuid::new_v4();
-        let pool = crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
-            .await
-            .expect("database init");
+        let database_url = self
+            .database_url
+            .unwrap_or_else(|| format!("sqlite:file:{id}?mode=memory&cache=shared"));
+        let pool = crate::db::init(&database_url).await.expect("database init");
+
+        let private_registry_path = self.private_registry_path.unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "st0x-test-private-registry-{}.data",
+                uuid::Uuid::new_v4()
+            ))
+        });
 
         let raindex_config = match self.raindex_config {
             Some(config) => config,
             None => {
-                let registry_url = match self.raindex_registry_url {
-                    Some(url) => url,
-                    None => mock_raindex_registry_url().await,
+                let registry_url = match std::fs::read_to_string(&private_registry_path) {
+                    Ok(artifact) if !artifact.is_empty() => artifact,
+                    _ => match self.raindex_registry_url {
+                        Some(url) => url,
+                        None => mock_raindex_registry_url().await,
+                    },
                 };
                 crate::raindex::RaindexProvider::load(&registry_url, None)
                     .await
@@ -56,9 +81,17 @@ impl TestClientBuilder {
         };
 
         let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+        let artifact_store =
+            crate::registry_artifact::RegistryArtifactStore::new(private_registry_path);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
-        let rocket = crate::rocket(pool, self.rate_limiter, shared_raindex, docs_dir)
-            .expect("valid rocket instance");
+        let rocket = crate::rocket(
+            pool,
+            self.rate_limiter,
+            shared_raindex,
+            artifact_store,
+            docs_dir,
+        )
+        .expect("valid rocket instance");
 
         Client::tracked(rocket).await.expect("valid client")
     }
@@ -101,6 +134,45 @@ tokens:
 
 pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> String {
     mock_raindex_registry_url_with_settings_and_tokens(settings, "{}").await
+}
+
+pub(crate) fn mock_raindex_registry_artifact() -> String {
+    let settings = r#"version: 5
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+subgraphs:
+  base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
+orderbooks:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+tokens:
+  token1:
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    network: base
+"#;
+    mock_raindex_registry_artifact_with_settings(settings)
+}
+
+pub(crate) fn mock_raindex_registry_artifact_with_settings(settings: &str) -> String {
+    let settings_uri = format!(
+        "data:application/yaml;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(settings)
+    );
+    format!(
+        "data:text/plain;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(settings_uri)
+    )
 }
 
 pub(crate) async fn mock_raindex_registry_url_with_settings_and_tokens(

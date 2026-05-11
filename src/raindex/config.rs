@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) struct RaindexProvider {
-    registry: DotrainRegistry,
     client: RaindexClient,
     db_path: Option<PathBuf>,
 }
@@ -43,7 +42,6 @@ impl RaindexProvider {
                     .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
 
                 Ok(RaindexProvider {
-                    registry,
                     client,
                     db_path: db,
                 })
@@ -57,10 +55,6 @@ impl RaindexProvider {
 
     pub(crate) fn client(&self) -> &RaindexClient {
         &self.client
-    }
-
-    pub(crate) fn registry_url(&self) -> String {
-        self.registry.registry_url()
     }
 
     pub(crate) fn db_path(&self) -> Option<PathBuf> {
@@ -80,7 +74,7 @@ pub(crate) enum RaindexProviderError {
 
 impl From<RaindexProviderError> for ApiError {
     fn from(e: RaindexProviderError) -> Self {
-        tracing::error!(error = %e, "raindex client provider error");
+        tracing::error!(error = %e.safe_summary(), "raindex client provider error");
         match e {
             RaindexProviderError::RegistryLoad(_) => {
                 ApiError::Internal("registry configuration error".into())
@@ -91,6 +85,16 @@ impl From<RaindexProviderError> for ApiError {
             RaindexProviderError::WorkerPanicked => {
                 ApiError::Internal("failed to initialize client runtime".into())
             }
+        }
+    }
+}
+
+impl RaindexProviderError {
+    pub(crate) fn safe_summary(&self) -> &'static str {
+        match self {
+            RaindexProviderError::RegistryLoad(_) => "registry load failed",
+            RaindexProviderError::ClientInit(_) => "raindex client initialization failed",
+            RaindexProviderError::WorkerPanicked => "worker thread panicked",
         }
     }
 }
@@ -136,8 +140,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_load_succeeds_with_valid_registry() {
-        let config = crate::test_helpers::mock_raindex_config().await;
-        assert!(!config.registry_url().is_empty());
+        crate::test_helpers::mock_raindex_config().await;
     }
 
     #[test]

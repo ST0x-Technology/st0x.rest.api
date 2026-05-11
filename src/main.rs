@@ -10,6 +10,7 @@ mod db;
 mod error;
 mod fairings;
 mod raindex;
+mod registry_artifact;
 mod routes;
 mod telemetry;
 mod types;
@@ -119,6 +120,7 @@ pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
+    registry_artifact_store: registry_artifact::RegistryArtifactStore,
     docs_dir: String,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
@@ -131,6 +133,7 @@ pub(crate) fn rocket(
         .manage(pool)
         .manage(rate_limiter)
         .manage(raindex_config)
+        .manage(registry_artifact_store)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -200,56 +203,114 @@ async fn main() {
 
     match command {
         cli::Command::Serve { .. } => {
-            let db_url = db::settings::get_setting(&pool, "registry_url")
-                .await
-                .ok()
-                .flatten();
+            let registry_artifact_store = registry_artifact::RegistryArtifactStore::new(
+                std::path::PathBuf::from(&cfg.private_registry_path),
+            );
 
-            let registry_url = match db_url {
-                Some(url) if !url.is_empty() => {
-                    tracing::info!(registry_url = %url, "loaded registry_url from database");
-                    url
-                }
-                _ if !cfg.registry_url.is_empty() => {
-                    if let Err(e) =
-                        db::settings::set_setting(&pool, "registry_url", &cfg.registry_url).await
-                    {
-                        tracing::warn!(error = %e, "failed to seed registry_url into database");
-                    }
-                    cfg.registry_url
-                }
-                _ => {
+            let private_registry_artifact = match registry_artifact_store.load().await {
+                Ok(artifact) => artifact,
+                Err(e) => {
                     tracing::error!(
-                        "registry_url not found in database and not set in config file"
+                        error = %e,
+                        path = %registry_artifact_store.path().display(),
+                        "failed to load private registry artifact"
                     );
                     drop(log_guard);
                     std::process::exit(1);
                 }
             };
 
-            let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
-            if let Some(parent) = local_db_path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        tracing::error!(error = %e, path = %parent.display(), "failed to create local db directory");
+            let latest_private_registry =
+                match db::registry_history::latest_successful_private_registry(&pool).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to query private registry history during startup"
+                        );
                         drop(log_guard);
                         std::process::exit(1);
                     }
+                };
+
+            let registry_source = match (
+                private_registry_artifact.filter(|artifact| !artifact.is_empty()),
+                latest_private_registry,
+            ) {
+                (Some(artifact), Some(row)) => {
+                    let payload_sha256 = registry_artifact::artifact_sha256(&artifact);
+                    if row.payload_sha256 != payload_sha256 {
+                        tracing::error!(
+                            expected_payload_sha256 = %row.payload_sha256,
+                            actual_payload_sha256 = %payload_sha256,
+                            path = %registry_artifact_store.path().display(),
+                            "private registry artifact does not match latest successful history"
+                        );
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+
+                    tracing::info!(
+                        path = %registry_artifact_store.path().display(),
+                        "loaded private registry artifact from file"
+                    );
+                    artifact
+                }
+                (Some(artifact), None) => {
+                    let payload_sha256 = registry_artifact::artifact_sha256(&artifact);
+                    tracing::error!(
+                        payload_sha256 = %payload_sha256,
+                        path = %registry_artifact_store.path().display(),
+                        "private registry artifact exists but no successful history row was found"
+                    );
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+                (None, Some(_)) => {
+                    tracing::error!(
+                        path = %registry_artifact_store.path().display(),
+                        "private registry history exists but artifact file is missing"
+                    );
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+                (None, None) => {
+                    if cfg.registry_url.is_empty() {
+                        tracing::error!(
+                            "private registry artifact not present and registry_url not set in config file"
+                        );
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                    tracing::info!("loaded public registry URL from config");
+                    cfg.registry_url
+                }
+            };
+
+            let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
+            if let Some(parent) = local_db_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::error!(error = %e, path = %parent.display(), "failed to create local db directory");
+                    drop(log_guard);
+                    std::process::exit(1);
                 }
             }
 
             let raindex_config = match raindex::RaindexProvider::load(
-                &registry_url,
+                &registry_source,
                 Some(local_db_path),
             )
             .await
             {
                 Ok(config) => {
-                    tracing::info!(registry_url = %registry_url, "raindex registry loaded");
+                    tracing::info!("raindex registry loaded");
                     config
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, registry_url = %registry_url, "failed to load raindex registry");
+                    tracing::error!(error = %e.safe_summary(), "failed to load raindex registry");
                     drop(log_guard);
                     std::process::exit(1);
                 }
@@ -266,7 +327,13 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let rocket = match rocket(pool, rate_limiter, shared_raindex, cfg.docs_dir) {
+            let rocket = match rocket(
+                pool,
+                rate_limiter,
+                shared_raindex,
+                registry_artifact_store,
+                cfg.docs_dir,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Rocket instance");

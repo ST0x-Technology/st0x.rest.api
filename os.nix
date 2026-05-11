@@ -9,7 +9,7 @@ let
   mkService = name: cfg:
     let
       path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
-      configFile = ./config/${name}.toml;
+      configFile = ./config/prod.toml;
     in {
       description = "st0x ${cfg.bin} (${name})";
 
@@ -24,8 +24,8 @@ let
       };
 
       serviceConfig = {
-        DynamicUser = true;
-        SupplementaryGroups = [ "st0x" ];
+        User = "st0x-rest-api";
+        Group = "st0x";
         ExecStart = "${path} serve --config ${configFile}";
         Restart = "always";
         RestartSec = 5;
@@ -117,8 +117,8 @@ in {
           add_header X-Frame-Options "DENY" always;
           add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-          # Limit request body size (API payloads are small)
-          client_max_body_size 1m;
+          # Allow private registry artifact uploads while keeping request bodies bounded.
+          client_max_body_size 5m;
         '';
 
         # Block common exploit scanners (PHP, Docker, ThinkPHP, etc.)
@@ -176,6 +176,10 @@ in {
   };
 
   users.groups.st0x = { };
+  users.users."st0x-rest-api" = {
+    isSystemUser = true;
+    group = "st0x";
+  };
   programs.bash.interactiveShellInit = "set -o vi";
 
   services.logrotate = {
