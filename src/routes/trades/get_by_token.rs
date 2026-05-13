@@ -7,30 +7,30 @@ use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedAddress;
 use crate::types::trades::{TradesByAddressResponse, TradesPaginationParams};
 use alloy::primitives::Address;
-use rain_orderbook_common::raindex_client::types::PaginationParams;
 use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/{address}",
+    path = "/v1/trades/token/{address}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
-        ("address" = String, Path, description = "Owner address"),
+        ("address" = String, Path, description = "Token address"),
         TradesPaginationParams,
     ),
     responses(
-        (status = 200, description = "Paginated list of trades", body = TradesByAddressResponse),
+        (status = 200, description = "Paginated list of trades for token", body = TradesByAddressResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 422, description = "Unprocessable entity", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/<address>?<params..>", rank = 2)]
-pub async fn get_trades_by_address(
+#[get("/token/<address>?<params..>")]
+pub async fn get_trades_by_token(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
@@ -44,28 +44,22 @@ pub async fn get_trades_by_address(
         let ds = RaindexTradesDataSource {
             client: raindex.client(),
         };
-        process_get_trades_by_address(&ds, address.0, params).await
+        process_get_trades_by_token(&ds, address.0, params).await
     }
     .instrument(span.0)
     .await
 }
 
-pub(super) async fn process_get_trades_by_address(
+pub(super) async fn process_get_trades_by_token(
     ds: &dyn TradesDataSource,
-    owner: Address,
+    token: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     let (page, page_size, sdk_page, sdk_page_size, time_filter) = trades_pagination_params(params)?;
 
+    tracing::info!(token = ?token, page, page_size, "querying trades by token");
     let result = ds
-        .get_trades_for_owner(
-            owner,
-            PaginationParams {
-                page: Some(sdk_page),
-                page_size: Some(sdk_page_size),
-            },
-            time_filter,
-        )
+        .get_trades_for_token(token, sdk_page, sdk_page_size, time_filter)
         .await?;
 
     build_trades_list_response(result, page, page_size)
@@ -75,16 +69,18 @@ pub(super) async fn process_get_trades_by_address(
 mod tests {
     use super::*;
     use crate::error::ApiError;
-    use crate::routes::order::test_fixtures::*;
-    use crate::test_helpers::TestClientBuilder;
+    use crate::routes::order::test_fixtures::{
+        mock_empty_trades_list_result, mock_trades_list_result,
+    };
+    use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use alloy::primitives::{address, B256};
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::trades::RaindexTradesListResult;
     use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
-    use rocket::http::Status;
+    use rocket::http::{Header, Status};
 
     struct MockTradesDataSource {
-        owner_result: Result<RaindexTradesListResult, ApiError>,
+        token_result: Result<RaindexTradesListResult, ApiError>,
     }
 
     #[async_trait]
@@ -102,10 +98,7 @@ mod tests {
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
         ) -> Result<RaindexTradesListResult, ApiError> {
-            match &self.owner_result {
-                Ok(r) => Ok(r.clone()),
-                Err(e) => Err(e.clone()),
-            }
+            unimplemented!()
         }
 
         async fn get_trades_for_token(
@@ -115,14 +108,17 @@ mod tests {
             _page_size: u16,
             _time_filter: TimeFilter,
         ) -> Result<RaindexTradesListResult, ApiError> {
-            unimplemented!()
+            match &self.token_result {
+                Ok(r) => Ok(r.clone()),
+                Err(e) => Err(e.clone()),
+            }
         }
     }
 
     #[rocket::async_test]
     async fn test_process_success() {
         let ds = MockTradesDataSource {
-            owner_result: Ok(mock_trades_list_result()),
+            token_result: Ok(mock_trades_list_result()),
         };
         let params = TradesPaginationParams {
             page: Some(1),
@@ -130,9 +126,9 @@ mod tests {
             start_time: None,
             end_time: None,
         };
-        let result = process_get_trades_by_address(
+        let result = process_get_trades_by_token(
             &ds,
-            address!("0000000000000000000000000000000000000001"),
+            address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             params,
         )
         .await
@@ -156,7 +152,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_no_trades() {
         let ds = MockTradesDataSource {
-            owner_result: Ok(mock_empty_trades_list_result()),
+            token_result: Ok(mock_empty_trades_list_result()),
         };
         let params = TradesPaginationParams {
             page: Some(1),
@@ -164,9 +160,9 @@ mod tests {
             start_time: None,
             end_time: None,
         };
-        let result = process_get_trades_by_address(
+        let result = process_get_trades_by_token(
             &ds,
-            address!("0000000000000000000000000000000000000001"),
+            address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             params,
         )
         .await
@@ -182,7 +178,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_query_failure() {
         let ds = MockTradesDataSource {
-            owner_result: Err(ApiError::Internal("subgraph error".into())),
+            token_result: Err(ApiError::Internal("subgraph error".into())),
         };
         let params = TradesPaginationParams {
             page: Some(1),
@@ -190,9 +186,9 @@ mod tests {
             start_time: None,
             end_time: None,
         };
-        let result = process_get_trades_by_address(
+        let result = process_get_trades_by_token(
             &ds,
-            address!("0000000000000000000000000000000000000001"),
+            address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             params,
         )
         .await;
@@ -203,9 +199,22 @@ mod tests {
     async fn test_401_without_auth() {
         let client = TestClientBuilder::new().build().await;
         let response = client
-            .get("/v1/trades/0x0000000000000000000000000000000000000001")
+            .get("/v1/trades/token/0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_invalid_address_returns_422() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/trades/token/not-an-address")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 }

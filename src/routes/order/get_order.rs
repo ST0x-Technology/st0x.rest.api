@@ -69,8 +69,12 @@ async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<Order
 
 fn determine_order_type(order: &RaindexOrder) -> OrderType {
     for meta in order.parsed_meta() {
-        if let ParsedMeta::DotrainGuiStateV1(gui_state) = meta {
-            if gui_state.selected_deployment.to_lowercase().contains("dca") {
+        if let ParsedMeta::OrderBuilderStateV1(builder_state) = meta {
+            if builder_state
+                .selected_deployment
+                .to_lowercase()
+                .contains("dca")
+            {
                 return OrderType::Dca;
             }
         }
