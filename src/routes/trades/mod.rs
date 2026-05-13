@@ -1,4 +1,5 @@
 pub(crate) mod get_by_address;
+pub(crate) mod get_by_order_hashes;
 pub(crate) mod get_by_taker;
 pub(crate) mod get_by_token;
 pub(crate) mod get_by_tx;
@@ -11,7 +12,8 @@ use crate::types::trades::{
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::trades::{
-    GetTradesFilters, GetTradesTokenFilter, RaindexTrade, RaindexTradesListResult,
+    GetTradesByOrderHashesFilters, GetTradesFilters, GetTradesTokenFilter, OrderHashes,
+    RaindexTrade, RaindexTradesByOrderHashResult, RaindexTradesListResult,
 };
 use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
@@ -44,6 +46,12 @@ pub(crate) trait TradesDataSource: Send + Sync {
         page_size: u16,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
+
+    async fn get_trades_by_order_hashes(
+        &self,
+        order_hashes: Vec<B256>,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError>;
 }
 
 pub(crate) struct RaindexTradesDataSource<'a> {
@@ -127,6 +135,25 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for taker");
+                ApiError::Internal("failed to query trades".into())
+            })
+    }
+
+    async fn get_trades_by_order_hashes(
+        &self,
+        order_hashes: Vec<B256>,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
+        let filters = GetTradesByOrderHashesFilters {
+            time_filter: Some(time_filter),
+            ..Default::default()
+        };
+
+        self.client
+            .get_trades_by_order_hashes(None, OrderHashes(order_hashes), Some(filters))
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to query trades by order hashes");
                 ApiError::Internal("failed to query trades".into())
             })
     }
@@ -223,6 +250,7 @@ pub(super) fn trades_pagination_params(
 pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_trades_by_tx,
+        get_by_order_hashes::get_trades_by_order_hashes,
         get_by_token::get_trades_by_token,
         get_by_taker::get_trades_by_taker,
         get_by_address::get_trades_by_address

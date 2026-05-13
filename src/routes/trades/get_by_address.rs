@@ -127,6 +127,17 @@ mod tests {
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
         }
+
+        async fn get_trades_by_order_hashes(
+            &self,
+            _order_hashes: Vec<B256>,
+            _time_filter: TimeFilter,
+        ) -> Result<
+            rain_orderbook_common::raindex_client::trades::RaindexTradesByOrderHashResult,
+            ApiError,
+        > {
+            unimplemented!()
+        }
     }
 
     #[rocket::async_test]

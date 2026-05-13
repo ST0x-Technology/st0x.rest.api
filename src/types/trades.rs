@@ -1,5 +1,5 @@
 use crate::types::common::TokenRef;
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, FixedBytes, B256};
 use rocket::form::FromForm;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -61,6 +61,36 @@ pub struct TradesPagination {
 pub struct TradesByAddressResponse {
     pub trades: Vec<TradeByAddress>,
     pub pagination: TradesPagination,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TradesByOrderHashesRequest {
+    #[schema(
+        value_type = Vec<String>,
+        example = json!(["0x000000000000000000000000000000000000000000000000000000000000abcd"])
+    )]
+    pub order_hashes: Vec<String>,
+    #[schema(example = 1718452800)]
+    pub start_time: Option<u64>,
+    #[schema(example = 1718539200)]
+    pub end_time: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TradesByOrderHashEntry {
+    #[schema(value_type = String, example = "0x000000000000000000000000000000000000000000000000000000000000abcd")]
+    pub order_hash: B256,
+    pub trades: Vec<TradeByAddress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TradesByOrderHashesResponse {
+    pub trades_by_order_hash: Vec<TradesByOrderHashEntry>,
+    #[schema(example = 3)]
+    pub total_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
