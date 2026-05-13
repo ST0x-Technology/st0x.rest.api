@@ -8,6 +8,7 @@ use rocket::serde::json::Json;
 use rocket::{Route, State};
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 use tracing::Instrument;
 
 #[derive(Debug, Serialize)]
@@ -19,7 +20,7 @@ pub struct TokenResponse {
 }
 
 impl From<TokenCfg> for TokenResponse {
-    fn from(token: TokenCfg) -> Self {
+    fn from(mut token: TokenCfg) -> Self {
         let name = token.label.clone();
         let isin = token
             .extensions
@@ -32,8 +33,18 @@ impl From<TokenCfg> for TokenResponse {
                     .and_then(|extensions| extract_extension_string(extensions, "ISIN"))
             });
 
+        token.network = Arc::new(sanitize_network(token.network.as_ref()));
+
         Self { token, name, isin }
     }
+}
+
+fn sanitize_network(
+    network: &rain_orderbook_app_settings::network::NetworkCfg,
+) -> rain_orderbook_app_settings::network::NetworkCfg {
+    let mut network = network.clone();
+    network.rpcs.clear();
+    network
 }
 
 fn extract_extension_string(
@@ -176,6 +187,68 @@ tokens:
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         let tokens = body.as_array().expect("tokens is an array");
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_clears_network_rpcs() {
+        let private_rpc = "https://private-rpc.example.com/secret-token";
+        let settings = format!(
+            r#"version: 5
+networks:
+  base:
+    rpcs:
+      - {private_rpc}
+    chain-id: 8453
+    currency: ETH
+subgraphs:
+  base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
+orderbooks:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+tokens:
+  usdc:
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    network: base
+    decimals: 6
+    label: USD Coin
+    symbol: USDC
+"#
+        );
+        let registry_url =
+            crate::test_helpers::mock_raindex_registry_url_with_settings(&settings).await;
+        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
+            .await
+            .expect("load raindex config");
+        let client = TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v1/tokens")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let response_body = response.into_string().await.expect("response body");
+        assert!(!response_body.contains(private_rpc));
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response_body).expect("response is json");
+        let tokens = body.as_array().expect("tokens is an array");
+        let rpcs = tokens[0]["network"]["rpcs"]
+            .as_array()
+            .expect("network rpcs is an array");
+        assert!(rpcs.is_empty());
     }
 
     #[rocket::async_test]
