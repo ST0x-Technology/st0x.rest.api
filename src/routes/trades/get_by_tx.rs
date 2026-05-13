@@ -163,6 +163,16 @@ mod tests {
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
         }
+
+        async fn get_trades_for_taker(
+            &self,
+            _taker: Address,
+            _page: u16,
+            _page_size: u16,
+            _time_filter: TimeFilter,
+        ) -> Result<RaindexTradesListResult, ApiError> {
+            unimplemented!()
+        }
     }
 
     #[rocket::async_test]

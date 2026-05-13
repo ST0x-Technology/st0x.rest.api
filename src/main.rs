@@ -68,6 +68,7 @@ enum StartupError {
         routes::admin::put_registry,
         routes::trades::get_by_tx::get_trades_by_tx,
         routes::trades::get_by_token::get_trades_by_token,
+        routes::trades::get_by_taker::get_trades_by_taker,
         routes::trades::get_by_address::get_trades_by_address,
         routes::registry::get_registry,
         routes::registry::get_registry_history,

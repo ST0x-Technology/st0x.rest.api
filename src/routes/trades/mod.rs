@@ -1,4 +1,5 @@
 pub(crate) mod get_by_address;
+pub(crate) mod get_by_taker;
 pub(crate) mod get_by_token;
 pub(crate) mod get_by_tx;
 
@@ -20,15 +21,25 @@ use rocket::Route;
 #[async_trait]
 pub(crate) trait TradesDataSource: Send + Sync {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError>;
+
     async fn get_trades_for_owner(
         &self,
         owner: Address,
         pagination: PaginationParams,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
+
     async fn get_trades_for_token(
         &self,
         token: Address,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError>;
+
+    async fn get_trades_for_taker(
+        &self,
+        taker: Address,
         page: u16,
         page_size: u16,
         time_filter: TimeFilter,
@@ -94,6 +105,28 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for token");
+                ApiError::Internal("failed to query trades".into())
+            })
+    }
+
+    async fn get_trades_for_taker(
+        &self,
+        taker: Address,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let filters = GetTradesFilters {
+            takers: vec![taker],
+            time_filter: Some(time_filter),
+            ..Default::default()
+        };
+
+        self.client
+            .get_trades(None, Some(filters), Some(page), Some(page_size))
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to query trades for taker");
                 ApiError::Internal("failed to query trades".into())
             })
     }
@@ -191,6 +224,7 @@ pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_trades_by_tx,
         get_by_token::get_trades_by_token,
+        get_by_taker::get_trades_by_taker,
         get_by_address::get_trades_by_address
     ]
 }
