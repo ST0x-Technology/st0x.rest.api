@@ -60,7 +60,11 @@ let
     deploy_env="''${DEPLOY_ENV:-prod}"
     case "$deploy_env" in
       prod)
-        host_ip=$(jq -r '.outputs.reserved_ip.value' ${tfState})
+        host_ip=$(jq -r '.outputs.reserved_ip.value // empty' ${tfState})
+        if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
+          echo "prod infrastructure is not present in Terraform state" >&2
+          exit 1
+        fi
         ;;
       preview)
         host_ip=$(jq -r '.outputs.preview_reserved_ip.value // empty' ${tfState})

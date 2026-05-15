@@ -273,7 +273,11 @@ After deploy, wait for `/health/detailed` to report a ready raindex state before
 running performance checks:
 
 ```bash
-API_URL=https://api.preview.st0x.io API_KEY=... API_SECRET=... ./scripts/smoke.sh
+export API_URL=https://api.preview.st0x.io
+read -r -p "API_KEY: " API_KEY && export API_KEY
+read -r -s -p "API_SECRET: " API_SECRET && export API_SECRET
+printf "\n"
+./scripts/smoke.sh
 ```
 
 Because the preview app DB is reset on preview service deploys, create a fresh

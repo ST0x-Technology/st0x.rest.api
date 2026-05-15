@@ -76,6 +76,10 @@ jobs:
       - name: Resolve preview host IP
         run: |
           host_ip=$(nix run .#resolvePreviewIp)
+          if [[ ! "$host_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Invalid preview host IP resolved: $host_ip" >&2
+            exit 1
+          fi
           echo "::add-mask::$host_ip"
           echo "HOST_IP=$host_ip" >> "$GITHUB_ENV"
 
@@ -86,18 +90,23 @@ jobs:
         env:
           PREVIEW_SSH_HOST_KEY: ${{ secrets.PREVIEW_SSH_HOST_KEY }}
         run: |
+          # Prefer PREVIEW_SSH_HOST_KEY. ssh-keyscan is a first-bootstrap fallback
+          # that trusts the presented host key before writing known_hosts.
           if [ -n "$PREVIEW_SSH_HOST_KEY" ]; then
             echo "$HOST_IP $PREVIEW_SSH_HOST_KEY" > ~/.ssh/known_hosts
           else
             ssh-keyscan -H "$HOST_IP" > ~/.ssh/known_hosts
           fi
 
+      # Prepare local build artifacts used by deploy-rs.
       - run: ./prep.sh
 
       - name: Deploy preview service
         if: (inputs.deploy_scope || 'all') == 'service'
+        timeout-minutes: 30
         run: nix run .#deployPreviewService
 
       - name: Deploy preview system and service
         if: (inputs.deploy_scope || 'all') == 'all'
+        timeout-minutes: 60
         run: nix run .#deployPreviewAll
