@@ -1,9 +1,6 @@
 name: Deploy Preview
 
 on:
-  push:
-    branches:
-      - feature/rai-581-preview-api-infrastructure
   workflow_dispatch:
     inputs:
       ref:
@@ -29,7 +26,6 @@ permissions:
 
 jobs:
   deploy-preview:
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'chore: update preview terraform state')
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
