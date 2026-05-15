@@ -2,3 +2,6 @@
 # NEVER commit terraform.tfvars — it contains secrets.
 
 do_token = ""
+
+# Set to true to provision the reusable preview API host and volume.
+preview_enabled = false

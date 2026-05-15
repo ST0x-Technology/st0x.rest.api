@@ -18,18 +18,39 @@
 
   outputs = { self, flake-utils, rainix, ragenix, deploy-rs, disko
     , nixos-anywhere, crane, ... }:
-    {
-      nixosConfigurations.st0x-rest-api =
+    let
+      mkNixosConfiguration = st0xEnv:
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
 
           specialArgs = {
+            inherit st0xEnv;
             docsRoot = self.packages.x86_64-linux.st0x-docs;
           };
 
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
+    in
+    {
+      nixosConfigurations.st0x-rest-api-prod = mkNixosConfiguration {
+        name = "prod";
+        virtualHost = "api.st0x.io";
+        configFile = ./config/prod.toml;
+        dataDir = "/mnt/data/st0x-rest-api";
+        dataVolumeName = "st0x-rest-api-data";
+      };
+
+      nixosConfigurations.st0x-rest-api-preview = mkNixosConfiguration {
+        name = "preview";
+        virtualHost = "api.preview.st0x.io";
+        configFile = ./config/preview.toml;
+        dataDir = "/mnt/data/st0x-rest-api-preview";
+        dataVolumeName = "st0x-rest-api-preview-data";
+      };
+
+      nixosConfigurations.st0x-rest-api =
+        self.nixosConfigurations.st0x-rest-api-prod;
 
       deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
 
@@ -99,9 +120,18 @@
               ++ [ nixos-anywhere.packages.${system}.default ];
             body = ''
               ${infraPkgs.resolveIp}
+              deploy_env="''${DEPLOY_ENV:-prod}"
+              case "$deploy_env" in
+                prod) nixos_config="st0x-rest-api-prod" ;;
+                preview) nixos_config="st0x-rest-api-preview" ;;
+                *)
+                  echo "unsupported DEPLOY_ENV '$deploy_env' (expected prod or preview)" >&2
+                  exit 1
+                  ;;
+              esac
               ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
 
-              nixos-anywhere --flake ".#st0x-rest-api" \
+              nixos-anywhere --flake ".#$nixos_config" \
                 --option pure-eval false \
                 --ssh-option "IdentityFile=$identity" \
                 --target-host "root@$host_ip" "$@"
@@ -129,11 +159,19 @@
                 exit 1
               fi
 
-              ${pkgs.gnused}/bin/sed -i \
-                '/host =/{n;s|"ssh-ed25519 [A-Za-z0-9+/=]*"|"'"$new_key"'"|;}' \
-                keys.nix
+              if [ "$deploy_env" = "prod" ]; then
+                ${pkgs.gnused}/bin/sed -i \
+                  '/host =/{n;s|"ssh-ed25519 [A-Za-z0-9+/=]*"|"'"$new_key"'"|;}' \
+                  keys.nix
 
-              echo "Updated host key in keys.nix"
+                echo "Updated host key in keys.nix"
+              else
+                echo "Preview SSH host key:"
+                echo "$new_key"
+                echo
+                echo "Optional GitHub secret PREVIEW_SSH_HOST_KEY value:"
+                echo "$new_key"
+              fi
             '';
           };
 
@@ -152,12 +190,77 @@
             '';
           };
 
+          resolvePreviewIp = pkgs.writeShellApplication {
+            name = "resolve-preview-ip";
+            runtimeInputs = infraPkgs.buildInputs;
+            text = ''
+              export DEPLOY_ENV=preview
+              ${infraPkgs.resolveIp}
+              echo "$host_ip"
+            '';
+          };
+
           remote = pkgs.writeShellApplication {
             name = "remote";
             runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
             text = ''
               ${infraPkgs.resolveIp}
               exec ssh -i "$identity" "root@$host_ip" "$@"
+            '';
+          };
+
+          remotePreview = pkgs.writeShellApplication {
+            name = "remote-preview";
+            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
+            text = ''
+              export DEPLOY_ENV=preview
+              ${infraPkgs.resolveIp}
+              exec ssh -i "$identity" "root@$host_ip" "$@"
+            '';
+          };
+
+          previewCreateApiKey = pkgs.writeShellApplication {
+            name = "preview-create-api-key";
+            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
+            text = ''
+              usage() {
+                echo "usage: preview-create-api-key <label> <owner> [--admin]" >&2
+              }
+
+              label="''${1:-}"
+              owner="''${2:-}"
+              admin="''${3:-}"
+
+              if [ -z "$label" ] || [ -z "$owner" ]; then
+                usage
+                exit 1
+              fi
+
+              if [ -n "$admin" ] && [ "$admin" != "--admin" ]; then
+                usage
+                exit 1
+              fi
+
+              export DEPLOY_ENV=preview
+              ${infraPkgs.resolveIp}
+
+              remote_cmd=(
+                /nix/var/nix/profiles/per-service/rest-api/bin/st0x_rest_api
+                keys
+                --config
+                /etc/st0x-rest-api/config.toml
+                create
+                --label
+                "$label"
+                --owner
+                "$owner"
+              )
+
+              if [ "$admin" = "--admin" ]; then
+                remote_cmd+=(--admin)
+              fi
+
+              exec ssh -i "$identity" "root@$host_ip" "''${remote_cmd[@]}"
             '';
           };
 
@@ -179,10 +282,17 @@
               ragenix.packages.${system}.default
               packages.rs-test
               packages.prepSolArtifacts
+              packages.resolveIp
               packages.remote
+              packages.remotePreview
+              packages.previewCreateApiKey
+              packages.resolvePreviewIp
               packages.deployNixos
               packages.deployService
               packages.deployAll
+              packages.deployPreviewNixos
+              packages.deployPreviewService
+              packages.deployPreviewAll
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });

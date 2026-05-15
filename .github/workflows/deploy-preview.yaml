@@ -1,0 +1,107 @@
+name: Deploy Preview
+
+on:
+  push:
+    branches:
+      - feature/rai-581-preview-api-infrastructure
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to deploy to preview"
+        required: true
+        default: "main"
+      deploy_scope:
+        description: "Deploy scope"
+        required: true
+        type: choice
+        default: "service"
+        options:
+          - service
+          - all
+
+concurrency:
+  group: deploy-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  deploy-preview:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'chore: update preview terraform state')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+            sandbox = false
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Provision preview infrastructure
+        run: |
+          nix run .#tfPlan -- -var preview_enabled=true
+          nix run .#tfApply
+          nix run .#tfRekey
+
+      - name: Commit encrypted Terraform state
+        run: |
+          git add infra/terraform.tfstate.age infra/terraform.tfvars.age keys.nix
+          if git diff --cached --quiet; then
+            echo "No encrypted infra changes to commit"
+          else
+            git commit -m "chore: update preview terraform state"
+            git push
+          fi
+
+      - name: Resolve preview host IP
+        run: |
+          host_ip=$(nix run .#resolvePreviewIp)
+          echo "::add-mask::$host_ip"
+          echo "HOST_IP=$host_ip" >> "$GITHUB_ENV"
+
+      - name: Bootstrap preview host
+        run: DEPLOY_ENV=preview nix run .#bootstrap
+
+      - name: Trust preview host key
+        env:
+          PREVIEW_SSH_HOST_KEY: ${{ secrets.PREVIEW_SSH_HOST_KEY }}
+        run: |
+          if [ -n "$PREVIEW_SSH_HOST_KEY" ]; then
+            echo "$HOST_IP $PREVIEW_SSH_HOST_KEY" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$HOST_IP" > ~/.ssh/known_hosts
+          fi
+
+      - run: ./prep.sh
+
+      - name: Deploy preview service
+        if: (inputs.deploy_scope || 'all') == 'service'
+        run: nix run .#deployPreviewService
+
+      - name: Deploy preview system and service
+        if: (inputs.deploy_scope || 'all') == 'all'
+        run: nix run .#deployPreviewAll

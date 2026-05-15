@@ -57,7 +57,23 @@ let
     ${parseIdentity}
     trap 'rm -f ${tfState}' EXIT
     ${decryptState}
-    host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${tfState})
+    deploy_env="''${DEPLOY_ENV:-prod}"
+    case "$deploy_env" in
+      prod)
+        host_ip=$(jq -r '.outputs.reserved_ip.value' ${tfState})
+        ;;
+      preview)
+        host_ip=$(jq -r '.outputs.preview_reserved_ip.value // empty' ${tfState})
+        if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
+          echo "preview infrastructure is not present in Terraform state" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "unsupported DEPLOY_ENV '$deploy_env' (expected prod or preview)" >&2
+        exit 1
+        ;;
+    esac
     rm -f ${tfState}
   '';
 

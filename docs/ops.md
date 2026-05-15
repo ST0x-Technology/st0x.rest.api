@@ -1,6 +1,6 @@
 # Operations cheat sheet
 
-Quick journalctl + curl recipes for the deployed `rest-api` service. SSH in with `nix develop -c remote` (or `ssh root@<host>` if your key is in `roles.ssh`).
+Quick journalctl + curl recipes for the deployed `rest-api` service. SSH into production with `nix develop -c remote` and into preview with `nix develop -c remote-preview` (or `ssh root@<host>` if your key is in `roles.ssh`).
 
 ## Service health
 
@@ -20,7 +20,7 @@ Key fields in `/health/detailed.cache_warmer`:
 
 ## Common journalctl queries
 
-All queries run via `ssh root@api.preview.st0x.io '...'` or after `nix develop -c remote`.
+All preview queries run via `ssh root@api.preview.st0x.io '...'` or after `nix develop -c remote-preview`.
 
 ### 429 rate
 

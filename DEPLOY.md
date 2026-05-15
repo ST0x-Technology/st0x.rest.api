@@ -222,9 +222,105 @@ systemctl cat rest-api
 nix develop -c deploy-service rest-api
 ```
 
+### Deploy a branch to preview
+
+Preview is a separate reusable machine and volume. It is intended for testing
+branch builds under production-like conditions without touching production data
+or services.
+
+Provision preview by setting `preview_enabled = true` in the encrypted Terraform
+vars, then plan/apply:
+
+```bash
+nix develop -c tf-edit-vars
+nix develop -c tf-plan
+nix develop -c tf-apply
+```
+
+Bootstrap preview after the host exists:
+
+```bash
+DEPLOY_ENV=preview nix develop -c bootstrap
+```
+
+Point `api.preview.st0x.io` at the preview reserved IP:
+
+```bash
+nix develop -c resolve-preview-ip
+```
+
+Deploy the checked-out branch to preview:
+
+```bash
+nix develop -c deploy-preview-all
+```
+
+For service-only branch deploys after the preview system is already configured:
+
+```bash
+nix develop -c deploy-preview-service
+```
+
+Preview service deploys intentionally reset local preview state before restart:
+
+- stop `rest-api`
+- remove `/mnt/data/st0x-rest-api-preview/st0x.db`
+- remove `/mnt/data/st0x-rest-api-preview/raindex.db`
+- preserve `/mnt/data/st0x-rest-api-preview/private-registry.data`
+- restart `rest-api` from the branch build
+
+After deploy, wait for `/health/detailed` to report a ready raindex state before
+running performance checks:
+
+```bash
+API_URL=https://api.preview.st0x.io API_KEY=... API_SECRET=... ./scripts/smoke.sh
+```
+
+Because the preview app DB is reset on preview service deploys, create a fresh
+preview API key after deploy when you need to run authenticated checks:
+
+```bash
+nix develop -c preview-create-api-key "preview-benchmark" "arda@st0x.io"
+```
+
+The command runs only against the preview host and prints the new key ID and
+secret in the terminal. Add `--admin` if the preview key needs admin access:
+
+```bash
+nix develop -c preview-create-api-key "preview-admin" "arda@st0x.io" --admin
+```
+
+### Deploy preview from GitHub
+
+The `Deploy Preview` GitHub Actions workflow exposes a manual
+`workflow_dispatch` button. It accepts:
+
+- `ref`: branch, tag, or SHA to deploy
+- `deploy_scope`: `service` for the API binary/profile only, or `all` for the
+  preview NixOS system plus service
+
+The workflow:
+
+- checks out the selected ref
+- resolves the preview reserved IP from Terraform state
+- deploys to the preview deploy-rs node
+- resets preview DB state as part of the preview service activation
+
+Required repository secrets:
+
+- `SSH_KEY`: private key allowed to SSH to the preview host
+- `PREVIEW_SSH_HOST_KEY`: optional but recommended SSH host public key for the
+  preview machine. If it is absent, the workflow falls back to `ssh-keyscan` for
+  the preview host.
+
 ### SSH into the server
 ```bash
 nix develop -c remote
+```
+
+### SSH into preview
+```bash
+nix develop -c remote-preview
 ```
 
 ### View service logs
