@@ -83,8 +83,14 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         pagination: PaginationParams,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
+        let filters = GetTradesFilters {
+            owners: vec![owner],
+            time_filter: Some(time_filter),
+            ..Default::default()
+        };
+
         self.client
-            .get_trades_for_owner(None, None, owner, pagination, time_filter)
+            .get_trades(None, Some(filters), pagination.page, pagination.page_size)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for owner");
