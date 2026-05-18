@@ -260,7 +260,8 @@
                 remote_cmd+=(--admin)
               fi
 
-              exec ssh -i "$identity" "root@$host_ip" "''${remote_cmd[@]}"
+              printf -v remote_cmd_escaped '%q ' "''${remote_cmd[@]}"
+              exec ssh -i "$identity" "root@$host_ip" "''${remote_cmd_escaped% }"
             '';
           };
 

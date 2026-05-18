@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag, or SHA to deploy to preview"
+        description: "Branch to deploy to preview"
         required: true
         default: "main"
       deploy_scope:
@@ -36,6 +36,22 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           submodules: recursive
           fetch-depth: 0
+
+      - name: Verify deploy branch
+        run: |
+          deploy_branch="${{ inputs.ref }}"
+          deploy_branch="${deploy_branch#refs/heads/}"
+          if [ -z "$deploy_branch" ] || [[ "$deploy_branch" == refs/* ]]; then
+            echo "Deploy Preview requires a branch ref, got '${{ inputs.ref }}'" >&2
+            exit 1
+          fi
+          if ! git ls-remote --exit-code --heads origin "$deploy_branch" >/dev/null; then
+            echo "Deploy Preview requires an existing remote branch, got '${{ inputs.ref }}'" >&2
+            exit 1
+          fi
+          git fetch origin "refs/heads/$deploy_branch:refs/remotes/origin/$deploy_branch"
+          git checkout -B "$deploy_branch" "origin/$deploy_branch"
+          echo "DEPLOY_BRANCH=$deploy_branch" >> "$GITHUB_ENV"
 
       - name: Configure Git author
         run: |
@@ -70,7 +86,7 @@ jobs:
             echo "No encrypted infra changes to commit"
           else
             git commit -m "chore: update preview terraform state"
-            git push
+            git push origin "HEAD:$DEPLOY_BRANCH"
           fi
 
       - name: Resolve preview host IP
