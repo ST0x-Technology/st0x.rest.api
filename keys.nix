@@ -14,7 +14,7 @@ rec {
   };
 
   roles = with keys; {
-    infra = [ st0x-op ci sid alastair ];
+    infra = [ st0x-op ci arda sid alastair ];
     ssh = [ st0x-op ci arda sid alastair ];
   };
 }

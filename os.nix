@@ -1,7 +1,15 @@
-{ pkgs, lib, modulesPath, docsRoot, ... }:
+{ pkgs, lib, modulesPath, docsRoot, st0xEnv ? { }, ... }:
 
 let
   inherit (import ./keys.nix) roles;
+
+  env = {
+    name = "prod";
+    virtualHost = "api.st0x.io";
+    configFile = ./config/prod.toml;
+    dataDir = "/mnt/data/st0x-rest-api";
+    dataVolumeName = "st0x-rest-api-data";
+  } // st0xEnv;
 
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
@@ -9,9 +17,8 @@ let
   mkService = name: cfg:
     let
       path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
-      configFile = ./config/prod.toml;
     in {
-      description = "st0x ${cfg.bin} (${name})";
+      description = "st0x ${cfg.bin} (${env.name}/${name})";
 
       wantedBy = [ ];
 
@@ -26,7 +33,7 @@ let
       serviceConfig = {
         User = "st0x-rest-api";
         Group = "st0x";
-        ExecStart = "${path} serve --config ${configFile}";
+        ExecStart = "${path} serve --config /etc/st0x-rest-api/config.toml";
         Restart = "always";
         RestartSec = 5;
         ReadWritePaths = [ "/mnt/data" ];
@@ -107,7 +114,7 @@ in {
         limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
       '';
 
-      virtualHosts."api.st0x.io" = {
+      virtualHosts.${env.virtualHost} = {
         enableACME = true;
         forceSSL = true;
 
@@ -157,7 +164,7 @@ in {
   };
 
   fileSystems."/mnt/data" = {
-    device = "/dev/disk/by-id/scsi-0DO_Volume_st0x-rest-api-data";
+    device = "/dev/disk/by-id/scsi-0DO_Volume_${env.dataVolumeName}";
     fsType = "ext4";
   };
 
@@ -182,9 +189,11 @@ in {
   };
   programs.bash.interactiveShellInit = "set -o vi";
 
+  environment.etc."st0x-rest-api/config.toml".source = env.configFile;
+
   services.logrotate = {
     enable = true;
-    settings."/mnt/data/st0x-rest-api/logs/*.log" = {
+    settings."${env.dataDir}/logs/*.log" = {
       su = "root st0x";
       rotate = 14;
       weekly = true;
@@ -195,8 +204,8 @@ in {
   };
 
   systemd.tmpfiles.rules = [
-    "d /mnt/data/st0x-rest-api 0775 root st0x -"
-    "d /mnt/data/st0x-rest-api/logs 0775 root st0x -"
+    "d ${env.dataDir} 0775 root st0x -"
+    "d ${env.dataDir}/logs 0775 root st0x -"
   ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
