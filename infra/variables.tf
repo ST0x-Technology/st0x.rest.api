@@ -27,3 +27,21 @@ variable "volume_size_gb" {
   type        = number
   default     = 5
 }
+
+variable "preview_enabled" {
+  description = "Whether to provision the reusable preview droplet, volume, and reserved IP"
+  type        = bool
+  default     = false
+}
+
+variable "preview_droplet_size" {
+  description = "Droplet size slug for the preview environment"
+  type        = string
+  default     = "s-2vcpu-4gb"
+}
+
+variable "preview_volume_size_gb" {
+  description = "Block storage volume size in GB for the preview environment"
+  type        = number
+  default     = 5
+}
