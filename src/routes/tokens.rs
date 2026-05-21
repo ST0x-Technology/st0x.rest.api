@@ -10,12 +10,58 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::Instrument;
+use utoipa::ToSchema;
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     #[serde(flatten)]
     token: TokenCfg,
     name: Option<String>,
+    isin: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct TokenNetworkResponseSchema {
+    /// Network identifier from the registry settings.
+    key: String,
+    /// RPC URLs are intentionally stripped from public token responses.
+    rpcs: Vec<String>,
+    /// EVM chain ID.
+    chain_id: u32,
+    /// Human-readable network label, when configured.
+    label: Option<String>,
+    /// Optional network ID from the registry settings.
+    network_id: Option<u32>,
+    /// Native currency symbol.
+    currency: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+struct TokenResponseSchema {
+    /// Token key from the registry settings.
+    key: String,
+    /// Sanitized network metadata for the token.
+    network: TokenNetworkResponseSchema,
+    /// Token contract address.
+    address: String,
+    /// Token decimals, when known.
+    decimals: Option<u8>,
+    /// Human-readable token label.
+    label: Option<String>,
+    /// Token symbol.
+    symbol: Option<String>,
+    /// Token logo URI, when available.
+    logo_uri: Option<String>,
+    /// Token list metadata extensions, when available.
+    #[schema(value_type = Object)]
+    extensions: Option<Value>,
+    /// Convenience display name derived from the token label.
+    name: Option<String>,
+    /// ISIN identifier from token extensions, when available.
     isin: Option<String>,
 }
 
@@ -64,7 +110,34 @@ fn extract_extension_string(
     tag = "Tokens",
     security(("basicAuth" = [])),
     responses(
-        (status = 200, description = "List of supported tokens", body = Vec<serde_json::Value>),
+        (
+            status = 200,
+            description = "List of supported tokens",
+            body = Vec<TokenResponseSchema>,
+            example = json!([
+                {
+                    "key": "usdc",
+                    "network": {
+                        "key": "base",
+                        "rpcs": [],
+                        "chainId": 8453,
+                        "label": "Base",
+                        "networkId": null,
+                        "currency": "ETH"
+                    },
+                    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    "decimals": 6,
+                    "label": "USD Coin",
+                    "symbol": "USDC",
+                    "logo-uri": null,
+                    "extensions": {
+                        "isin": "US0000000001"
+                    },
+                    "name": "USD Coin",
+                    "isin": "US0000000001"
+                }
+            ])
+        ),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),

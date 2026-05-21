@@ -124,7 +124,7 @@ API_KEY="$SAVED_KEY"; API_SECRET="$SAVED_SECRET"
 
 # 3. Authenticated endpoints — only run if creds are set
 if [[ -n "$API_KEY" && -n "$API_SECRET" ]]; then
-    probe "GET /v1/tokens"                       GET "/v1/tokens" 200 '.tokens | type == "array"'
+    probe "GET /v1/tokens"                       GET "/v1/tokens" 200 'type == "array"'
     probe "GET /v1/orders/token/{usdc}"          GET "/v1/orders/token/$USDC_BASE" 200 '.orders | type == "array" and .pagination'
     probe "GET /v1/orders/owner/{owner}"         GET "/v1/orders/owner/$SAMPLE_OWNER" 200 '.orders | type == "array"'
     probe "GET /v1/trades/token/{usdc}"          GET "/v1/trades/token/$USDC_BASE?pageSize=10" 200 '.trades | type == "array"'
