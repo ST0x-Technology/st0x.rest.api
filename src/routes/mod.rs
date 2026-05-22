@@ -6,6 +6,7 @@ pub mod registry;
 pub mod swap;
 pub mod tokens;
 pub mod trades;
+pub mod trades_denomination;
 
 use crate::error::ApiError;
 use rain_orderbook_common::raindex_client::vaults::{RaindexVault, RaindexVaultType};

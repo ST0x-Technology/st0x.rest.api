@@ -23,6 +23,7 @@ curl "https://api.st0x.io/v1/trades/0xYourAddress?page=1&pageSize=20" \
 | `pageSize` | number | 20 | Results per page |
 | `startTime` | number | - | Filter: only trades after this Unix timestamp |
 | `endTime` | number | - | Filter: only trades before this Unix timestamp |
+| `denomination` | string | `wtstock` | Set to `tstock` to express amounts and IO ratios in underlying tStock units. See [Denomination toggle](#denomination-toggle). |
 
 ### Response
 
@@ -108,3 +109,72 @@ curl https://api.st0x.io/v1/trades/tx/0xTxHash... \
 ```
 
 The `totals` field aggregates across all trades in the transaction.
+
+## Denomination toggle
+
+All `/v1/trades/*` GET endpoints accept a `denomination` query parameter:
+
+| Value | Meaning |
+|-------|---------|
+| `wtstock` *(default)* | Amounts and IO ratios are returned exactly as recorded on chain — the wrapped (`wt*`) share token amounts. Backwards-compatible; preserves prior behavior. |
+| `tstock` | Wrapped-side amounts and IO ratios are scaled by the assets-per-share rate from the wrapped exchange rate snapshot ≤ each trade's block number, so amounts read in underlying tStock units. |
+
+When `denomination=tstock`:
+
+- For each trade, the API looks up the `wrapped_exchange_rate_snapshots`
+  row whose `block_number` is the greatest value ≤ the trade's block. If no
+  qualifying snapshot exists for a wrapped token, that side is left as-is
+  and `assetsPerShare` is omitted on that row.
+- Token addresses, symbols, and decimals in `inputToken`/`outputToken`
+  remain pointing at the wrapped share token. Callers should pair the
+  returned `assetsPerShare` (when present) with [`/v1/tokens/exchange-rates`](./tokens.md#wrapped-token-exchange-rates)
+  if they need underlying-asset metadata.
+- For `GET /v1/trades/tx/{tx_hash}` the per-trade `request.maximumIoRatio`
+  and `result.actualIoRatio` are recomputed in tStock terms, and the
+  response-level `totals` are recomputed against the adjusted amounts.
+
+### Example
+
+```bash
+curl "https://api.st0x.io/v1/trades/0xYourAddress?denomination=tstock" \
+  -H "Authorization: Basic <credentials>"
+```
+
+```json
+{
+  "trades": [
+    {
+      "txHash": "0x...",
+      "inputAmount": "10.4",
+      "outputAmount": "-50.0",
+      "inputToken": { "address": "0x...", "symbol": "wtMSTR", "decimals": 18 },
+      "outputToken": { "address": "0x...", "symbol": "USDC", "decimals": 6 },
+      "orderHash": "0xabc123...",
+      "timestamp": 1708010000,
+      "blockNumber": 12345678,
+      "denomination": "tstock",
+      "assetsPerShare": "1.04"
+    }
+  ]
+}
+```
+
+### Historical accuracy
+
+The conversion uses the *most recent* snapshot whose `block_number` is
+`≤ trade.block_number`. Snapshot cadence is currently best-effort:
+
+- Each call to `GET /v1/tokens/exchange-rates` refreshes any token whose
+  most recent snapshot is older than 24 hours and persists a new row.
+- During the stub-fetcher period, `block_number` is recorded as `0`, which
+  matches all trade blocks. Consequently, while the stub is in place the
+  tStock conversion uses whatever rate the operator has configured (or
+  `1.0` by default) for *every* historical trade. Once the subgraph/RPC
+  fetcher lands, snapshots will carry real block numbers and historical
+  rates will be applied per-trade.
+
+The same `denomination` toggle is accepted by `/v1/trades/tx/{tx_hash}`,
+`/v1/trades/token/{address}`, and `/v1/trades/taker/{address}`. The
+`POST /v1/trades/batch` endpoint currently returns amounts only in
+`wtstock` (no per-trade token metadata is exposed for conversion).
+

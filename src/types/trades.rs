@@ -1,8 +1,26 @@
 use crate::types::common::TokenRef;
 use alloy::primitives::{Address, FixedBytes};
-use rocket::form::FromForm;
+use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
+
+/// Denomination requested for the prices in the response. `Wtstock` (the
+/// default) returns trade amounts and IO ratios exactly as recorded on
+/// chain — the input/output sides settle in wrapped (`wt*`) share tokens.
+/// `Tstock` adjusts every wrapped-side amount by the assets-per-share rate
+/// at that trade's block, so the response reads in underlying tStock terms.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema, FromFormField,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Denomination {
+    /// Raw wtStock denomination (default — backwards compatible).
+    #[default]
+    Wtstock,
+    /// Adjusted to underlying tStock using the wrapped exchange rate at the
+    /// trade's block number.
+    Tstock,
+}
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -20,6 +38,11 @@ pub struct TradesPaginationParams {
     #[field(name = "endTime")]
     #[param(example = 1718539200)]
     pub end_time: Option<u64>,
+    /// `wtstock` (default) returns raw on-chain amounts. `tstock` adjusts
+    /// wrapped-side amounts and ratios by the assets-per-share rate that
+    /// was current at each trade's block.
+    #[field(name = "denomination")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -39,6 +62,18 @@ pub struct TradeByAddress {
     pub timestamp: u64,
     #[schema(example = 12345678)]
     pub block_number: u64,
+    /// Denomination applied to amounts in this row. Mirrors the
+    /// `denomination` query parameter — `wtstock` for raw on-chain amounts,
+    /// `tstock` for amounts adjusted by the wrapped exchange rate.
+    #[serde(default)]
+    pub denomination: Denomination,
+    /// Per-trade assets-per-share rate used to convert wrapped-side amounts
+    /// when `denomination == "tstock"`. Decimal string; `None` when the row
+    /// is in `wtstock` denomination or when no historical snapshot was
+    /// available for the wrapped tokens at the trade's block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.04", value_type = Option<String>)]
+    pub assets_per_share: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -96,6 +131,13 @@ pub struct TradeByTxEntry {
     pub order_owner: Address,
     pub request: TradeRequest,
     pub result: TradeResult,
+    /// Denomination applied to the request/result amounts. Mirrors the
+    /// `denomination` query parameter.
+    #[serde(default)]
+    pub denomination: Denomination,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.04", value_type = Option<String>)]
+    pub assets_per_share: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

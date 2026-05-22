@@ -49,9 +49,13 @@ impl TestClientBuilder {
                     Some(url) => url,
                     None => mock_raindex_registry_url().await,
                 };
-                crate::raindex::RaindexProvider::load(&registry_url, None, std::collections::HashMap::new())
-                    .await
-                    .expect("mock raindex config from registry url")
+                crate::raindex::RaindexProvider::load(
+                    &registry_url,
+                    None,
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .expect("mock raindex config from registry url")
             }
         };
 

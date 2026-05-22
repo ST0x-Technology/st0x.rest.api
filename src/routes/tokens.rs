@@ -1,14 +1,24 @@
 use crate::auth::AuthenticatedKey;
+use crate::db::wrapped_rates as db_rates;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
+use crate::types::common::TokenRef;
+use crate::wrapped_rates::{self, StubRateFetcher};
+use alloy::primitives::Address;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::Instrument;
+use utoipa::ToSchema;
+
+/// Caps how stale a snapshot may be before the endpoint forces a refresh.
+/// 24 hours matches the user's tolerance for rate-change infrequency.
+const EXCHANGE_RATE_MAX_AGE_SECS: i64 = 86_400;
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
@@ -86,8 +96,122 @@ pub async fn get_tokens(
     .await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeRateEntry {
+    /// The wrapped ERC4626 share token address.
+    pub share: TokenRef,
+    /// Underlying tStock asset metadata. When the registry doesn't include
+    /// `assetAddress`/`assetSymbol`/`assetDecimals` extensions for the
+    /// wrapped token, address is zero and symbol is a best-effort derivation
+    /// of the wrapped symbol (e.g. `wtMSTR` → `tMSTR`).
+    pub asset: TokenRef,
+    /// Decimal string. `1.0` means one wrapped share redeems for one
+    /// underlying tStock unit. Greater than `1.0` means the wrapper has
+    /// accumulated underlying assets (positive yield).
+    #[schema(example = "1.0")]
+    pub assets_per_share: String,
+    /// Block at which the snapshot was observed. Zero indicates the stub
+    /// fetcher recorded the snapshot without consulting a chain head (i.e.
+    /// no real RPC/subgraph call has happened yet).
+    #[schema(example = 12345678)]
+    pub block_number: u64,
+    /// Unix seconds of the observation block, or the capture time when
+    /// `blockNumber == 0`.
+    #[schema(example = 1718452800)]
+    pub block_timestamp: u64,
+    /// ISO-8601 timestamp recording when the API persisted this snapshot.
+    pub captured_at: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tokens/exchange-rates",
+    tag = "Tokens",
+    security(("basicAuth" = [])),
+    responses(
+        (status = 200, description = "Current wrapped-token exchange rates", body = Vec<ExchangeRateEntry>),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    )
+)]
+#[get("/exchange-rates")]
+pub async fn get_exchange_rates(
+    _global: GlobalRateLimit,
+    _key: AuthenticatedKey,
+    span: TracingSpan,
+    shared_raindex: &State<SharedRaindexProvider>,
+    pool: &State<DbPool>,
+) -> Result<Json<Vec<ExchangeRateEntry>>, ApiError> {
+    async move {
+        tracing::info!("exchange-rates request received");
+        let raindex = shared_raindex.read().await;
+        let tokens = raindex
+            .client()
+            .get_all_tokens()
+            .map_err(|e: RaindexError| {
+                tracing::error!(error = %e, "failed to get tokens from raindex");
+                ApiError::Internal("failed to retrieve token list".into())
+            })?;
+
+        let wrapped: Vec<TokenCfg> = tokens
+            .into_values()
+            .filter(wrapped_rates::is_wrapped_token)
+            .collect();
+        tracing::info!(wrapped_count = wrapped.len(), "refreshing wrapped rates");
+
+        let fetcher = StubRateFetcher { pool: pool.inner() };
+        let mut entries = Vec::with_capacity(wrapped.len());
+        for token in &wrapped {
+            let snapshot = wrapped_rates::refresh_if_stale(
+                pool.inner(),
+                &fetcher,
+                token,
+                EXCHANGE_RATE_MAX_AGE_SECS,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, token = ?token.address, "failed to refresh wrapped rate");
+                ApiError::Internal("failed to fetch wrapped exchange rate".into())
+            })?;
+            entries.push(snapshot_to_entry(token, snapshot));
+        }
+
+        Ok(Json(entries))
+    }
+    .instrument(span.0)
+    .await
+}
+
+fn snapshot_to_entry(
+    token: &TokenCfg,
+    snapshot: db_rates::WrappedRateSnapshot,
+) -> ExchangeRateEntry {
+    let asset_addr = snapshot
+        .asset_address
+        .parse::<Address>()
+        .unwrap_or(Address::ZERO);
+    ExchangeRateEntry {
+        share: TokenRef {
+            address: token.address,
+            symbol: token.symbol.clone().unwrap_or_default(),
+            decimals: token.decimals.unwrap_or(0),
+        },
+        asset: TokenRef {
+            address: asset_addr,
+            symbol: snapshot.asset_symbol,
+            decimals: u8::try_from(snapshot.asset_decimals).unwrap_or(0),
+        },
+        assets_per_share: snapshot.assets_per_share,
+        block_number: u64::try_from(snapshot.block_number).unwrap_or(0),
+        block_timestamp: u64::try_from(snapshot.block_timestamp).unwrap_or(0),
+        captured_at: snapshot.captured_at,
+    }
+}
+
 pub fn routes() -> Vec<Route> {
-    rocket::routes![get_tokens]
+    rocket::routes![get_tokens, get_exchange_rates]
 }
 
 #[cfg(test)]

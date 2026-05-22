@@ -233,7 +233,8 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_load_fails_with_unreachable_url() {
-        let result = RaindexProvider::load("http://127.0.0.1:1/registry.txt", None, HashMap::new()).await;
+        let result =
+            RaindexProvider::load("http://127.0.0.1:1/registry.txt", None, HashMap::new()).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -258,7 +259,9 @@ mod tests {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
 
-        let result = RaindexProvider::load(&format!("http://{addr}/registry.txt"), None, HashMap::new()).await;
+        let result =
+            RaindexProvider::load(&format!("http://{addr}/registry.txt"), None, HashMap::new())
+                .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

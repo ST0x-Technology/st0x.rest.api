@@ -16,6 +16,7 @@ mod raindex;
 mod routes;
 mod telemetry;
 mod types;
+mod wrapped_rates;
 
 pub(crate) const CHAIN_ID: u32 = 8453;
 
@@ -58,6 +59,7 @@ enum StartupError {
         routes::health::get_health,
         routes::health::get_health_detailed,
         routes::tokens::get_tokens,
+        routes::tokens::get_exchange_rates,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
         routes::order::post_order_dca,

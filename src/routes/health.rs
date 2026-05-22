@@ -87,10 +87,7 @@ async fn build_cache_warmer_status(stats: &SharedCacheWarmerStats) -> CacheWarme
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let (seconds_since_last_complete, last_complete_age) = match snapshot.last_complete_at_unix {
-        Some(ts) => (
-            Some(now.saturating_sub(ts)),
-            Some(format_age(now, ts)),
-        ),
+        Some(ts) => (Some(now.saturating_sub(ts)), Some(format_age(now, ts))),
         None => (None, None),
     };
     CacheWarmerStatus {

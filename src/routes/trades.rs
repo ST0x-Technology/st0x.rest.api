@@ -1,11 +1,15 @@
 use crate::auth::AuthenticatedKey;
 use crate::cache::AppCache;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::trades_denomination::{
+    apply_denomination_by_address, apply_denomination_by_tx, wrapped_token_set, RateLookup,
+};
 use crate::types::common::{TokenRef, ValidatedAddress, ValidatedFixedBytes};
 use crate::types::order::OrderTradeEntry;
 use crate::types::trades::{
-    TakerTradesResponse, TradeByAddress, TradeByTxEntry, TradeRequest, TradeResult,
+    Denomination, TakerTradesResponse, TradeByAddress, TradeByTxEntry, TradeRequest, TradeResult,
     TradesBatchEntry, TradesBatchRequest, TradesBatchResponse, TradesByAddressResponse,
     TradesByTxResponse, TradesPagination, TradesPaginationParams, TradesTotals,
 };
@@ -431,6 +435,8 @@ async fn process_get_trades_by_tx(
                 output_amount: output_change.formatted_amount(),
                 actual_io_ratio: io_ratio,
             },
+            denomination: crate::types::trades::Denomination::Wtstock,
+            assets_per_share: None,
         });
     }
 
@@ -574,6 +580,8 @@ async fn process_get_trades_by_address(
                             order_hash: Some(*order_hash),
                             timestamp: entry.timestamp,
                             block_number: 0, // not available from DirectTradesFetcher
+                            denomination: crate::types::trades::Denomination::Wtstock,
+                            assets_per_share: None,
                         });
                     }
                 }
@@ -668,6 +676,8 @@ async fn build_trades_from_library(
             order_hash: maybe_parse_trade_order_hash(trade.order_hash()),
             timestamp: to_u64(trade.timestamp(), "timestamp")?,
             block_number: to_u64(trade.transaction().block_number(), "block number")?,
+            denomination: crate::types::trades::Denomination::Wtstock,
+            assets_per_share: None,
         });
     }
     Ok(trades)
@@ -819,6 +829,8 @@ async fn process_get_trades_by_token(
                             order_hash: Some(*order_hash),
                             timestamp: entry.timestamp,
                             block_number: 0,
+                            denomination: crate::types::trades::Denomination::Wtstock,
+                            assets_per_share: None,
                         });
                     }
                 }
@@ -1066,6 +1078,8 @@ fn build_trades_by_tx_from_enriched(
                 output_amount: trade.output_amount.clone(),
                 actual_io_ratio: io_ratio,
             },
+            denomination: crate::types::trades::Denomination::Wtstock,
+            assets_per_share: None,
         });
     }
 
@@ -1113,15 +1127,18 @@ fn build_trades_by_tx_from_enriched(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/tx/<tx_hash>")]
+#[allow(clippy::too_many_arguments)]
+#[get("/tx/<tx_hash>?<params..>")]
 pub async fn get_trades_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     trades_by_tx_cache: &State<TradesByTxCache>,
     direct_trades: &State<Option<crate::direct_trades::DirectTradesFetcher>>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
+    params: TradesPaginationParams,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
@@ -1175,9 +1192,17 @@ pub async fn get_trades_by_tx(
             None
         };
 
-        let response =
+        let mut response =
             get_cached_trades_by_tx(trades_by_tx_cache, &ds, tx_hash.0, known_order_hashes)
                 .await?;
+        drop(raindex);
+
+        let denomination = params.denomination.unwrap_or_default();
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
+            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            apply_denomination_by_tx(&mut lookup, denomination, &mut response).await?;
+        }
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -1201,6 +1226,7 @@ pub async fn get_trades_by_tx(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/token/<address>?<params..>")]
 pub async fn get_trades_by_token(
     _global: GlobalRateLimit,
@@ -1208,17 +1234,19 @@ pub async fn get_trades_by_token(
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     trades_by_token_cache: &State<TradesByTokenCache>,
     direct_trades: &State<Option<crate::direct_trades::DirectTradesFetcher>>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "trades by token request received");
+        let denomination = params.denomination.unwrap_or_default();
         let raindex = shared_raindex.read().await;
         let ds = RaindexTradesDataSource {
             client: raindex.client(),
         };
-        let response = get_cached_trades_by_token(
+        let mut response = get_cached_trades_by_token(
             trades_by_token_cache,
             &ds,
             direct_trades.inner().as_ref(),
@@ -1226,6 +1254,13 @@ pub async fn get_trades_by_token(
             params,
         )
         .await?;
+        drop(raindex);
+
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
+            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            apply_denomination_by_address(&mut lookup, denomination, &mut response).await?;
+        }
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -1249,6 +1284,7 @@ pub async fn get_trades_by_token(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/<address>?<params..>", rank = 2)]
 pub async fn get_trades_by_address(
     _global: GlobalRateLimit,
@@ -1256,17 +1292,19 @@ pub async fn get_trades_by_address(
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     trades_by_address_cache: &State<TradesByAddressCache>,
     direct_trades: &State<Option<crate::direct_trades::DirectTradesFetcher>>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
+        let denomination = params.denomination.unwrap_or_default();
         let raindex = shared_raindex.read().await;
         let ds = RaindexTradesDataSource {
             client: raindex.client(),
         };
-        let response = get_cached_trades_by_address(
+        let mut response = get_cached_trades_by_address(
             trades_by_address_cache,
             &ds,
             direct_trades.inner().as_ref(),
@@ -1274,6 +1312,13 @@ pub async fn get_trades_by_address(
             params,
         )
         .await?;
+        drop(raindex);
+
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
+            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            apply_denomination_by_address(&mut lookup, denomination, &mut response).await?;
+        }
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -1297,6 +1342,7 @@ pub async fn get_trades_by_address(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/taker/<address>?<params..>")]
 pub async fn get_taker_trades(
     _global: GlobalRateLimit,
@@ -1305,17 +1351,19 @@ pub async fn get_taker_trades(
     trades_by_tx_cache: &State<TradesByTxCache>,
     taker_tx_cache: &State<TakerTradesTxHashCache>,
     direct_trades: &State<Option<crate::direct_trades::DirectTradesFetcher>>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TakerTradesResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "taker trades request received");
+        let denomination = params.denomination.unwrap_or_default();
         let raindex = shared_raindex.read().await;
         let ds = RaindexTradesDataSource {
             client: raindex.client(),
         };
-        let response = process_get_taker_trades(
+        let mut response = process_get_taker_trades(
             &ds,
             direct_trades.inner().as_ref(),
             trades_by_tx_cache,
@@ -1324,6 +1372,15 @@ pub async fn get_taker_trades(
             params,
         )
         .await?;
+        drop(raindex);
+
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
+            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            for tx_response in &mut response.market_orders {
+                apply_denomination_by_tx(&mut lookup, denomination, tx_response).await?;
+            }
+        }
         Ok(Json(response))
     }
     .instrument(span.0)
