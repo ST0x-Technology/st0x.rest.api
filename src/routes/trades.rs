@@ -1663,6 +1663,7 @@ mod tests {
                 page_size: Some(20),
                 start_time: None,
                 end_time: None,
+                denomination: None,
             },
         )
         .await
@@ -1711,6 +1712,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
 
         let first = get_cached_trades_by_address(&cache, &ds, None, owner, params.clone())
@@ -1877,6 +1879,7 @@ mod tests {
                 page_size: Some(20),
                 start_time: None,
                 end_time: None,
+                denomination: None,
             },
         )
         .await

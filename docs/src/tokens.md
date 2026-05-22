@@ -73,11 +73,17 @@ Rates are cached for 24 hours and persisted to a snapshot history so the
 current at each trade's block. See [Trade Monitoring](./trades.md) for the
 `denomination=tstock` query toggle.
 
-> **Note (current implementation):** The on-chain/subgraph fetch is stubbed.
-> Rates default to `1.0` unless an operator has set a per-token override
-> via the `settings` table under key `wrapped_rate:<token_address>`. The
-> response shape is final; future versions will replace the stub with a
-> subgraph read or, if necessary, an ERC4626 `convertToAssets` call.
+### Data source
+
+The API reads `assetsPerShare` directly from the ERC4626 vault contract via
+`convertToAssets(10^decimals)` against the registry-declared RPC. Neither
+the rain.orderbook subgraph nor the st0x.oracle subgraph indexes ERC4626
+share/asset accounting, so RPC is the only authoritative source. The first
+RPC in the token's network configuration is used; additional RPCs serve as
+fallbacks on transport or `eth_call` errors. Each successful read is
+persisted to `wrapped_exchange_rate_snapshots` along with the chain head
+block number, so historical lookups (the `tstock` denomination toggle) can
+find the rate that was live at any past trade's block.
 
 ### Request
 
@@ -97,12 +103,12 @@ curl https://api.st0x.io/v1/tokens/exchange-rates \
       "decimals": 18
     },
     "asset": {
-      "address": "0x0000000000000000000000000000000000000000",
+      "address": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
       "symbol": "tMSTR",
       "decimals": 18
     },
-    "assetsPerShare": "1.0",
-    "blockNumber": 0,
+    "assetsPerShare": "1.04",
+    "blockNumber": 12345678,
     "blockTimestamp": 1718452800,
     "capturedAt": "2026-05-22 09:32:11"
   }
@@ -114,9 +120,9 @@ curl https://api.st0x.io/v1/tokens/exchange-rates \
 | Field | Type | Description |
 |-------|------|-------------|
 | `share` | object | The wrapped ERC4626 share token (`wt*`). |
-| `asset` | object | The underlying tStock asset. Address may be zero when the registry doesn't yet record an `assetAddress` extension; `symbol` falls back to stripping the leading `w`. |
+| `asset` | object | The underlying tStock asset. Address comes from the wrapped token's `extensions.unwrappedAddress` in the registry; `symbol` falls back to stripping the leading `w` from the wrapped symbol when the registry doesn't supply one. |
 | `assetsPerShare` | string | Decimal multiplier from share → asset. `1.0` means redemption is 1:1. |
-| `blockNumber` | number | Block at which the snapshot was observed. Zero indicates the stub fetcher recorded the snapshot without a chain head. |
-| `blockTimestamp` | number | Unix seconds. |
+| `blockNumber` | number | Chain head at the moment the rate was read. |
+| `blockTimestamp` | number | Unix seconds at observation. |
 | `capturedAt` | string | ISO-8601 timestamp recording when the API persisted this snapshot. |
 

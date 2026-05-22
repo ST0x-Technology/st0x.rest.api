@@ -5,7 +5,7 @@ use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
 use crate::types::common::TokenRef;
-use crate::wrapped_rates::{self, StubRateFetcher};
+use crate::wrapped_rates::{self, RpcRateFetcher};
 use alloy::primitives::Address;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
@@ -161,9 +161,9 @@ pub async fn get_exchange_rates(
             .collect();
         tracing::info!(wrapped_count = wrapped.len(), "refreshing wrapped rates");
 
-        let fetcher = StubRateFetcher { pool: pool.inner() };
         let mut entries = Vec::with_capacity(wrapped.len());
         for token in &wrapped {
+            let fetcher = RpcRateFetcher::new(token.network.rpcs.clone());
             let snapshot = wrapped_rates::refresh_if_stale(
                 pool.inner(),
                 &fetcher,

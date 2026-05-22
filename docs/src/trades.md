@@ -165,13 +165,15 @@ The conversion uses the *most recent* snapshot whose `block_number` is
 `≤ trade.block_number`. Snapshot cadence is currently best-effort:
 
 - Each call to `GET /v1/tokens/exchange-rates` refreshes any token whose
-  most recent snapshot is older than 24 hours and persists a new row.
-- During the stub-fetcher period, `block_number` is recorded as `0`, which
-  matches all trade blocks. Consequently, while the stub is in place the
-  tStock conversion uses whatever rate the operator has configured (or
-  `1.0` by default) for *every* historical trade. Once the subgraph/RPC
-  fetcher lands, snapshots will carry real block numbers and historical
-  rates will be applied per-trade.
+  most recent snapshot is older than 24 hours and persists a new row. The
+  refresh dials the token's registry-configured RPC and reads
+  `convertToAssets(10^decimals)` on the ERC4626 vault.
+- Until the API has observed the chain for a token for the first time, no
+  historical snapshot exists. For trades that predate the first snapshot,
+  the `tstock` toggle leaves the row in raw wtStock amounts and omits the
+  `assetsPerShare` field so the caller knows no conversion was applied.
+  Hitting `/v1/tokens/exchange-rates` once after deploy is enough to seed
+  the table for every wrapped token in the registry.
 
 The same `denomination` toggle is accepted by `/v1/trades/tx/{tx_hash}`,
 `/v1/trades/token/{address}`, and `/v1/trades/taker/{address}`. The

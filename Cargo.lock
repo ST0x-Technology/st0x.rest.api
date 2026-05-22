@@ -9014,6 +9014,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber 0.3.19",
  "tracing-test",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid 1.17.0",

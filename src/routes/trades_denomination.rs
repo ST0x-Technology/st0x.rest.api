@@ -12,8 +12,7 @@ use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
 use crate::error::ApiError;
 use crate::types::trades::{
-    Denomination, TradeByAddress, TradeByTxEntry, TradesByAddressResponse, TradesByTxResponse,
-    TradesTotals,
+    Denomination, TradeByTxEntry, TradesByAddressResponse, TradesByTxResponse, TradesTotals,
 };
 use alloy::primitives::Address;
 use rain_math_float::Float;

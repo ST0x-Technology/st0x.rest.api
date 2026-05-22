@@ -11,21 +11,42 @@
 //! they look up the snapshot at or before each trade's block number so the
 //! conversion reflects the rate that was live at trade time.
 //!
-//! Today the on-chain/subgraph fetch is stubbed: rates are read from the
-//! `settings` table (key `wrapped_rate:<token_address>`), with a default of
-//! `1.0` when no override has been configured. The fetcher trait keeps the
-//! call site uniform so a real implementation (subgraph or RPC) can replace
-//! [`StubRateFetcher`] without churn at the endpoints.
+//! ## Data source
+//!
+//! The rain.orderbook subgraph only indexes ERC20 metadata (address, name,
+//! symbol, decimals) for tokens that appear in vaults — it does not track
+//! ERC4626 share/asset accounting. The st0x.oracle subgraph indexes oracle
+//! adapter mappings, not vault state. There is no dedicated wrapper
+//! subgraph. The only authoritative source for the current `assetsPerShare`
+//! is the ERC4626 contract itself, via `convertToAssets(10^decimals)`.
+//!
+//! [`RpcRateFetcher`] is the default production fetcher: it dials the
+//! token's registry-configured RPC, makes the view call, and records the
+//! observation with the chain head block number so historical lookups work.
+//! [`StubRateFetcher`] remains in this module solely so unit tests can
+//! exercise the storage layer without spinning up an RPC.
 
+#[cfg(test)]
+use crate::db::settings;
 use crate::db::wrapped_rates as db_rates;
-use crate::db::{settings, DbPool};
-use alloy::primitives::Address;
+use crate::db::DbPool;
+use alloy::primitives::{Address, U256};
+use alloy::providers::{Provider, ProviderBuilder};
 use async_trait::async_trait;
 use rain_orderbook_app_settings::token::TokenCfg;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
+alloy::sol! {
+    #[sol(rpc)]
+    interface IERC4626Rate {
+        function convertToAssets(uint256 shares) external view returns (uint256 assets);
+    }
+}
+
+#[cfg(test)]
 pub(crate) const STUB_DEFAULT_RATE: &str = "1.0";
 
 #[derive(Debug, Clone)]
@@ -61,15 +82,17 @@ pub(crate) trait RateFetcher: Send + Sync {
         -> Result<RateObservation, RateFetchError>;
 }
 
-/// Stub implementation: reads `wrapped_rate:<addr>` from the `settings`
-/// table when present, otherwise returns [`STUB_DEFAULT_RATE`]. This is a
-/// deliberate placeholder so the rest of the system (storage, endpoint,
-/// per-trade lookup) can be exercised end-to-end without subgraph or RPC
-/// dependencies. Replace with a real fetcher when one is ready.
+/// Test-only fetcher backing the unit suite. Reads
+/// `wrapped_rate:<addr>` from the `settings` table when present, otherwise
+/// returns [`STUB_DEFAULT_RATE`]. The production code path uses
+/// [`RpcRateFetcher`]; this stub exists so storage and conversion logic
+/// can be exercised without spinning up an Ethereum node.
+#[cfg(test)]
 pub(crate) struct StubRateFetcher<'a> {
     pub pool: &'a DbPool,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl<'a> RateFetcher for StubRateFetcher<'a> {
     async fn fetch_current_rate(
@@ -101,6 +124,124 @@ impl<'a> RateFetcher for StubRateFetcher<'a> {
     }
 }
 
+/// Production fetcher: calls `IERC4626::convertToAssets(10^decimals)` on the
+/// wrapped token via the registry-declared RPC. The first RPC in the
+/// token's network configuration is tried first; subsequent RPCs serve as
+/// fallbacks on transport/eth_call failure. The block number recorded on
+/// the snapshot is `eth_blockNumber` at fetch time — the slight race
+/// between that and the `latest`-tagged `eth_call` is bounded by Base's
+/// 2s block time and is acceptable for a 24h-cached rate.
+///
+/// Assumes share-decimals == asset-decimals (true for every ST0x pair
+/// today: both wt* and t* are 18 decimals). The returned ratio is the
+/// unscaled decimal `assets / shares`.
+pub(crate) struct RpcRateFetcher {
+    rpcs: Vec<Url>,
+}
+
+impl RpcRateFetcher {
+    pub(crate) fn new(rpcs: Vec<Url>) -> Self {
+        Self { rpcs }
+    }
+}
+
+#[async_trait]
+impl RateFetcher for RpcRateFetcher {
+    async fn fetch_current_rate(
+        &self,
+        token: &TokenCfg,
+    ) -> Result<RateObservation, RateFetchError> {
+        if self.rpcs.is_empty() {
+            return Err(RateFetchError::RpcUnavailable(
+                "no rpc urls configured for token network".into(),
+            ));
+        }
+
+        let share_decimals = token.decimals.unwrap_or(18);
+        let one_share = scale_one(share_decimals);
+        let (asset_address, asset_symbol, asset_decimals) = extract_asset_hint(token);
+        let effective_asset_decimals = if asset_decimals == 0 {
+            share_decimals
+        } else {
+            asset_decimals
+        };
+
+        let mut last_err: Option<String> = None;
+        for rpc in &self.rpcs {
+            let provider = ProviderBuilder::new().connect_http(rpc.clone());
+            let contract = IERC4626Rate::new(token.address, &provider);
+
+            let assets = match contract.convertToAssets(one_share).call().await {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(
+                        token = ?token.address,
+                        rpc = %rpc,
+                        error = %e,
+                        "convertToAssets call failed; trying next rpc"
+                    );
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
+
+            let block_number = provider.get_block_number().await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    token = ?token.address,
+                    rpc = %rpc,
+                    error = %e,
+                    "block_number lookup failed; recording snapshot with block 0"
+                );
+                0
+            });
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let formatted = format_ratio(assets, effective_asset_decimals);
+            return Ok(RateObservation {
+                token_address: token.address,
+                block_number,
+                block_timestamp: now,
+                assets_per_share: formatted,
+                asset_address,
+                asset_symbol,
+                asset_decimals: effective_asset_decimals,
+            });
+        }
+
+        Err(RateFetchError::RpcUnavailable(
+            last_err.unwrap_or_else(|| "all rpcs failed".into()),
+        ))
+    }
+}
+
+fn scale_one(decimals: u8) -> U256 {
+    let mut value = U256::from(1u64);
+    for _ in 0..decimals {
+        value *= U256::from(10u64);
+    }
+    value
+}
+
+/// Renders `assets / 10^decimals` as a decimal string, trimming trailing
+/// zeros but always keeping at least one fractional digit so the result is
+/// unambiguously a decimal (e.g. `1.0`, not `1`).
+fn format_ratio(assets: U256, decimals: u8) -> String {
+    let scale = scale_one(decimals);
+    let integer = assets / scale;
+    let remainder = assets % scale;
+    if remainder.is_zero() {
+        return format!("{integer}.0");
+    }
+    let frac_full = format!("{remainder:0width$}", width = decimals as usize);
+    let trimmed = frac_full.trim_end_matches('0');
+    let frac = if trimmed.is_empty() { "0" } else { trimmed };
+    format!("{integer}.{frac}")
+}
+
 /// Treat a token as wrapped if its `extensions.category == "ST0x"` (this is
 /// how the st0x registry labels wrapped tStock tokens — see the existing
 /// remote-tokens metadata served alongside the registry).
@@ -111,16 +252,19 @@ pub(crate) fn is_wrapped_token(token: &TokenCfg) -> bool {
 }
 
 /// Pulls underlying-asset metadata from the wrapped token's extensions when
-/// available. Recognized keys (any of):
-///   - `asset` or `assetAddress` → address
-///   - `assetSymbol` → symbol
-///   - `assetDecimals` → decimals
+/// available. The st0x registry's token-list metadata records the
+/// underlying tStock address under `unwrappedAddress` (see
+/// `st0x.registry/token-lists/base.json`). We accept the historical
+/// alternates `assetAddress`/`asset` too for forward-compat.
 ///
-/// All three default to zero/empty when absent — the snapshot row still
-/// records the rate, the asset block is just informational.
+/// Symbol and decimals aren't carried by the registry today, so they are
+/// derived: symbol drops the leading `w` (`wtMSTR` → `tMSTR`) and decimals
+/// fall back to the wrapped token's decimals (always 18 in the current
+/// st0x deployment; both sides of every existing pair share the same scale).
 fn extract_asset_hint(token: &TokenCfg) -> (Address, String, u8) {
     let ext = token.extensions.as_ref();
-    let addr = extract_extension_string(ext, "assetAddress")
+    let addr = extract_extension_string(ext, "unwrappedAddress")
+        .or_else(|| extract_extension_string(ext, "assetAddress"))
         .or_else(|| extract_extension_string(ext, "asset"))
         .and_then(|s| s.parse::<Address>().ok())
         .unwrap_or(Address::ZERO);
@@ -278,6 +422,55 @@ mod tests {
     fn test_derived_asset_symbol_strips_wt() {
         let token = make_token(Some("wtMSTR"), None);
         assert_eq!(derived_asset_symbol(&token).unwrap(), "tMSTR");
+    }
+
+    #[test]
+    fn test_format_ratio_handles_integer_result() {
+        let one = scale_one(18);
+        assert_eq!(format_ratio(one, 18), "1.0");
+    }
+
+    #[test]
+    fn test_format_ratio_renders_one_point_five() {
+        let one_point_five = scale_one(18) + scale_one(18) / U256::from(2u64);
+        assert_eq!(format_ratio(one_point_five, 18), "1.5");
+    }
+
+    #[test]
+    fn test_format_ratio_strips_trailing_zeros() {
+        // 1.04 * 10^18
+        let value = scale_one(18) + scale_one(16) * U256::from(4u64);
+        assert_eq!(format_ratio(value, 18), "1.04");
+    }
+
+    #[test]
+    fn test_format_ratio_zero() {
+        assert_eq!(format_ratio(U256::ZERO, 18), "0.0");
+    }
+
+    #[test]
+    fn test_extract_asset_hint_picks_unwrapped_address() {
+        let mut ext = ext_st0x();
+        ext.insert(
+            "unwrappedAddress".into(),
+            Value::String("0x013b782f402d61aa1004cca95b9f5bb402c9d5fe".into()),
+        );
+        let token = make_token(Some("wtMSTR"), Some(ext));
+        let (addr, sym, dec) = extract_asset_hint(&token);
+        assert_eq!(
+            format!("{addr:#x}"),
+            "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe"
+        );
+        assert_eq!(sym, "tMSTR");
+        assert_eq!(dec, 18);
+    }
+
+    #[rocket::async_test]
+    async fn test_rpc_fetcher_fails_when_no_rpcs_configured() {
+        let token = make_token(Some("wtMSTR"), Some(ext_st0x()));
+        let fetcher = RpcRateFetcher::new(vec![]);
+        let err = fetcher.fetch_current_rate(&token).await.unwrap_err();
+        assert!(matches!(err, RateFetchError::RpcUnavailable(_)));
     }
 
     #[rocket::async_test]

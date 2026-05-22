@@ -36,6 +36,7 @@ moka = { version = "0.12", features = ["future"] }
 rusqlite = { version = "0.32" }
 chrono = "0.4"
 chrono-tz = "0.10"
+url = "2"
 
 [dev-dependencies]
 tracing-test = "0.2"
