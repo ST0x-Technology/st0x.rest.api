@@ -5,7 +5,7 @@ use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
 use crate::types::common::TokenRef;
-use crate::wrapped_rates::{self, RpcRateFetcher};
+use crate::wrapped_rates::{self, SubgraphRateFetcher};
 use alloy::primitives::Address;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
@@ -19,6 +19,12 @@ use utoipa::ToSchema;
 /// Caps how stale a snapshot may be before the endpoint forces a refresh.
 /// 24 hours matches the user's tolerance for rate-change infrequency.
 const EXCHANGE_RATE_MAX_AGE_SECS: i64 = 86_400;
+
+/// Newtype around the sft-base subgraph endpoint string used as Rocket
+/// managed state. Wrapped so we can index by type in `&State<...>` without
+/// colliding with other `String` state.
+#[derive(Debug, Clone)]
+pub struct SftSubgraphUrl(pub String);
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
@@ -143,6 +149,7 @@ pub async fn get_exchange_rates(
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
     pool: &State<DbPool>,
+    sft_subgraph_url: &State<SftSubgraphUrl>,
 ) -> Result<Json<Vec<ExchangeRateEntry>>, ApiError> {
     async move {
         tracing::info!("exchange-rates request received");
@@ -162,8 +169,8 @@ pub async fn get_exchange_rates(
         tracing::info!(wrapped_count = wrapped.len(), "refreshing wrapped rates");
 
         let mut entries = Vec::with_capacity(wrapped.len());
+        let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
         for token in &wrapped {
-            let fetcher = RpcRateFetcher::new(token.network.rpcs.clone());
             let snapshot = wrapped_rates::refresh_if_stale(
                 pool.inner(),
                 &fetcher,

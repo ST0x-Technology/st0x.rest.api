@@ -136,6 +136,7 @@ pub(crate) fn rocket(
     stale_price_skip_cache: routes::orders::StalePriceSkipCache,
     swap_quote_cache: routes::swap::SwapQuoteCache,
     cache_warmer_stats: cache_warmer::SharedCacheWarmerStats,
+    sft_subgraph_url: routes::tokens::SftSubgraphUrl,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
@@ -167,6 +168,7 @@ pub(crate) fn rocket(
         .manage(swap_quote_cache)
         .manage(cache_warmer_stats)
         .manage(direct_trades_fetcher)
+        .manage(sft_subgraph_url)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -394,6 +396,7 @@ async fn main() {
                 stale_price_skip_cache,
                 swap_quote_cache,
                 cache_warmer_stats,
+                routes::tokens::SftSubgraphUrl(cfg.sft_subgraph_url.clone()),
             ) {
                 Ok(r) => r,
                 Err(e) => {

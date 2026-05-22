@@ -30,6 +30,20 @@ pub struct Config {
     /// `active_transport_count = 1`).
     #[serde(default)]
     pub rpc_override: HashMap<String, Vec<String>>,
+
+    /// Subgraph that indexes the OARV-backed wrapped-token (`wt*`)
+    /// contracts. Used by `/v1/tokens/exchange-rates` and the
+    /// `denomination=tstock` toggle on `/v1/trades/*`. Mirrors the URL used
+    /// by `st0x.dividend.processes` and `st0x.issuance`; if the deployment
+    /// moves, override here without rebuilding. Defaults to the published
+    /// production endpoint when absent from the config file.
+    #[serde(default = "default_sft_subgraph_url")]
+    pub sft_subgraph_url: String,
+}
+
+fn default_sft_subgraph_url() -> String {
+    "https://api.goldsky.com/api/public/project_cmjr2df7svg6t01tl2ic706ao/subgraphs/sft-base/1.0.10/gn"
+        .to_string()
 }
 
 impl Config {

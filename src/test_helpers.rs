@@ -15,6 +15,7 @@ pub(crate) struct TestClientBuilder {
     rate_limiter: crate::fairings::RateLimiter,
     raindex_registry_url: Option<String>,
     raindex_config: Option<crate::raindex::RaindexProvider>,
+    sft_subgraph_url: Option<String>,
 }
 
 impl TestClientBuilder {
@@ -23,6 +24,7 @@ impl TestClientBuilder {
             rate_limiter: crate::fairings::RateLimiter::new(10000, 10000),
             raindex_registry_url: None,
             raindex_config: None,
+            sft_subgraph_url: None,
         }
     }
 
@@ -33,6 +35,12 @@ impl TestClientBuilder {
 
     pub(crate) fn raindex_config(mut self, config: crate::raindex::RaindexProvider) -> Self {
         self.raindex_config = Some(config);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sft_subgraph_url(mut self, url: String) -> Self {
+        self.sft_subgraph_url = Some(url);
         self
     }
 
@@ -79,6 +87,10 @@ impl TestClientBuilder {
             stale_price_skip_cache,
             swap_quote_cache,
             cache_warmer_stats,
+            crate::routes::tokens::SftSubgraphUrl(
+                self.sft_subgraph_url
+                    .unwrap_or_else(|| "http://127.0.0.1:0/subgraph".to_string()),
+            ),
         )
         .expect("valid rocket instance");
 

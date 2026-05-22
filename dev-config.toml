@@ -4,3 +4,4 @@ registry_url = "https://raw.githubusercontent.com/rainlanguage/rain.strategies/a
 rate_limit_global_rpm = 1000
 rate_limit_per_key_rpm = 100
 docs_dir = "docs/book"
+sft_subgraph_url = "https://api.goldsky.com/api/public/project_cmjr2df7svg6t01tl2ic706ao/subgraphs/sft-base/1.0.10/gn"

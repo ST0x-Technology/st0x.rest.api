@@ -75,15 +75,28 @@ current at each trade's block. See [Trade Monitoring](./trades.md) for the
 
 ### Data source
 
-The API reads `assetsPerShare` directly from the ERC4626 vault contract via
-`convertToAssets(10^decimals)` against the registry-declared RPC. Neither
-the rain.orderbook subgraph nor the st0x.oracle subgraph indexes ERC4626
-share/asset accounting, so RPC is the only authoritative source. The first
-RPC in the token's network configuration is used; additional RPCs serve as
-fallbacks on transport or `eth_call` errors. Each successful read is
-persisted to `wrapped_exchange_rate_snapshots` along with the chain head
-block number, so historical lookups (the `tstock` denomination toggle) can
-find the rate that was live at any past trade's block.
+Wrapped tStock contracts on Base are ERC4626 vaults sitting over gildlab's
+`OffchainAssetReceiptVault` (OARV) — the legacy tStock tokens. The
+`sft-base` subgraph (default
+`https://api.goldsky.com/.../subgraphs/sft-base/1.0.10/gn`, overridable via
+the `sft_subgraph_url` config key) indexes both sides of that pair: each
+`OffchainAssetReceiptVault` entity exposes `wrappedTokenContractAddress`
+pointing back at the `wt*` wrapper, plus `totalShares` and the indexer's
+head block via `_meta.block`. The API resolves wrapped tokens to their
+underlying OARV through that subgraph; the snapshot row records the
+indexer's head block so historical lookups for the `tstock` denomination
+toggle (see [Trade Monitoring](./trades.md)) align to indexed blocks.
+
+For the current OARV deployment `totalAssets() == totalSupply()`, so the
+ERC4626 round-trip is structurally fixed at 1:1 and `assetsPerShare`
+returns `"1.0"`. The same code path will surface a variable rate the
+moment a token switches to a price-oracle-driven wrapper — no endpoint
+changes required.
+
+If the subgraph is temporarily unreachable an alternate RPC-based fetcher
+calls `IERC4626::convertToAssets(10^decimals)` directly against the
+registry-configured RPCs, but it is not the default and must be enabled in
+configuration.
 
 ### Request
 

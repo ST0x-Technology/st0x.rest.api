@@ -166,14 +166,20 @@ The conversion uses the *most recent* snapshot whose `block_number` is
 
 - Each call to `GET /v1/tokens/exchange-rates` refreshes any token whose
   most recent snapshot is older than 24 hours and persists a new row. The
-  refresh dials the token's registry-configured RPC and reads
-  `convertToAssets(10^decimals)` on the ERC4626 vault.
-- Until the API has observed the chain for a token for the first time, no
-  historical snapshot exists. For trades that predate the first snapshot,
-  the `tstock` toggle leaves the row in raw wtStock amounts and omits the
-  `assetsPerShare` field so the caller knows no conversion was applied.
-  Hitting `/v1/tokens/exchange-rates` once after deploy is enough to seed
-  the table for every wrapped token in the registry.
+  refresh reads the `sft-base` subgraph to resolve the wrapped token's
+  underlying OARV (`OffchainAssetReceiptVault.wrappedTokenContractAddress`)
+  and records the rate alongside the subgraph's `_meta.block`.
+- Until the API has observed a token for the first time, no historical
+  snapshot exists. For trades that predate the first snapshot, the
+  `tstock` toggle leaves the row in raw wtStock amounts and omits
+  `assetsPerShare` so the caller knows no conversion was applied. Hitting
+  `/v1/tokens/exchange-rates` once after deploy is enough to seed the
+  table for every wrapped token in the registry.
+- For OARV-backed wrappers the rate is structurally `1.0` (the contract
+  enforces `totalAssets() == totalSupply()`). Conversion is therefore an
+  identity on amounts but a no-op on token symbols/addresses — the
+  caller still sees `denomination: "tstock"` and `assetsPerShare: "1.0"`
+  so they can confirm the toggle was applied.
 
 The same `denomination` toggle is accepted by `/v1/trades/tx/{tx_hash}`,
 `/v1/trades/token/{address}`, and `/v1/trades/taker/{address}`. The

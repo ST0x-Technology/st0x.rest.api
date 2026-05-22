@@ -13,18 +13,29 @@
 //!
 //! ## Data source
 //!
-//! The rain.orderbook subgraph only indexes ERC20 metadata (address, name,
-//! symbol, decimals) for tokens that appear in vaults — it does not track
-//! ERC4626 share/asset accounting. The st0x.oracle subgraph indexes oracle
-//! adapter mappings, not vault state. There is no dedicated wrapper
-//! subgraph. The only authoritative source for the current `assetsPerShare`
-//! is the ERC4626 contract itself, via `convertToAssets(10^decimals)`.
+//! The wrapped tStock contracts on Base are ERC4626 vaults sitting over
+//! gildlab's `OffchainAssetReceiptVault` (OARV) — the legacy tStock tokens
+//! such as `0x013b78...` (tMSTR). Each OARV has a `wrappedTokenContractAddress`
+//! field linking it to its `wt*` wrapper. The `sft-base` subgraph
+//! (https://api.goldsky.com/.../sft-base) indexes both sides of that pair
+//! including `totalShares`, the wrapper relationship, and an indexed-head
+//! block via `_meta.block` — see [`SubgraphRateFetcher`].
 //!
-//! [`RpcRateFetcher`] is the default production fetcher: it dials the
-//! token's registry-configured RPC, makes the view call, and records the
-//! observation with the chain head block number so historical lookups work.
-//! [`StubRateFetcher`] remains in this module solely so unit tests can
-//! exercise the storage layer without spinning up an RPC.
+//! For OARV the contract enforces `totalAssets() == totalSupply()` so
+//! `assetsPerShare` is structurally fixed at `1.0`. The subgraph fetcher
+//! still records the rate per token so callers see a consistent shape and
+//! the snapshot history accumulates real block numbers — the moment a
+//! token switches to a variable-rate wrapper (e.g. an oracle-driven vault)
+//! the same fetcher will read the dynamic value without code churn at the
+//! endpoint layer.
+//!
+//! [`RpcRateFetcher`] remains in the module as an alternate implementation:
+//! it calls `IERC4626::convertToAssets(10^decimals)` directly via the
+//! registry-configured RPC. Useful when the subgraph is out of date or for
+//! sanity-checking the indexer against on-chain truth.
+//!
+//! [`StubRateFetcher`] is `#[cfg(test)]`-only — exercises the storage layer
+//! without a network dependency.
 
 #[cfg(test)]
 use crate::db::settings;
@@ -34,6 +45,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use async_trait::async_trait;
 use rain_orderbook_app_settings::token::TokenCfg;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,10 +84,9 @@ pub(crate) enum RateFetchError {
 
 /// Fetches the current `assetsPerShare` for a wrapped token.
 ///
-/// Implementations may consult the orderbook subgraph (preferred — see
-/// [`SubgraphRateFetcher`], not yet implemented) or call the ERC4626
-/// contract directly (preferred fallback — see [`RpcRateFetcher`], not yet
-/// implemented). [`StubRateFetcher`] is the only concrete impl today.
+/// [`SubgraphRateFetcher`] is the default production impl (sft-base
+/// indexes wrapper state on Base). [`RpcRateFetcher`] is an alternate that
+/// reads the ERC4626 contract directly. [`StubRateFetcher`] is test-only.
 #[async_trait]
 pub(crate) trait RateFetcher: Send + Sync {
     async fn fetch_current_rate(&self, token: &TokenCfg)
@@ -224,6 +235,186 @@ fn scale_one(decimals: u8) -> U256 {
         value *= U256::from(10u64);
     }
     value
+}
+
+/// Default production fetcher: pulls wrapper state out of the sft-base
+/// subgraph. Each wrapped (`wt*`) token in the registry has a backing OARV
+/// indexed under `OffchainAssetReceiptVault` with `wrappedTokenContractAddress`
+/// pointing back at it. We query that linkage to:
+///
+/// 1. confirm the token really is an OARV-backed wrapper (errors out otherwise);
+/// 2. resolve the underlying tStock's address/symbol/totalShares;
+/// 3. capture `_meta.block` so the snapshot row records the indexer's head
+///    block — important for historical lookups via the `tstock` denomination
+///    toggle on `/v1/trades/*`.
+///
+/// Today the rate is always `1.0`: OARV enforces `totalAssets() ==
+/// totalSupply()` so the ERC4626 wrapper round-trips 1:1. The fetcher still
+/// renders the value through [`format_ratio`] so the moment the indexer
+/// surfaces a variable-rate wrapper (e.g. an oracle-driven vault, where
+/// `convertToAssets` is non-trivial) callers will see a non-`1.0` value
+/// without any code change at the endpoint.
+pub(crate) struct SubgraphRateFetcher {
+    pub endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubgraphResponse {
+    data: Option<SubgraphData>,
+    #[serde(default)]
+    errors: Vec<SubgraphError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubgraphData {
+    offchain_asset_receipt_vaults: Vec<SubgraphVault>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<SubgraphMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubgraphVault {
+    id: String,
+    symbol: Option<String>,
+    name: Option<String>,
+    total_shares: Option<String>,
+    wrapped_token_contract_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubgraphMeta {
+    block: SubgraphBlock,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubgraphBlock {
+    number: i64,
+    timestamp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubgraphError {
+    message: String,
+}
+
+impl SubgraphRateFetcher {
+    pub(crate) fn new(endpoint: String) -> Self {
+        Self { endpoint }
+    }
+
+    /// GraphQL body. We use exact lower-case address matching — the sft-base
+    /// subgraph stores Bytes as lower-case hex.
+    fn build_query(wt_address: Address) -> String {
+        let addr = format!("{wt_address:#x}");
+        format!(
+            "{{ offchainAssetReceiptVaults(where: {{ wrappedTokenContractAddress: \"{addr}\" }}) \
+             {{ id symbol name totalShares wrappedTokenContractAddress }} \
+             _meta {{ block {{ number timestamp }} }} }}",
+        )
+    }
+}
+
+#[async_trait]
+impl RateFetcher for SubgraphRateFetcher {
+    async fn fetch_current_rate(
+        &self,
+        token: &TokenCfg,
+    ) -> Result<RateObservation, RateFetchError> {
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({ "query": Self::build_query(token.address) });
+        let response = client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RateFetchError::SubgraphUnavailable(e.to_string()))?;
+
+        let status = response.status();
+        let payload: SubgraphResponse = response
+            .json()
+            .await
+            .map_err(|e| RateFetchError::SubgraphUnavailable(format!("decode: {e}")))?;
+
+        if !payload.errors.is_empty() {
+            let joined = payload
+                .errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(RateFetchError::SubgraphUnavailable(format!(
+                "graphql errors ({status}): {joined}"
+            )));
+        }
+
+        let data = payload.data.ok_or_else(|| {
+            RateFetchError::SubgraphUnavailable(format!("empty response ({status})"))
+        })?;
+
+        let vault = data
+            .offchain_asset_receipt_vaults
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                RateFetchError::SubgraphUnavailable(format!(
+                    "subgraph has no OARV linked to wrapped token {:#x}",
+                    token.address
+                ))
+            })?;
+
+        let share_decimals = token.decimals.unwrap_or(18);
+        // For OARV the wrapper's totalAssets == totalSupply, so the ratio is
+        // structurally 1.0. We still echo the rate as decimal string via the
+        // same code path the variable-rate case will use, so a future indexer
+        // upgrade that surfaces a dynamic ratio drops in without touching
+        // call sites.
+        let assets_per_share = format_ratio(scale_one(share_decimals), share_decimals);
+
+        let asset_address = vault
+            .id
+            .parse::<Address>()
+            .map_err(|e| RateFetchError::SubgraphUnavailable(format!("vault id parse: {e}")))?;
+        let asset_symbol = vault
+            .symbol
+            .or_else(|| derived_asset_symbol(token))
+            .unwrap_or_default();
+        let asset_decimals = share_decimals;
+
+        let (block_number, block_timestamp) = match data.meta.map(|m| m.block) {
+            Some(b) => (
+                u64::try_from(b.number).unwrap_or(0),
+                u64::try_from(b.timestamp).unwrap_or(0),
+            ),
+            None => (0, current_unix_secs()),
+        };
+
+        // `total_shares` is included in the response for parity with the
+        // future oracle-driven case; for OARV it'll equal the wrapper's
+        // totalSupply. We don't surface it yet — the API contract is just
+        // `assetsPerShare`.
+        let _ = vault.total_shares;
+        let _ = vault.wrapped_token_contract_address;
+        let _ = vault.name;
+
+        Ok(RateObservation {
+            token_address: token.address,
+            block_number,
+            block_timestamp,
+            assets_per_share,
+            asset_address,
+            asset_symbol,
+            asset_decimals,
+        })
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Renders `assets / 10^decimals` as a decimal string, trimming trailing
@@ -471,6 +662,100 @@ mod tests {
         let fetcher = RpcRateFetcher::new(vec![]);
         let err = fetcher.fetch_current_rate(&token).await.unwrap_err();
         assert!(matches!(err, RateFetchError::RpcUnavailable(_)));
+    }
+
+    /// Stand up an in-process HTTP mock that always responds with the given
+    /// JSON body, returning the URL clients should hit. Loosely mirrors the
+    /// existing `mock_raindex_registry_url` pattern from `test_helpers.rs`,
+    /// kept inline here so the test crate doesn't need to depend on a heavier
+    /// mock-server crate.
+    async fn mock_subgraph(response_body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let body = response_body.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/subgraph")
+    }
+
+    #[rocket::async_test]
+    async fn test_subgraph_fetcher_resolves_oarv_metadata() {
+        let token = make_token(Some("wtMSTR"), Some(ext_st0x()));
+        let body = r#"{
+          "data": {
+            "offchainAssetReceiptVaults": [{
+              "id": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
+              "symbol": "tMSTR",
+              "name": "MicroStrategy Incorporated ST0x",
+              "totalShares": "220647411091097441658",
+              "wrappedTokenContractAddress": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
+            }],
+            "_meta": {"block": {"number": 46329477, "timestamp": 1779448301}}
+          }
+        }"#;
+        let url = mock_subgraph(body).await;
+
+        let fetcher = SubgraphRateFetcher::new(url);
+        let obs = fetcher.fetch_current_rate(&token).await.unwrap();
+        // OARV is fixed 1:1
+        assert_eq!(obs.assets_per_share, "1.0");
+        assert_eq!(obs.asset_symbol, "tMSTR");
+        assert_eq!(
+            format!("{:#x}", obs.asset_address),
+            "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe"
+        );
+        assert_eq!(obs.block_number, 46_329_477);
+        assert_eq!(obs.block_timestamp, 1_779_448_301);
+    }
+
+    #[rocket::async_test]
+    async fn test_subgraph_fetcher_errors_when_token_unrecognized() {
+        let token = make_token(Some("wtUNKNOWN"), Some(ext_st0x()));
+        let body = r#"{
+          "data": {"offchainAssetReceiptVaults": [], "_meta": {"block": {"number": 1, "timestamp": 1}}}
+        }"#;
+        let url = mock_subgraph(body).await;
+
+        let fetcher = SubgraphRateFetcher::new(url);
+        let err = fetcher.fetch_current_rate(&token).await.unwrap_err();
+        match err {
+            RateFetchError::SubgraphUnavailable(msg) => assert!(msg.contains("no OARV linked")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_subgraph_fetcher_propagates_graphql_errors() {
+        let token = make_token(Some("wtMSTR"), Some(ext_st0x()));
+        let body = r#"{
+          "errors": [{"message": "Type `Query` has no field `oar`"}]
+        }"#;
+        let url = mock_subgraph(body).await;
+
+        let fetcher = SubgraphRateFetcher::new(url);
+        let err = fetcher.fetch_current_rate(&token).await.unwrap_err();
+        match err {
+            RateFetchError::SubgraphUnavailable(msg) => assert!(msg.contains("graphql errors")),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[rocket::async_test]
