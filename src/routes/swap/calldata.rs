@@ -1,8 +1,15 @@
 use super::{RaindexSwapDataSource, SwapDataSource};
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::quote_denomination::{
+    reverse_convert_calldata_ratio, wrapped_token_map, CurrentRateLookup,
+};
+use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
+use crate::types::trades::Denomination;
+use crate::wrapped_rates::SubgraphRateFetcher;
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
 use rocket::serde::json::Json;
@@ -25,21 +32,52 @@ use tracing::Instrument;
     )
 )]
 #[post("/calldata", data = "<request>")]
+#[allow(clippy::too_many_arguments)]
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    pool: &State<DbPool>,
+    sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
+        let denomination = req.denomination.unwrap_or_default();
+
+        // For tStock: reverse-convert the caller's `maximum_io_ratio` to
+        // wtStock before submitting to the contract. The contract is always
+        // wrapped-token-denominated. We compute the lookup outside the
+        // `process_swap_calldata` helper so that helper stays trivially
+        // testable without DB/subgraph dependencies.
+        let (submitted_ratio, aps) = if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
+            let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
+            reverse_convert_calldata_ratio(
+                &req.maximum_io_ratio,
+                req.input_token,
+                req.output_token,
+                denomination,
+                &mut lookup,
+            )
+            .await?
+        } else {
+            (req.maximum_io_ratio.clone(), None)
+        };
+
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
         };
-        let response = process_swap_calldata(&ds, req).await?;
+        let mut on_chain_req = req.clone();
+        on_chain_req.maximum_io_ratio = submitted_ratio.clone();
+        let mut response = process_swap_calldata(&ds, on_chain_req).await?;
+        response.denomination = denomination;
+        response.assets_per_share = aps;
+        response.submitted_io_ratio = submitted_ratio;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -84,6 +122,7 @@ mod tests {
             output_token: WETH,
             output_amount: output_amount.to_string(),
             maximum_io_ratio: max_ratio.to_string(),
+            denomination: None,
         }
     }
 
@@ -94,6 +133,9 @@ mod tests {
             value: U256::ZERO,
             estimated_input: "150".to_string(),
             approvals: vec![],
+            denomination: Denomination::Wtstock,
+            assets_per_share: None,
+            submitted_io_ratio: String::new(),
         }
     }
 
@@ -110,6 +152,9 @@ mod tests {
                 symbol: String::new(),
                 approval_data: Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]),
             }],
+            denomination: Denomination::Wtstock,
+            assets_per_share: None,
+            submitted_io_ratio: String::new(),
         }
     }
 

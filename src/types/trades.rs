@@ -10,7 +10,17 @@ use utoipa::{IntoParams, ToSchema};
 /// `Tstock` adjusts every wrapped-side amount by the assets-per-share rate
 /// at that trade's block, so the response reads in underlying tStock terms.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema, FromFormField,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    FromFormField,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Denomination {

@@ -4,10 +4,17 @@ use super::{
 };
 use crate::auth::AuthenticatedKey;
 use crate::cache::AppCache;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::quote_denomination::{
+    apply_denomination_to_order_list, wrapped_token_map, CurrentRateLookup,
+};
+use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::common::ValidatedAddress;
 use crate::types::orders::{OrderSide, OrdersByTokenParams, OrdersListResponse};
+use crate::types::trades::Denomination;
+use crate::wrapped_rates::SubgraphRateFetcher;
 use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rain_orderbook_common::raindex_client::orders::GetOrdersTokenFilter;
@@ -159,6 +166,8 @@ pub async fn get_orders_by_token(
     block_number_cache: &State<crate::raindex::BlockNumberCache>,
     limit_ratio_cache: &State<super::LimitOrderRatioCache>,
     stale_price_skip_cache: &State<super::StalePriceSkipCache>,
+    pool: &State<DbPool>,
+    sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersByTokenParams,
@@ -167,6 +176,7 @@ pub async fn get_orders_by_token(
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
         let side = params.side;
+        let denomination = params.denomination.unwrap_or_default();
         let page = params.page.unwrap_or(1);
         let page_size = params
             .page_size
@@ -174,7 +184,7 @@ pub async fn get_orders_by_token(
             .min(MAX_PAGE_SIZE);
         let cache_key = (addr, side, page, page_size);
 
-        let response = orders_cache
+        let mut response = orders_cache
             .get_or_try_insert(cache_key, || async {
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexOrdersListDataSource {
@@ -187,6 +197,32 @@ pub async fn get_orders_by_token(
             })
             .await
             .map_err(ApiError::from)?;
+
+        // Orderbook-depth ordering is established in process_get_orders_by_token
+        // before this conversion runs; this loop preserves that ordering.
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
+            let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
+            apply_denomination_to_order_list(
+                &mut response.orders,
+                denomination,
+                &mut lookup,
+                |o| {
+                    (
+                        o.input_token.address,
+                        o.output_token.address,
+                        o.io_ratio.clone(),
+                    )
+                },
+                |o, ratio, aps, d| {
+                    o.io_ratio = ratio;
+                    o.assets_per_share = aps;
+                    o.denomination = d;
+                },
+            )
+            .await?;
+        }
 
         Ok(Json(response))
     }
@@ -275,6 +311,147 @@ mod tests {
             .unwrap();
         let result = process_get_orders_by_token(&ds, addr, None, None, None).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[rocket::async_test]
+    async fn test_tstock_conversion_preserves_orderbook_depth_ordering() {
+        use crate::db;
+        use crate::routes::quote_denomination::{
+            apply_denomination_to_order_list, CurrentRateLookup,
+        };
+        use crate::types::common::TokenRef;
+        use crate::types::orders::{OrderSummary, OrdersPagination};
+        use crate::types::trades::Denomination;
+        use crate::wrapped_rates::{RateFetchError, RateFetcher, RateObservation};
+        use alloy::primitives::FixedBytes;
+        use async_trait::async_trait;
+        use rain_orderbook_app_settings::network::NetworkCfg;
+        use rain_orderbook_app_settings::token::TokenCfg;
+        use rain_orderbook_app_settings::yaml::default_document;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let pool = {
+            let id = uuid::Uuid::new_v4();
+            db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
+                .await
+                .expect("init db")
+        };
+
+        let wt_addr: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let usdc_addr: Address = "0x00000000000000000000000000000000000000bb"
+            .parse()
+            .unwrap();
+
+        struct FixedFetcher;
+        #[async_trait]
+        impl RateFetcher for FixedFetcher {
+            async fn fetch_current_rate(
+                &self,
+                token: &TokenCfg,
+            ) -> Result<RateObservation, RateFetchError> {
+                Ok(RateObservation {
+                    token_address: token.address,
+                    block_number: 0,
+                    block_timestamp: 0,
+                    assets_per_share: "2.0".into(),
+                    asset_address: Address::ZERO,
+                    asset_symbol: "tStub".into(),
+                    asset_decimals: 18,
+                })
+            }
+        }
+
+        let token_cfg = TokenCfg {
+            document: default_document(),
+            key: "wt".into(),
+            network: Arc::new(NetworkCfg {
+                document: default_document(),
+                key: "base".into(),
+                rpcs: vec![],
+                chain_id: 8453,
+                label: None,
+                network_id: None,
+                currency: None,
+            }),
+            address: wt_addr,
+            decimals: Some(18),
+            label: None,
+            symbol: Some("wtMSTR".into()),
+            logo_uri: None,
+            extensions: None,
+        };
+        let mut wrapped = HashMap::new();
+        wrapped.insert(wt_addr, token_cfg);
+
+        let fetcher = FixedFetcher;
+        let mut lookup = CurrentRateLookup::new(&pool, &fetcher, wrapped);
+
+        let mk = |ratio: &str| OrderSummary {
+            order_hash: FixedBytes::default(),
+            owner: Address::ZERO,
+            order_bytes: Default::default(),
+            input_token: TokenRef {
+                address: wt_addr,
+                symbol: "wtMSTR".into(),
+                decimals: 18,
+            },
+            output_token: TokenRef {
+                address: usdc_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+            output_vault_balance: "100".into(),
+            max_output: "100".into(),
+            io_ratio: ratio.into(),
+            created_at: 0,
+            orderbook_id: Address::ZERO,
+            denomination: Denomination::Wtstock,
+            assets_per_share: None,
+        };
+
+        let mut response = crate::types::orders::OrdersListResponse {
+            orders: vec![mk("0.1"), mk("0.2"), mk("0.3")],
+            pagination: OrdersPagination {
+                page: 1,
+                page_size: 20,
+                total_orders: 3,
+                total_pages: 1,
+                has_more: false,
+            },
+        };
+
+        apply_denomination_to_order_list(
+            &mut response.orders,
+            Denomination::Tstock,
+            &mut lookup,
+            |o| {
+                (
+                    o.input_token.address,
+                    o.output_token.address,
+                    o.io_ratio.clone(),
+                )
+            },
+            |o, ratio, aps, d| {
+                o.io_ratio = ratio;
+                o.assets_per_share = aps;
+                o.denomination = d;
+            },
+        )
+        .await
+        .unwrap();
+
+        // All three converted: 0.1 * 2.0 = 0.2; 0.2 * 2.0 = 0.4; 0.3 * 2.0 = 0.6
+        assert_eq!(response.orders[0].io_ratio, "0.2");
+        assert_eq!(response.orders[1].io_ratio, "0.4");
+        assert_eq!(response.orders[2].io_ratio, "0.6");
+        // Ordering preserved.
+        for o in &response.orders {
+            assert_eq!(o.denomination, Denomination::Tstock);
+            assert_eq!(o.assets_per_share.as_deref(), Some("2.0"));
+        }
     }
 
     #[rocket::async_test]

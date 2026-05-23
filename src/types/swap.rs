@@ -1,4 +1,5 @@
 use crate::types::common::Approval;
+use crate::types::trades::Denomination;
 use alloy::primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -12,6 +13,12 @@ pub struct SwapQuoteRequest {
     pub output_token: Address,
     #[schema(example = "0.5")]
     pub output_amount: String,
+    /// `wtstock` (default) returns the raw wrapped-token quote. `tstock`
+    /// rescales `estimated_input`, `estimated_output`, and
+    /// `estimated_io_ratio` by the latest `assetsPerShare` snapshot for any
+    /// wrapped side of the pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -29,6 +36,17 @@ pub struct SwapQuoteResponse {
     pub estimated_input: String,
     #[schema(example = "2501.5")]
     pub estimated_io_ratio: String,
+    /// Denomination applied to amounts/ratios in this response. Mirrors the
+    /// `denomination` field on the request — `wtstock` for raw on-chain
+    /// values, `tstock` for values rescaled via the wrapped exchange rate.
+    #[serde(default)]
+    pub denomination: Denomination,
+    /// `assetsPerShare` rate(s) used when `denomination == "tstock"`.
+    /// Decimal string; `None` for `wtstock` or when neither side of the pair
+    /// is a wrapped token (so the conversion was a no-op).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.04", value_type = Option<String>)]
+    pub assets_per_share: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -44,6 +62,12 @@ pub struct SwapCalldataRequest {
     pub output_amount: String,
     #[schema(example = "2600")]
     pub maximum_io_ratio: String,
+    /// `wtstock` (default) treats `maximum_io_ratio` as already
+    /// wtStock-denominated and forwards it straight to the contract.
+    /// `tstock` interprets the caller-supplied ratio as a tStock value and
+    /// reverse-converts it to wtStock terms before building the calldata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -58,4 +82,16 @@ pub struct SwapCalldataResponse {
     #[schema(example = "1250.75")]
     pub estimated_input: String,
     pub approvals: Vec<Approval>,
+    /// Denomination applied to the response. Mirrors the request value.
+    #[serde(default)]
+    pub denomination: Denomination,
+    /// `assetsPerShare` rate(s) used when `denomination == "tstock"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.04", value_type = Option<String>)]
+    pub assets_per_share: Option<String>,
+    /// The wtStock-denominated `maximum_io_ratio` actually submitted to the
+    /// orderbook contract. Equal to the caller-supplied value for `wtstock`,
+    /// or the reverse-converted value for `tstock`.
+    #[schema(example = "2600")]
+    pub submitted_io_ratio: String,
 }

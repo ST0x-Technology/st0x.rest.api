@@ -1,4 +1,5 @@
 use crate::types::common::TokenRef;
+use crate::types::trades::Denomination;
 use alloy::primitives::{Address, Bytes, FixedBytes};
 use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,11 @@ pub struct OrdersPaginationParams {
     #[field(name = "pageSize")]
     #[param(example = 20)]
     pub page_size: Option<u16>,
+    /// `wtstock` (default) returns raw on-chain `ioRatio` values. `tstock`
+    /// converts the ratio using the latest `assetsPerShare` snapshot for any
+    /// wrapped side of the order pair.
+    #[field(name = "denomination")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(
@@ -37,6 +43,11 @@ pub struct OrdersByTokenParams {
     #[field(name = "pageSize")]
     #[param(example = 20)]
     pub page_size: Option<u16>,
+    /// `wtstock` (default) returns raw on-chain `ioRatio` values. `tstock`
+    /// converts the ratio using the latest `assetsPerShare` snapshot for any
+    /// wrapped side of the order pair.
+    #[field(name = "denomination")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -62,6 +73,18 @@ pub struct OrderSummary {
     pub created_at: u64,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub orderbook_id: Address,
+    /// Denomination applied to `io_ratio`. Mirrors the `denomination` query
+    /// parameter — `wtstock` for raw on-chain ratios, `tstock` for ratios
+    /// rescaled by the wrapped exchange rate.
+    #[serde(default)]
+    pub denomination: Denomination,
+    /// Per-order `assetsPerShare` rate used when
+    /// `denomination == "tstock"`. Decimal string; `None` for `wtstock` or
+    /// when neither side of the order pair is wrapped (no conversion
+    /// required).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.04", value_type = Option<String>)]
+    pub assets_per_share: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

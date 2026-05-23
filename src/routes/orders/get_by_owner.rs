@@ -4,10 +4,17 @@ use super::{
 };
 use crate::auth::AuthenticatedKey;
 use crate::cache::AppCache;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::quote_denomination::{
+    apply_denomination_to_order_list, wrapped_token_map, CurrentRateLookup,
+};
+use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::common::ValidatedAddress;
 use crate::types::orders::{OrdersListResponse, OrdersPaginationParams};
+use crate::types::trades::Denomination;
+use crate::wrapped_rates::SubgraphRateFetcher;
 use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rocket::serde::json::Json;
@@ -141,6 +148,8 @@ pub async fn get_orders_by_address(
     block_number_cache: &State<crate::raindex::BlockNumberCache>,
     limit_ratio_cache: &State<super::LimitOrderRatioCache>,
     stale_price_skip_cache: &State<super::StalePriceSkipCache>,
+    pool: &State<DbPool>,
+    sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,
@@ -148,6 +157,7 @@ pub async fn get_orders_by_address(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
+        let denomination = params.denomination.unwrap_or_default();
         let page = params.page.unwrap_or(1);
         let page_size = params
             .page_size
@@ -155,7 +165,7 @@ pub async fn get_orders_by_address(
             .min(MAX_PAGE_SIZE);
         let cache_key = (addr, page, page_size);
 
-        let response = orders_cache
+        let mut response = orders_cache
             .get_or_try_insert(cache_key, || async {
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexOrdersListDataSource {
@@ -168,6 +178,30 @@ pub async fn get_orders_by_address(
             })
             .await
             .map_err(ApiError::from)?;
+
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
+            let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
+            apply_denomination_to_order_list(
+                &mut response.orders,
+                denomination,
+                &mut lookup,
+                |o| {
+                    (
+                        o.input_token.address,
+                        o.output_token.address,
+                        o.io_ratio.clone(),
+                    )
+                },
+                |o, ratio, aps, d| {
+                    o.io_ratio = ratio;
+                    o.assets_per_share = aps;
+                    o.denomination = d;
+                },
+            )
+            .await?;
+        }
 
         Ok(Json(response))
     }

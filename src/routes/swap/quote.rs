@@ -1,8 +1,15 @@
 use super::{RaindexSwapDataSource, SwapDataSource, SwapQuoteCache};
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::quote_denomination::{
+    apply_denomination_to_quote, wrapped_token_map, CurrentRateLookup,
+};
+use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
+use crate::types::trades::Denomination;
+use crate::wrapped_rates::SubgraphRateFetcher;
 use rain_math_float::Float;
 use rain_orderbook_common::take_orders::simulate_buy_over_candidates;
 use rocket::serde::json::Json;
@@ -26,20 +33,33 @@ use tracing::Instrument;
     )
 )]
 #[post("/quote", data = "<request>")]
+#[allow(clippy::too_many_arguments)]
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     swap_cache: &State<SwapQuoteCache>,
+    pool: &State<DbPool>,
+    sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let cache_key = (req.input_token, req.output_token, req.output_amount.clone());
-        let req_for_fetch = req.clone();
-        let response = swap_cache
+        let denomination = req.denomination.unwrap_or_default();
+        // Cache the *raw* wtStock quote and apply denomination per-request.
+        // Including denomination in the key avoids cross-pollution and lets
+        // us re-use a cached wtStock fetch for repeated tstock requests.
+        let cache_key = (
+            req.input_token,
+            req.output_token,
+            req.output_amount.clone(),
+            Denomination::Wtstock,
+        );
+        let mut req_for_fetch = req.clone();
+        req_for_fetch.denomination = Some(Denomination::Wtstock);
+        let mut response = swap_cache
             .get_or_try_insert(cache_key, || async move {
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexSwapDataSource {
@@ -49,6 +69,14 @@ pub async fn post_swap_quote(
             })
             .await
             .map_err(ApiError::from)?;
+
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
+            let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
+            apply_denomination_to_quote(&mut response, denomination, &mut lookup).await?;
+        }
+
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -123,6 +151,8 @@ async fn process_swap_quote(
         estimated_output: formatted_output,
         estimated_input: formatted_input,
         estimated_io_ratio: formatted_ratio,
+        denomination: Denomination::Wtstock,
+        assets_per_share: None,
     })
 }
 
@@ -142,6 +172,7 @@ mod tests {
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
+            denomination: None,
         }
     }
 
@@ -270,7 +301,7 @@ mod tests {
         use std::sync::Arc;
 
         let cache = crate::routes::swap::swap_quote_cache();
-        let key = (USDC, WETH, "100".to_string());
+        let key = (USDC, WETH, "100".to_string(), Denomination::Wtstock);
         let cached = SwapQuoteResponse {
             input_token: USDC,
             output_token: WETH,
@@ -278,6 +309,8 @@ mod tests {
             estimated_output: "100".to_string(),
             estimated_input: "150".to_string(),
             estimated_io_ratio: "1.5".to_string(),
+            denomination: Denomination::Wtstock,
+            assets_per_share: None,
         };
         cache.insert(key.clone(), cached.clone()).await;
 
@@ -303,7 +336,7 @@ mod tests {
         use std::sync::Arc;
 
         let cache = crate::routes::swap::swap_quote_cache();
-        let key = (USDC, WETH, "200".to_string());
+        let key = (USDC, WETH, "200".to_string(), Denomination::Wtstock);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_inner = Arc::clone(&calls);
 
@@ -317,6 +350,8 @@ mod tests {
                     estimated_output: "200".to_string(),
                     estimated_input: "300".to_string(),
                     estimated_io_ratio: "1.5".to_string(),
+                    denomination: Denomination::Wtstock,
+                    assets_per_share: None,
                 })
             })
             .await;

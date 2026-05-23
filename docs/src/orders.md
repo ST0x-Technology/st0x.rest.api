@@ -254,3 +254,35 @@ curl -X POST https://api.st0x.io/v1/order/cancel \
 ```
 
 Execute each transaction in the `transactions` array sequentially. The `summary` shows what tokens you will receive back.
+
+## Denomination toggle
+
+All order-listing endpoints (`GET /v1/orders/owner/{address}`,
+`GET /v1/orders/token/{address}`, `GET /v1/order/{order_hash}`) accept an
+optional `denomination` query parameter:
+
+| Value | Meaning |
+|-------|---------|
+| `wtstock` *(default)* | `ioRatio` is returned exactly as quoted on chain — wrapped-token-denominated. Backwards-compatible. |
+| `tstock` | `ioRatio` is converted using the latest `assetsPerShare` snapshot for any wrapped side of the order pair. Orderbook depth ordering is preserved across the conversion. |
+
+When `denomination=tstock`:
+
+- Each response entry includes `denomination: "tstock"` and an
+  `assetsPerShare` rate string (e.g. `"1.04"`, or
+  `"input=1.04;output=1.02"` when both sides are wrapped with different
+  rates).
+- If a wrapped token has no persisted snapshot and the in-line refresh
+  also fails (subgraph/RPC down), the entry's `ioRatio` is left untouched
+  and `assetsPerShare` is omitted so the caller can detect the no-op.
+- The token metadata in `inputToken`/`outputToken` keeps pointing at the
+  wrapped share token. Pair with [`GET /v1/tokens/exchange-rates`](./tokens.md#wrapped-token-exchange-rates)
+  for underlying-asset metadata.
+
+Example:
+
+```bash
+curl "https://api.st0x.io/v1/orders/token/0xWtStockAddress?denomination=tstock" \
+  -H "Authorization: Basic <credentials>"
+```
+

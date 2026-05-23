@@ -188,3 +188,34 @@ fi
 # 4. Execute the swap transaction using to, data, and value from the response
 echo "$CALLDATA" | jq '{to, data, value}'
 ```
+
+## Denomination toggle
+
+Both `POST /v1/swap/quote` and `POST /v1/swap/calldata` accept an optional
+`denomination` field in the request body:
+
+| Value | Meaning |
+|-------|---------|
+| `wtstock` *(default)* | All amounts and ratios are wrapped-token-denominated (i.e. raw `wt*` units). Backwards-compatible. |
+| `tstock` | Wrapped-side amounts and ratios are rescaled by the latest `assetsPerShare` snapshot. The conversion uses the most recent snapshot per wrapped token; snapshots older than 24h are refreshed in-line. |
+
+### Quote semantics
+
+When `denomination=tstock` on `/v1/swap/quote`:
+
+- `estimatedInput`, `estimatedOutput`, and `estimatedIoRatio` are scaled
+  using the current rate(s).
+- `denomination` and `assetsPerShare` echo the conversion in the response.
+- `outputAmount` is left unchanged — it echoes the wtStock amount we
+  actually simulated against.
+
+### Calldata semantics
+
+When `denomination=tstock` on `/v1/swap/calldata`:
+
+- The caller's `maximumIoRatio` is interpreted as a *tStock* ratio and
+  reverse-converted to wtStock terms before being submitted on-chain.
+- The wtStock value actually submitted to the contract is echoed in
+  `submittedIoRatio` so callers can verify the conversion.
+- `denomination` and `assetsPerShare` are echoed in the response.
+

@@ -1,16 +1,36 @@
 use super::{OrderDataSource, RaindexOrderDataSource};
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::quote_denomination::{
+    apply_denomination_to_order_list, wrapped_token_map, CurrentRateLookup,
+};
+use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::common::{TokenRef, ValidatedFixedBytes};
 use crate::types::order::{OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType};
+use crate::types::trades::Denomination;
+use crate::wrapped_rates::SubgraphRateFetcher;
 use alloy::primitives::B256;
 use rain_orderbook_common::parsed_meta::ParsedMeta;
 use rain_orderbook_common::raindex_client::orders::RaindexOrder;
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
+use rocket::form::FromForm;
 use rocket::serde::json::Json;
 use rocket::State;
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
+use utoipa::IntoParams;
+
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams, Default)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct GetOrderParams {
+    /// `wtstock` (default) returns raw on-chain `ioRatio`. `tstock`
+    /// converts using the latest wrapped exchange-rate snapshot.
+    #[field(name = "denomination")]
+    pub denomination: Option<Denomination>,
+}
 
 #[utoipa::path(
     get,
@@ -19,6 +39,7 @@ use tracing::Instrument;
     security(("basicAuth" = [])),
     params(
         ("order_hash" = String, Path, description = "The order hash"),
+        GetOrderParams,
     ),
     responses(
         (status = 200, description = "Order details", body = OrderDetail),
@@ -28,22 +49,58 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/<order_hash>")]
+#[allow(clippy::too_many_arguments)]
+#[get("/<order_hash>?<params..>")]
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    pool: &State<DbPool>,
+    sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
+    params: GetOrderParams,
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
-        tracing::info!(order_hash = ?order_hash, "request received");
+        tracing::info!(order_hash = ?order_hash, params = ?params, "request received");
         let hash = order_hash.0;
-        let raindex = shared_raindex.read().await;
-        let ds = RaindexOrderDataSource {
-            client: raindex.client(),
+        let denomination = params.denomination.unwrap_or_default();
+        let mut detail = {
+            let raindex = shared_raindex.read().await;
+            let ds = RaindexOrderDataSource {
+                client: raindex.client(),
+            };
+            process_get_order(&ds, hash).await?
         };
-        let detail = process_get_order(&ds, hash).await?;
+
+        if denomination == Denomination::Tstock {
+            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
+            let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
+            // Wrap the single detail in a one-element slice so we can reuse
+            // the generic helper. Ordering trivially preserved.
+            let detail_slice: &mut [OrderDetail] = std::slice::from_mut(&mut detail);
+            apply_denomination_to_order_list(
+                detail_slice,
+                denomination,
+                &mut lookup,
+                |o| {
+                    (
+                        o.input_token.address,
+                        o.output_token.address,
+                        o.io_ratio.clone(),
+                    )
+                },
+                |o, ratio, aps, d| {
+                    o.order_details.io_ratio = ratio.clone();
+                    o.io_ratio = ratio;
+                    o.assets_per_share = aps;
+                    o.denomination = d;
+                },
+            )
+            .await?;
+        }
+
         Ok(Json(detail))
     }
     .instrument(span.0)
@@ -118,6 +175,8 @@ fn build_order_detail(
         created_at,
         orderbook_id: order.orderbook(),
         trades: trade_entries,
+        denomination: Denomination::Wtstock,
+        assets_per_share: None,
     })
 }
 

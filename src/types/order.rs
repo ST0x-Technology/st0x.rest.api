@@ -1,4 +1,5 @@
 use crate::types::common::{Approval, TokenRef};
+use crate::types::trades::Denomination;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -166,6 +167,18 @@ pub struct OrderDetail {
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub orderbook_id: Address,
     pub trades: Vec<OrderTradeEntry>,
+    /// Denomination applied to `io_ratio` (and `order_details.io_ratio`).
+    /// Mirrors the `denomination` query parameter — `wtstock` for raw
+    /// on-chain ratios, `tstock` for ratios rescaled by the wrapped
+    /// exchange rate.
+    #[serde(default)]
+    pub denomination: Denomination,
+    /// `assetsPerShare` rate used when `denomination == "tstock"`.
+    /// Decimal string; `None` for `wtstock` or when neither side of the
+    /// order pair is wrapped (no conversion required).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.04", value_type = Option<String>)]
+    pub assets_per_share: Option<String>,
 }
 
 #[cfg(test)]
