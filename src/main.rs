@@ -8,6 +8,7 @@ mod catchers;
 mod cli;
 mod config;
 mod db;
+mod denomination;
 mod direct_trades;
 mod error;
 mod fairings;

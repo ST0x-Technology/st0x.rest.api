@@ -13,18 +13,23 @@
 //!   `wtstock_ratio = tstock_ratio * (output_rate / input_rate)`. The
 //!   contract always speaks wtStock, so the caller hands us a tStock ratio
 //!   and we feed the contract its wrapped equivalent.
+//!
+//! Shared math and the [`RateLookup`](crate::denomination::RateLookup) trait
+//! live in [`crate::denomination`].
 
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
+use crate::denomination::{
+    combine_rate_strings, convert_ratio_to_tstock, convert_ratio_to_wtstock, multiply_decimal,
+    RateLookup,
+};
 use crate::error::ApiError;
-use crate::raindex::SharedRaindexProvider;
 use crate::types::trades::Denomination;
 use crate::wrapped_rates::{self, RateFetcher};
 use alloy::primitives::Address;
-use rain_math_float::Float;
+use async_trait::async_trait;
 use rain_orderbook_app_settings::token::TokenCfg;
 use std::collections::HashMap;
-use std::ops::{Div, Mul};
 
 /// Max age before a cached rate snapshot is refreshed from the subgraph.
 const MAX_SNAPSHOT_AGE_SECS: i64 = 86_400;
@@ -52,16 +57,11 @@ impl<'a> CurrentRateLookup<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_wrapped(&self, addr: Address) -> bool {
-        self.wrapped_tokens.contains_key(&addr)
-    }
-
     /// Returns the current `assetsPerShare` decimal string for `token`, or
     /// `None` if the token is not a wrapped token. Refreshes via the
     /// configured fetcher when the latest persisted snapshot is older than
     /// `MAX_SNAPSHOT_AGE_SECS`.
-    pub(crate) async fn rate_for(&mut self, token: Address) -> Result<Option<String>, ApiError> {
+    async fn rate(&mut self, token: Address) -> Result<Option<String>, ApiError> {
         if let Some(cached) = self.cache.get(&token) {
             return Ok(cached.clone());
         }
@@ -98,129 +98,17 @@ impl<'a> CurrentRateLookup<'a> {
     }
 }
 
-/// Build the wrapped-token map (address → TokenCfg) by filtering the
-/// registry. The TokenCfg is required for the subgraph refresh path.
-pub(crate) async fn wrapped_token_map(
-    shared_raindex: &SharedRaindexProvider,
-) -> Result<HashMap<Address, TokenCfg>, ApiError> {
-    let raindex = shared_raindex.read().await;
-    let tokens = raindex.client().get_all_tokens().map_err(|e| {
-        tracing::error!(error = %e, "failed to get tokens for wrapped map");
-        ApiError::Internal("failed to load token list".into())
-    })?;
-    Ok(tokens
-        .into_values()
-        .filter(wrapped_rates::is_wrapped_token)
-        .map(|t| (t.address, t))
-        .collect())
-}
+#[async_trait]
+impl<'a> RateLookup for CurrentRateLookup<'a> {
+    type Context = ();
 
-fn parse_float(value: &str, context: &'static str) -> Result<Float, ApiError> {
-    Float::parse(value.to_string()).map_err(|e| {
-        tracing::error!(error = %e, value, context, "failed to parse float");
-        ApiError::Internal(format!("{context} parse failed"))
-    })
-}
-
-fn format_float(value: Float, context: &'static str) -> Result<String, ApiError> {
-    value.format().map_err(|e| {
-        tracing::error!(error = %e, context, "float formatting failed");
-        ApiError::Internal(format!("{context} format failed"))
-    })
-}
-
-fn multiply_decimal(amount: &str, rate: &str) -> Result<String, ApiError> {
-    let amount_f = parse_float(amount, "quote amount")?;
-    let rate_f = parse_float(rate, "wrapped rate")?;
-    let product = amount_f.mul(rate_f).map_err(|e| {
-        tracing::error!(error = %e, "failed to scale amount by wrapped rate");
-        ApiError::Internal("denomination adjustment failed".into())
-    })?;
-    format_float(product, "quote amount")
-}
-
-/// Combine optional input/output rates into a single response field. If both
-/// sides have rates and they differ, we emit both — matches the pattern used
-/// by `trades_denomination::combine_rate_strings`.
-fn combine_rate_strings(input_rate: Option<&str>, output_rate: Option<&str>) -> Option<String> {
-    match (input_rate, output_rate) {
-        (Some(i), Some(o)) if i == o => Some(i.to_string()),
-        (Some(i), Some(o)) => Some(format!("input={i};output={o}")),
-        (Some(i), None) => Some(i.to_string()),
-        (None, Some(o)) => Some(o.to_string()),
-        (None, None) => None,
+    async fn rate_for(&mut self, token: Address, _ctx: ()) -> Result<Option<String>, ApiError> {
+        self.rate(token).await
     }
-}
 
-/// Convert a wtStock-denominated IO ratio to its tStock equivalent.
-///
-/// `tstock_ratio = wtstock_ratio * (input_rate / output_rate)` with `1.0`
-/// substituted for the non-wrapped side. Both sides wrapped at the same rate
-/// is a no-op (the ratio cancels).
-fn convert_ratio_to_tstock(
-    ratio: &str,
-    input_rate: Option<&str>,
-    output_rate: Option<&str>,
-) -> Result<String, ApiError> {
-    if input_rate.is_none() && output_rate.is_none() {
-        return Ok(ratio.to_string());
+    fn is_wrapped(&self, token: Address) -> bool {
+        self.wrapped_tokens.contains_key(&token)
     }
-    let one = Float::parse("1.0".into()).map_err(|e| {
-        tracing::error!(error = %e, "float one construction failed");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    let ratio_f = parse_float(ratio, "io ratio")?;
-    let input_f = match input_rate {
-        Some(r) => parse_float(r, "wrapped rate")?,
-        None => one,
-    };
-    let output_f = match output_rate {
-        Some(r) => parse_float(r, "wrapped rate")?,
-        None => one,
-    };
-    let scale = input_f.div(output_f).map_err(|e| {
-        tracing::error!(error = %e, "failed to scale io ratio");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    let converted = ratio_f.mul(scale).map_err(|e| {
-        tracing::error!(error = %e, "failed to apply tstock conversion to io ratio");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    format_float(converted, "io ratio")
-}
-
-/// Inverse of `convert_ratio_to_tstock`. Caller's tStock-denominated ratio
-/// becomes the wtStock value the contract expects.
-fn convert_ratio_to_wtstock(
-    ratio: &str,
-    input_rate: Option<&str>,
-    output_rate: Option<&str>,
-) -> Result<String, ApiError> {
-    if input_rate.is_none() && output_rate.is_none() {
-        return Ok(ratio.to_string());
-    }
-    let one = Float::parse("1.0".into()).map_err(|e| {
-        tracing::error!(error = %e, "float one construction failed");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    let ratio_f = parse_float(ratio, "io ratio")?;
-    let input_f = match input_rate {
-        Some(r) => parse_float(r, "wrapped rate")?,
-        None => one,
-    };
-    let output_f = match output_rate {
-        Some(r) => parse_float(r, "wrapped rate")?,
-        None => one,
-    };
-    let scale = output_f.div(input_f).map_err(|e| {
-        tracing::error!(error = %e, "failed to scale io ratio");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    let converted = ratio_f.mul(scale).map_err(|e| {
-        tracing::error!(error = %e, "failed to apply wtstock conversion to io ratio");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    format_float(converted, "io ratio")
 }
 
 /// Adjust a swap quote response to tStock terms. No-op when `denomination`
@@ -235,8 +123,8 @@ pub(crate) async fn apply_denomination_to_quote(
         return Ok(());
     }
 
-    let input_rate = lookup.rate_for(response.input_token).await?;
-    let output_rate = lookup.rate_for(response.output_token).await?;
+    let input_rate = lookup.rate_for(response.input_token, ()).await?;
+    let output_rate = lookup.rate_for(response.output_token, ()).await?;
 
     if let Some(rate) = input_rate.as_deref() {
         response.estimated_input = multiply_decimal(&response.estimated_input, rate)?;
@@ -276,8 +164,8 @@ pub(crate) async fn reverse_convert_calldata_ratio(
     if denomination == Denomination::Wtstock {
         return Ok((io_ratio.to_string(), None));
     }
-    let input_rate = lookup.rate_for(input_token).await?;
-    let output_rate = lookup.rate_for(output_token).await?;
+    let input_rate = lookup.rate_for(input_token, ()).await?;
+    let output_rate = lookup.rate_for(output_token, ()).await?;
     let wtstock_ratio =
         convert_ratio_to_wtstock(io_ratio, input_rate.as_deref(), output_rate.as_deref())?;
     let aps = combine_rate_strings(input_rate.as_deref(), output_rate.as_deref());
@@ -307,8 +195,8 @@ where
     // string fields. The orderbook-depth sort already happened upstream.
     for entry in orders.iter_mut() {
         let (input_token, output_token, io_ratio) = extract(entry);
-        let input_rate = lookup.rate_for(input_token).await?;
-        let output_rate = lookup.rate_for(output_token).await?;
+        let input_rate = lookup.rate_for(input_token, ()).await?;
+        let output_rate = lookup.rate_for(output_token, ()).await?;
         // Skip when the ratio is a placeholder (failed quote) — leave the
         // entry untouched but still mark denomination so the response shape
         // is consistent.

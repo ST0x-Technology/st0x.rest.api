@@ -7,29 +7,38 @@
 //! When a side isn't a wrapped token, or no historical snapshot exists, the
 //! row's amounts and ratios are left untouched and `assets_per_share` is set
 //! to `None` so callers can distinguish "converted" from "unavailable".
+//!
+//! Shared math (float parsing, sign-aware multiply, rate-string combination,
+//! ratio scaling) and the [`RateLookup`](crate::denomination::RateLookup) trait
+//! live in [`crate::denomination`].
 
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
+use crate::denomination::{
+    combine_rate_strings, convert_amounts_to_tstock_ratio, format_float, multiply_decimal,
+    parse_float, RateLookup,
+};
 use crate::error::ApiError;
 use crate::types::trades::{
     Denomination, TradeByTxEntry, TradesByAddressResponse, TradesByTxResponse, TradesTotals,
 };
 use alloy::primitives::Address;
+use async_trait::async_trait;
 use rain_math_float::Float;
 use std::collections::{HashMap, HashSet};
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Div};
 
 /// Builds a lookup of wrapped-token rate snapshots for the addresses
 /// touched by a batch of trades. Each `(token_address, block_number)` pair
 /// is resolved to the snapshot ≤ that block, then memoized so repeated
 /// lookups in the same response are free.
-pub(crate) struct RateLookup<'a> {
+pub(crate) struct HistoricalRateLookup<'a> {
     pool: &'a DbPool,
     cache: HashMap<(Address, u64), Option<db_rates::WrappedRateSnapshot>>,
     wrapped_tokens: HashSet<Address>,
 }
 
-impl<'a> RateLookup<'a> {
+impl<'a> HistoricalRateLookup<'a> {
     pub(crate) fn new(pool: &'a DbPool, wrapped_tokens: HashSet<Address>) -> Self {
         Self {
             pool,
@@ -38,11 +47,7 @@ impl<'a> RateLookup<'a> {
         }
     }
 
-    pub(crate) fn is_wrapped(&self, addr: Address) -> bool {
-        self.wrapped_tokens.contains(&addr)
-    }
-
-    pub(crate) async fn rate_at(
+    async fn snapshot_at(
         &mut self,
         token: Address,
         block_number: u64,
@@ -65,101 +70,26 @@ impl<'a> RateLookup<'a> {
     }
 }
 
-pub(crate) async fn wrapped_token_set(
-    shared_raindex: &crate::raindex::SharedRaindexProvider,
-) -> Result<HashSet<Address>, ApiError> {
-    let raindex = shared_raindex.read().await;
-    let tokens = raindex.client().get_all_tokens().map_err(|e| {
-        tracing::error!(error = %e, "failed to get tokens for wrapped set");
-        ApiError::Internal("failed to load token list".into())
-    })?;
-    Ok(tokens
-        .into_values()
-        .filter(crate::wrapped_rates::is_wrapped_token)
-        .map(|t| t.address)
-        .collect())
-}
+#[async_trait]
+impl<'a> RateLookup for HistoricalRateLookup<'a> {
+    type Context = u64;
 
-fn parse_float(value: &str, context: &'static str) -> Result<Float, ApiError> {
-    Float::parse(value.to_string()).map_err(|e| {
-        tracing::error!(error = %e, value, context, "failed to parse float");
-        ApiError::Internal(format!("{context} parse failed"))
-    })
-}
-
-fn format_float(value: Float, context: &'static str) -> Result<String, ApiError> {
-    value.format().map_err(|e| {
-        tracing::error!(error = %e, context, "float formatting failed");
-        ApiError::Internal(format!("{context} format failed"))
-    })
-}
-
-fn multiply_signed_decimal(amount: &str, rate: &str) -> Result<String, ApiError> {
-    let trimmed = amount.trim_start();
-    let (sign, magnitude) = match trimmed.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", trimmed),
-    };
-    let amount_f = parse_float(magnitude, "trade amount")?;
-    let rate_f = parse_float(rate, "wrapped rate")?;
-    let product = amount_f.mul(rate_f).map_err(|e| {
-        tracing::error!(error = %e, "failed to scale amount by wrapped rate");
-        ApiError::Internal("denomination adjustment failed".into())
-    })?;
-    Ok(format!("{sign}{}", format_float(product, "trade amount")?))
-}
-
-fn ratio_in_tstock(
-    input_amount: &str,
-    output_amount: &str,
-    input_rate: Option<&str>,
-    output_rate: Option<&str>,
-) -> Result<String, ApiError> {
-    let zero = Float::zero().map_err(|e| {
-        tracing::error!(error = %e, "float zero construction failed");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    let input_f = parse_float(input_amount.trim_start_matches('-'), "trade amount")?;
-    let output_magnitude = output_amount.trim_start().trim_start_matches('-');
-    let output_f = parse_float(output_magnitude, "trade amount")?;
-
-    let input_f = match input_rate {
-        Some(r) => input_f.mul(parse_float(r, "wrapped rate")?).map_err(|e| {
-            tracing::error!(error = %e, "failed to scale input by wrapped rate");
-            ApiError::Internal("denomination adjustment failed".into())
-        })?,
-        None => input_f,
-    };
-    let output_f = match output_rate {
-        Some(r) => output_f.mul(parse_float(r, "wrapped rate")?).map_err(|e| {
-            tracing::error!(error = %e, "failed to scale output by wrapped rate");
-            ApiError::Internal("denomination adjustment failed".into())
-        })?,
-        None => output_f,
-    };
-
-    if output_f.eq(zero).unwrap_or(true) {
-        return Ok("0".into());
+    async fn rate_for(
+        &mut self,
+        token: Address,
+        block_number: u64,
+    ) -> Result<Option<String>, ApiError> {
+        let snapshot = self.snapshot_at(token, block_number).await?;
+        Ok(snapshot.map(|s| s.assets_per_share))
     }
-    let ratio = input_f.div(output_f).map_err(|e| {
-        tracing::error!(error = %e, "failed to compute io ratio in tstock");
-        ApiError::Internal("io ratio calculation failed".into())
-    })?;
-    format_float(ratio, "io ratio")
-}
 
-fn combine_rate_strings(input_rate: Option<&str>, output_rate: Option<&str>) -> Option<String> {
-    match (input_rate, output_rate) {
-        (Some(i), Some(o)) if i == o => Some(i.to_string()),
-        (Some(i), Some(o)) => Some(format!("input={i};output={o}")),
-        (Some(i), None) => Some(i.to_string()),
-        (None, Some(o)) => Some(o.to_string()),
-        (None, None) => None,
+    fn is_wrapped(&self, addr: Address) -> bool {
+        self.wrapped_tokens.contains(&addr)
     }
 }
 
 pub(crate) async fn apply_denomination_by_address(
-    lookup: &mut RateLookup<'_>,
+    lookup: &mut HistoricalRateLookup<'_>,
     denomination: Denomination,
     response: &mut TradesByAddressResponse,
 ) -> Result<(), ApiError> {
@@ -169,19 +99,17 @@ pub(crate) async fn apply_denomination_by_address(
 
     for trade in &mut response.trades {
         let input_rate = lookup
-            .rate_at(trade.input_token.address, trade.block_number)
-            .await?
-            .map(|s| s.assets_per_share);
+            .rate_for(trade.input_token.address, trade.block_number)
+            .await?;
         let output_rate = lookup
-            .rate_at(trade.output_token.address, trade.block_number)
-            .await?
-            .map(|s| s.assets_per_share);
+            .rate_for(trade.output_token.address, trade.block_number)
+            .await?;
 
         if let Some(rate) = input_rate.as_deref() {
-            trade.input_amount = multiply_signed_decimal(&trade.input_amount, rate)?;
+            trade.input_amount = multiply_decimal(&trade.input_amount, rate)?;
         }
         if let Some(rate) = output_rate.as_deref() {
-            trade.output_amount = multiply_signed_decimal(&trade.output_amount, rate)?;
+            trade.output_amount = multiply_decimal(&trade.output_amount, rate)?;
         }
         trade.denomination = Denomination::Tstock;
         trade.assets_per_share =
@@ -192,7 +120,7 @@ pub(crate) async fn apply_denomination_by_address(
 }
 
 pub(crate) async fn apply_denomination_by_tx(
-    lookup: &mut RateLookup<'_>,
+    lookup: &mut HistoricalRateLookup<'_>,
     denomination: Denomination,
     response: &mut TradesByTxResponse,
 ) -> Result<(), ApiError> {
@@ -206,13 +134,11 @@ pub(crate) async fn apply_denomination_by_tx(
 
     for entry in &mut response.trades {
         let input_rate = lookup
-            .rate_at(entry.request.input_token, block_number)
-            .await?
-            .map(|s| s.assets_per_share);
+            .rate_for(entry.request.input_token, block_number)
+            .await?;
         let output_rate = lookup
-            .rate_at(entry.request.output_token, block_number)
-            .await?
-            .map(|s| s.assets_per_share);
+            .rate_for(entry.request.output_token, block_number)
+            .await?;
 
         adjust_entry(entry, input_rate.as_deref(), output_rate.as_deref())?;
 
@@ -277,14 +203,14 @@ fn adjust_entry(
     output_rate: Option<&str>,
 ) -> Result<(), ApiError> {
     if let Some(rate) = input_rate {
-        entry.request.maximum_input = multiply_signed_decimal(&entry.request.maximum_input, rate)?;
-        entry.result.input_amount = multiply_signed_decimal(&entry.result.input_amount, rate)?;
+        entry.request.maximum_input = multiply_decimal(&entry.request.maximum_input, rate)?;
+        entry.result.input_amount = multiply_decimal(&entry.result.input_amount, rate)?;
     }
     if let Some(rate) = output_rate {
-        entry.result.output_amount = multiply_signed_decimal(&entry.result.output_amount, rate)?;
+        entry.result.output_amount = multiply_decimal(&entry.result.output_amount, rate)?;
     }
 
-    let new_ratio = ratio_in_tstock(
+    let new_ratio = convert_amounts_to_tstock_ratio(
         &entry.result.input_amount,
         &entry.result.output_amount,
         // Amounts above are already scaled — pass None so we don't double-apply.
@@ -296,14 +222,6 @@ fn adjust_entry(
     entry.denomination = Denomination::Tstock;
     entry.assets_per_share = combine_rate_strings(input_rate, output_rate);
     Ok(())
-}
-
-#[allow(dead_code)]
-fn negate(value: Float) -> Result<Float, ApiError> {
-    Float::zero().and_then(|z| z.sub(value)).map_err(|e| {
-        tracing::error!(error = %e, "float negate failed");
-        ApiError::Internal("denomination adjustment failed".into())
-    })
 }
 
 #[cfg(test)]
@@ -336,7 +254,7 @@ mod tests {
     #[rocket::async_test]
     async fn test_no_adjustment_when_wtstock() {
         let pool = fresh_pool().await;
-        let mut lookup = RateLookup::new(&pool, HashSet::new());
+        let mut lookup = HistoricalRateLookup::new(&pool, HashSet::new());
         let mut response = TradesByAddressResponse {
             trades: vec![TradeByAddress {
                 tx_hash: Default::default(),
@@ -388,7 +306,7 @@ mod tests {
 
         let mut wrapped = HashSet::new();
         wrapped.insert(wt.address);
-        let mut lookup = RateLookup::new(&pool, wrapped);
+        let mut lookup = HistoricalRateLookup::new(&pool, wrapped);
 
         let mut response = TradesByAddressResponse {
             trades: vec![TradeByAddress {
@@ -445,7 +363,7 @@ mod tests {
 
         let mut wrapped = HashSet::new();
         wrapped.insert(wt.address);
-        let mut lookup = RateLookup::new(&pool, wrapped);
+        let mut lookup = HistoricalRateLookup::new(&pool, wrapped);
 
         let mut response = TradesByAddressResponse {
             trades: vec![TradeByAddress {
@@ -498,7 +416,7 @@ mod tests {
 
         let mut wrapped = HashSet::new();
         wrapped.insert(wt.address);
-        let mut lookup = RateLookup::new(&pool, wrapped);
+        let mut lookup = HistoricalRateLookup::new(&pool, wrapped);
 
         let mut response = TradesByTxResponse {
             tx_hash: Default::default(),

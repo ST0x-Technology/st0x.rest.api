@@ -1,11 +1,10 @@
 use super::{OrderDataSource, RaindexOrderDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
+use crate::denomination::WrappedTokenIndex;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::routes::quote_denomination::{
-    apply_denomination_to_order_list, wrapped_token_map, CurrentRateLookup,
-};
+use crate::routes::quote_denomination::{apply_denomination_to_order_list, CurrentRateLookup};
 use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::common::{TokenRef, ValidatedFixedBytes};
 use crate::types::order::{OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType};
@@ -74,7 +73,9 @@ pub async fn get_order(
         };
 
         if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
+                .await?
+                .into_map();
             let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
             let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
             // Wrap the single detail in a one-element slice so we can reuse

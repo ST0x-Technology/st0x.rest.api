@@ -1,11 +1,10 @@
 use super::{RaindexSwapDataSource, SwapDataSource};
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
+use crate::denomination::WrappedTokenIndex;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::routes::quote_denomination::{
-    reverse_convert_calldata_ratio, wrapped_token_map, CurrentRateLookup,
-};
+use crate::routes::quote_denomination::{reverse_convert_calldata_ratio, CurrentRateLookup};
 use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
 use crate::types::trades::Denomination;
@@ -22,6 +21,10 @@ use tracing::Instrument;
     tag = "Swap",
     security(("basicAuth" = [])),
     request_body = SwapCalldataRequest,
+    params(
+        ("denomination" = Option<Denomination>, Query, description =
+            "Optional `denomination` override (fallback to body field; body wins if both set)."),
+    ),
     responses(
         (status = 200, description = "Swap calldata", body = SwapCalldataResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
@@ -31,7 +34,7 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[post("/calldata", data = "<request>")]
+#[post("/calldata?<denomination>", data = "<request>")]
 #[allow(clippy::too_many_arguments)]
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
@@ -40,12 +43,16 @@ pub async fn post_swap_calldata(
     pool: &State<DbPool>,
     sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
+    denomination: Option<Denomination>,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
+    let query_denomination = denomination;
     async move {
-        tracing::info!(body = ?req, "request received");
-        let denomination = req.denomination.unwrap_or_default();
+        tracing::info!(body = ?req, query_denomination = ?query_denomination, "request received");
+        // Body wins if both provided; query is the fallback so SDK consumers
+        // can override the default without rewriting the JSON body.
+        let denomination = req.denomination.or(query_denomination).unwrap_or_default();
 
         // For tStock: reverse-convert the caller's `maximum_io_ratio` to
         // wtStock before submitting to the contract. The contract is always
@@ -53,7 +60,9 @@ pub async fn post_swap_calldata(
         // `process_swap_calldata` helper so that helper stays trivially
         // testable without DB/subgraph dependencies.
         let (submitted_ratio, aps) = if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
+                .await?
+                .into_map();
             let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
             let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
             reverse_convert_calldata_ratio(

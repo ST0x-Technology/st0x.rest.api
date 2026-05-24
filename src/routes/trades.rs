@@ -1,10 +1,11 @@
 use crate::auth::AuthenticatedKey;
 use crate::cache::AppCache;
 use crate::db::DbPool;
+use crate::denomination::WrappedTokenIndex;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::trades_denomination::{
-    apply_denomination_by_address, apply_denomination_by_tx, wrapped_token_set, RateLookup,
+    apply_denomination_by_address, apply_denomination_by_tx, HistoricalRateLookup,
 };
 use crate::types::common::{TokenRef, ValidatedAddress, ValidatedFixedBytes};
 use crate::types::order::OrderTradeEntry;
@@ -1199,8 +1200,8 @@ pub async fn get_trades_by_tx(
 
         let denomination = params.denomination.unwrap_or_default();
         if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
-            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner()).await?.into_set();
+            let mut lookup = HistoricalRateLookup::new(pool.inner(), wrapped);
             apply_denomination_by_tx(&mut lookup, denomination, &mut response).await?;
         }
         Ok(Json(response))
@@ -1257,8 +1258,10 @@ pub async fn get_trades_by_token(
         drop(raindex);
 
         if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
-            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
+                .await?
+                .into_set();
+            let mut lookup = HistoricalRateLookup::new(pool.inner(), wrapped);
             apply_denomination_by_address(&mut lookup, denomination, &mut response).await?;
         }
         Ok(Json(response))
@@ -1315,8 +1318,10 @@ pub async fn get_trades_by_address(
         drop(raindex);
 
         if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
-            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
+                .await?
+                .into_set();
+            let mut lookup = HistoricalRateLookup::new(pool.inner(), wrapped);
             apply_denomination_by_address(&mut lookup, denomination, &mut response).await?;
         }
         Ok(Json(response))
@@ -1375,8 +1380,10 @@ pub async fn get_taker_trades(
         drop(raindex);
 
         if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_set(shared_raindex.inner()).await?;
-            let mut lookup = RateLookup::new(pool.inner(), wrapped);
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
+                .await?
+                .into_set();
+            let mut lookup = HistoricalRateLookup::new(pool.inner(), wrapped);
             for tx_response in &mut response.market_orders {
                 apply_denomination_by_tx(&mut lookup, denomination, tx_response).await?;
             }

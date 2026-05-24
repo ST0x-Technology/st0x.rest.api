@@ -1,11 +1,10 @@
 use super::{RaindexSwapDataSource, SwapDataSource, SwapQuoteCache};
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
+use crate::denomination::WrappedTokenIndex;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::routes::quote_denomination::{
-    apply_denomination_to_quote, wrapped_token_map, CurrentRateLookup,
-};
+use crate::routes::quote_denomination::{apply_denomination_to_quote, CurrentRateLookup};
 use crate::routes::tokens::SftSubgraphUrl;
 use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
 use crate::types::trades::Denomination;
@@ -23,6 +22,10 @@ use tracing::Instrument;
     tag = "Swap",
     security(("basicAuth" = [])),
     request_body = SwapQuoteRequest,
+    params(
+        ("denomination" = Option<Denomination>, Query, description =
+            "Optional `denomination` override (fallback to body field; body wins if both set)."),
+    ),
     responses(
         (status = 200, description = "Swap quote", body = SwapQuoteResponse),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
@@ -32,7 +35,7 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[post("/quote", data = "<request>")]
+#[post("/quote?<denomination>", data = "<request>")]
 #[allow(clippy::too_many_arguments)]
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
@@ -42,12 +45,16 @@ pub async fn post_swap_quote(
     pool: &State<DbPool>,
     sft_subgraph_url: &State<SftSubgraphUrl>,
     span: TracingSpan,
+    denomination: Option<Denomination>,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
+    let query_denomination = denomination;
     async move {
-        tracing::info!(body = ?req, "request received");
-        let denomination = req.denomination.unwrap_or_default();
+        tracing::info!(body = ?req, query_denomination = ?query_denomination, "request received");
+        // Body wins if both provided; query is the fallback so SDK consumers
+        // can override the default without rewriting the JSON body.
+        let denomination = req.denomination.or(query_denomination).unwrap_or_default();
         // Cache the *raw* wtStock quote and apply denomination per-request.
         // Including denomination in the key avoids cross-pollution and lets
         // us re-use a cached wtStock fetch for repeated tstock requests.
@@ -71,7 +78,9 @@ pub async fn post_swap_quote(
             .map_err(ApiError::from)?;
 
         if denomination == Denomination::Tstock {
-            let wrapped = wrapped_token_map(shared_raindex.inner()).await?;
+            let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
+                .await?
+                .into_map();
             let fetcher = SubgraphRateFetcher::new(sft_subgraph_url.inner().0.clone());
             let mut lookup = CurrentRateLookup::new(pool.inner(), &fetcher, wrapped);
             apply_denomination_to_quote(&mut response, denomination, &mut lookup).await?;
@@ -174,6 +183,38 @@ mod tests {
             output_amount: output_amount.to_string(),
             denomination: None,
         }
+    }
+
+    /// Mirrors the resolution rule baked into the handler: body wins over
+    /// query, query is the fallback, both `None` collapses to default
+    /// (`Wtstock`). Kept tiny so the rule is documented in test form even
+    /// though the call sites use `.or().unwrap_or_default()` inline.
+    fn resolve_denomination(
+        body: Option<Denomination>,
+        query: Option<Denomination>,
+    ) -> Denomination {
+        body.or(query).unwrap_or_default()
+    }
+
+    #[test]
+    fn test_resolve_denomination_body_wins_over_query() {
+        assert_eq!(
+            resolve_denomination(Some(Denomination::Tstock), Some(Denomination::Wtstock)),
+            Denomination::Tstock
+        );
+    }
+
+    #[test]
+    fn test_resolve_denomination_query_used_when_body_absent() {
+        assert_eq!(
+            resolve_denomination(None, Some(Denomination::Tstock)),
+            Denomination::Tstock
+        );
+    }
+
+    #[test]
+    fn test_resolve_denomination_defaults_to_wtstock() {
+        assert_eq!(resolve_denomination(None, None), Denomination::Wtstock);
     }
 
     #[rocket::async_test]
