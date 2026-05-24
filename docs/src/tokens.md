@@ -71,7 +71,7 @@ the registry's token-list metadata.
 Rates are cached for 24 hours and persisted to a snapshot history so the
 `/v1/trades/*` endpoints can convert past trades using the rate that was
 current at each trade's block. See [Trade Monitoring](./trades.md) for the
-`denomination=tstock` query toggle.
+`denomination=unwrapped` query toggle.
 
 ### Data source
 
@@ -84,7 +84,7 @@ the `sft_subgraph_url` config key) indexes both sides of that pair: each
 pointing back at the `wt*` wrapper, plus `totalShares` and the indexer's
 head block via `_meta.block`. The API resolves wrapped tokens to their
 underlying OARV through that subgraph; the snapshot row records the
-indexer's head block so historical lookups for the `tstock` denomination
+indexer's head block so historical lookups for the `unwrapped` denomination
 toggle (see [Trade Monitoring](./trades.md)) align to indexed blocks.
 
 For the current OARV deployment `totalAssets() == totalSupply()`, so the

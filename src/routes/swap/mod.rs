@@ -28,7 +28,7 @@ const SWAP_QUOTE_CACHE_CAPACITY: u64 = 1_000;
 /// 5s TTL keeps quotes within ~2 Base block times of staleness while
 /// coalescing concurrent or repeated requests for the same pair+amount.
 /// We currently always cache the wtStock quote (denomination =
-/// `Wtstock`) and post-process per-request, but the denomination field is
+/// `Wrapped`) and post-process per-request, but the denomination field is
 /// included so future variants (e.g. caching the converted quote) don't
 /// collide.
 pub(crate) type SwapQuoteCache =
@@ -127,7 +127,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                     symbol: String::new(),
                     approval_data: approval_info.calldata().clone(),
                 }],
-                denomination: Denomination::Wtstock,
+                denomination: Denomination::Wrapped,
                 assets_per_share: None,
                 submitted_io_ratio: String::new(),
             })
@@ -142,7 +142,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 value: alloy::primitives::U256::ZERO,
                 estimated_input: expected_sell,
                 approvals: vec![],
-                denomination: Denomination::Wtstock,
+                denomination: Denomination::Wrapped,
                 assets_per_share: None,
                 submitted_io_ratio: String::new(),
             })

@@ -83,6 +83,32 @@ pub(crate) async fn list_latest_per_token(
     .await
 }
 
+/// Return every snapshot row for `token` whose `block_number` falls in
+/// `[from_block, to_block]` (inclusive on both ends). Used by the
+/// exchange-rate history endpoint to merge snapshots with donation events
+/// into a single chronological feed.
+pub(crate) async fn list_for_token_in_range(
+    pool: &DbPool,
+    token: Address,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+) -> Result<Vec<WrappedRateSnapshot>, sqlx::Error> {
+    let from = from_block.map(|b| b as i64).unwrap_or(0);
+    let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
+    sqlx::query_as::<_, WrappedRateSnapshot>(
+        "SELECT token_address, block_number, block_timestamp, assets_per_share, \
+                asset_address, asset_symbol, asset_decimals, captured_at \
+         FROM wrapped_exchange_rate_snapshots \
+         WHERE token_address = ? AND block_number BETWEEN ? AND ? \
+         ORDER BY block_number ASC, id ASC",
+    )
+    .bind(lowercase_addr(token))
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+}
+
 pub(crate) async fn get_at_or_before_block(
     pool: &DbPool,
     token: Address,

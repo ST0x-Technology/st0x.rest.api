@@ -57,15 +57,15 @@ pub async fn post_swap_quote(
         let denomination = req.denomination.or(query_denomination).unwrap_or_default();
         // Cache the *raw* wtStock quote and apply denomination per-request.
         // Including denomination in the key avoids cross-pollution and lets
-        // us re-use a cached wtStock fetch for repeated tstock requests.
+        // us re-use a cached wrapped-denomination fetch for repeated unwrapped requests.
         let cache_key = (
             req.input_token,
             req.output_token,
             req.output_amount.clone(),
-            Denomination::Wtstock,
+            Denomination::Wrapped,
         );
         let mut req_for_fetch = req.clone();
-        req_for_fetch.denomination = Some(Denomination::Wtstock);
+        req_for_fetch.denomination = Some(Denomination::Wrapped);
         let mut response = swap_cache
             .get_or_try_insert(cache_key, || async move {
                 let raindex = shared_raindex.read().await;
@@ -77,7 +77,7 @@ pub async fn post_swap_quote(
             .await
             .map_err(ApiError::from)?;
 
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_map();
@@ -160,7 +160,7 @@ async fn process_swap_quote(
         estimated_output: formatted_output,
         estimated_input: formatted_input,
         estimated_io_ratio: formatted_ratio,
-        denomination: Denomination::Wtstock,
+        denomination: Denomination::Wrapped,
         assets_per_share: None,
     })
 }
@@ -187,7 +187,7 @@ mod tests {
 
     /// Mirrors the resolution rule baked into the handler: body wins over
     /// query, query is the fallback, both `None` collapses to default
-    /// (`Wtstock`). Kept tiny so the rule is documented in test form even
+    /// (`Wrapped`). Kept tiny so the rule is documented in test form even
     /// though the call sites use `.or().unwrap_or_default()` inline.
     fn resolve_denomination(
         body: Option<Denomination>,
@@ -199,22 +199,22 @@ mod tests {
     #[test]
     fn test_resolve_denomination_body_wins_over_query() {
         assert_eq!(
-            resolve_denomination(Some(Denomination::Tstock), Some(Denomination::Wtstock)),
-            Denomination::Tstock
+            resolve_denomination(Some(Denomination::Unwrapped), Some(Denomination::Wrapped)),
+            Denomination::Unwrapped
         );
     }
 
     #[test]
     fn test_resolve_denomination_query_used_when_body_absent() {
         assert_eq!(
-            resolve_denomination(None, Some(Denomination::Tstock)),
-            Denomination::Tstock
+            resolve_denomination(None, Some(Denomination::Unwrapped)),
+            Denomination::Unwrapped
         );
     }
 
     #[test]
-    fn test_resolve_denomination_defaults_to_wtstock() {
-        assert_eq!(resolve_denomination(None, None), Denomination::Wtstock);
+    fn test_resolve_denomination_defaults_to_wrapped() {
+        assert_eq!(resolve_denomination(None, None), Denomination::Wrapped);
     }
 
     #[rocket::async_test]
@@ -342,7 +342,7 @@ mod tests {
         use std::sync::Arc;
 
         let cache = crate::routes::swap::swap_quote_cache();
-        let key = (USDC, WETH, "100".to_string(), Denomination::Wtstock);
+        let key = (USDC, WETH, "100".to_string(), Denomination::Wrapped);
         let cached = SwapQuoteResponse {
             input_token: USDC,
             output_token: WETH,
@@ -350,7 +350,7 @@ mod tests {
             estimated_output: "100".to_string(),
             estimated_input: "150".to_string(),
             estimated_io_ratio: "1.5".to_string(),
-            denomination: Denomination::Wtstock,
+            denomination: Denomination::Wrapped,
             assets_per_share: None,
         };
         cache.insert(key.clone(), cached.clone()).await;
@@ -377,7 +377,7 @@ mod tests {
         use std::sync::Arc;
 
         let cache = crate::routes::swap::swap_quote_cache();
-        let key = (USDC, WETH, "200".to_string(), Denomination::Wtstock);
+        let key = (USDC, WETH, "200".to_string(), Denomination::Wrapped);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_inner = Arc::clone(&calls);
 
@@ -391,7 +391,7 @@ mod tests {
                     estimated_output: "200".to_string(),
                     estimated_input: "300".to_string(),
                     estimated_io_ratio: "1.5".to_string(),
-                    denomination: Denomination::Wtstock,
+                    denomination: Denomination::Wrapped,
                     assets_per_share: None,
                 })
             })

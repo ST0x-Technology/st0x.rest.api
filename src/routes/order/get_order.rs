@@ -25,7 +25,7 @@ use utoipa::IntoParams;
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct GetOrderParams {
-    /// `wtstock` (default) returns raw on-chain `ioRatio`. `tstock`
+    /// `wrapped` (default) returns raw on-chain `ioRatio`. `unwrapped`
     /// converts using the latest wrapped exchange-rate snapshot.
     #[field(name = "denomination")]
     pub denomination: Option<Denomination>,
@@ -72,7 +72,7 @@ pub async fn get_order(
             process_get_order(&ds, hash).await?
         };
 
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_map();
@@ -176,7 +176,7 @@ fn build_order_detail(
         created_at,
         orderbook_id: order.orderbook(),
         trades: trade_entries,
-        denomination: Denomination::Wtstock,
+        denomination: Denomination::Wrapped,
         assets_per_share: None,
     })
 }

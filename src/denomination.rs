@@ -1,4 +1,4 @@
-//! Shared helpers for converting between `wtstock` and `tstock` denominations.
+//! Shared helpers for converting between `wrapped` and `unwrapped` denominations.
 //!
 //! Two route families need the same math but talk to different sources of
 //! `assetsPerShare`:
@@ -90,7 +90,7 @@ pub(crate) fn combine_rate_strings(
 /// already scaled the amounts (the typical case after `multiply_decimal`).
 /// Signs on the amount strings are stripped — the resulting ratio is always
 /// the magnitude.
-pub(crate) fn convert_amounts_to_tstock_ratio(
+pub(crate) fn convert_amounts_to_unwrapped_ratio(
     input_amount: &str,
     output_amount: &str,
     input_rate: Option<&str>,
@@ -122,7 +122,7 @@ pub(crate) fn convert_amounts_to_tstock_ratio(
         return Ok("0".into());
     }
     let ratio = input_f.div(output_f).map_err(|e| {
-        tracing::error!(error = %e, "failed to compute io ratio in tstock");
+        tracing::error!(error = %e, "failed to compute io ratio in unwrapped");
         ApiError::Internal("io ratio calculation failed".into())
     })?;
     format_float(ratio, "io ratio")
@@ -130,10 +130,10 @@ pub(crate) fn convert_amounts_to_tstock_ratio(
 
 /// Convert a wtStock-denominated IO ratio to its tStock equivalent.
 ///
-/// `tstock_ratio = wtstock_ratio * (input_rate / output_rate)` with `1.0`
+/// `unwrapped_ratio = wrapped_ratio * (input_rate / output_rate)` with `1.0`
 /// substituted for the non-wrapped side. Both sides wrapped at the same rate
 /// is a no-op (the ratio cancels).
-pub(crate) fn convert_ratio_to_tstock(
+pub(crate) fn convert_ratio_to_unwrapped(
     ratio: &str,
     input_rate: Option<&str>,
     output_rate: Option<&str>,
@@ -141,9 +141,9 @@ pub(crate) fn convert_ratio_to_tstock(
     scale_ratio(ratio, input_rate, output_rate, /*invert=*/ false)
 }
 
-/// Inverse of [`convert_ratio_to_tstock`]. Caller's tStock-denominated ratio
+/// Inverse of [`convert_ratio_to_unwrapped`]. Caller's tStock-denominated ratio
 /// becomes the wtStock value the contract expects.
-pub(crate) fn convert_ratio_to_wtstock(
+pub(crate) fn convert_ratio_to_wrapped(
     ratio: &str,
     input_rate: Option<&str>,
     output_rate: Option<&str>,
@@ -233,6 +233,14 @@ impl WrappedTokenIndex {
     pub(crate) fn into_map(self) -> HashMap<Address, TokenCfg> {
         self.map
     }
+
+    /// Consume the index and surface every wrapped [`TokenCfg`] for callers
+    /// that just want to iterate the registry's wrapped tokens (e.g. the
+    /// `/v1/tokens/exchange-rates` route, which doesn't need address-keyed
+    /// lookup).
+    pub(crate) fn into_values(self) -> impl Iterator<Item = TokenCfg> {
+        self.map.into_values()
+    }
 }
 
 /// Unified rate-resolution interface shared by the historical and current
@@ -283,21 +291,43 @@ mod tests {
     }
 
     #[test]
-    fn convert_ratio_to_tstock_noop_when_no_rates() {
-        let out = convert_ratio_to_tstock("0.1", None, None).unwrap();
+    fn convert_ratio_to_unwrapped_noop_when_no_rates() {
+        let out = convert_ratio_to_unwrapped("0.1", None, None).unwrap();
         assert_eq!(out, "0.1");
     }
 
     #[test]
-    fn convert_ratio_to_tstock_scales_by_input_over_output() {
-        let out = convert_ratio_to_tstock("0.1", Some("2.0"), None).unwrap();
+    fn convert_ratio_to_unwrapped_scales_by_input_over_output() {
+        let out = convert_ratio_to_unwrapped("0.1", Some("2.0"), None).unwrap();
         assert_eq!(out, "0.2");
     }
 
     #[test]
-    fn convert_ratio_to_wtstock_is_inverse() {
-        let tstock = convert_ratio_to_tstock("0.1", Some("2.0"), None).unwrap();
-        let round_trip = convert_ratio_to_wtstock(&tstock, Some("2.0"), None).unwrap();
+    fn denomination_serializes_as_lowercase_wrapped_unwrapped() {
+        use crate::types::trades::Denomination;
+        assert_eq!(
+            serde_json::to_string(&Denomination::Wrapped).unwrap(),
+            "\"wrapped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denomination::Unwrapped).unwrap(),
+            "\"unwrapped\""
+        );
+        // Parse round-trip.
+        assert_eq!(
+            serde_json::from_str::<Denomination>("\"wrapped\"").unwrap(),
+            Denomination::Wrapped
+        );
+        assert_eq!(
+            serde_json::from_str::<Denomination>("\"unwrapped\"").unwrap(),
+            Denomination::Unwrapped
+        );
+    }
+
+    #[test]
+    fn convert_ratio_to_wrapped_is_inverse() {
+        let unwrapped = convert_ratio_to_unwrapped("0.1", Some("2.0"), None).unwrap();
+        let round_trip = convert_ratio_to_wrapped(&unwrapped, Some("2.0"), None).unwrap();
         assert_eq!(round_trip, "0.1");
     }
 }

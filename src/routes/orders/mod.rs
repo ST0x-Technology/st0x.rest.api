@@ -498,7 +498,7 @@ pub(crate) fn build_order_summary(
         io_ratio: quote.io_ratio.clone(),
         created_at,
         orderbook_id: order.orderbook(),
-        denomination: crate::types::trades::Denomination::Wtstock,
+        denomination: crate::types::trades::Denomination::Wrapped,
         assets_per_share: None,
     })
 }

@@ -199,7 +199,7 @@ pub async fn get_orders_by_token(
 
         // Orderbook-depth ordering is established in process_get_orders_by_token
         // before this conversion runs; this loop preserves that ordering.
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_map();
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_tstock_conversion_preserves_orderbook_depth_ordering() {
+    async fn test_unwrapped_conversion_preserves_orderbook_depth_ordering() {
         use crate::db;
         use crate::routes::quote_denomination::{
             apply_denomination_to_order_list, CurrentRateLookup,
@@ -409,7 +409,7 @@ mod tests {
             io_ratio: ratio.into(),
             created_at: 0,
             orderbook_id: Address::ZERO,
-            denomination: Denomination::Wtstock,
+            denomination: Denomination::Wrapped,
             assets_per_share: None,
         };
 
@@ -426,7 +426,7 @@ mod tests {
 
         apply_denomination_to_order_list(
             &mut response.orders,
-            Denomination::Tstock,
+            Denomination::Unwrapped,
             &mut lookup,
             |o| {
                 (
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(response.orders[2].io_ratio, "0.6");
         // Ordering preserved.
         for o in &response.orders {
-            assert_eq!(o.denomination, Denomination::Tstock);
+            assert_eq!(o.denomination, Denomination::Unwrapped);
             assert_eq!(o.assets_per_share.as_deref(), Some("2.0"));
         }
     }

@@ -178,7 +178,7 @@ pub async fn get_orders_by_address(
             .await
             .map_err(ApiError::from)?;
 
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_map();

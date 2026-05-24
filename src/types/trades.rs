@@ -4,11 +4,12 @@ use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-/// Denomination requested for the prices in the response. `Wtstock` (the
+/// Denomination requested for the prices in the response. `Wrapped` (the
 /// default) returns trade amounts and IO ratios exactly as recorded on
 /// chain — the input/output sides settle in wrapped (`wt*`) share tokens.
-/// `Tstock` adjusts every wrapped-side amount by the assets-per-share rate
-/// at that trade's block, so the response reads in underlying tStock terms.
+/// `Unwrapped` adjusts every wrapped-side amount by the assets-per-share
+/// rate at that trade's block, so the response reads in underlying
+/// (tStock) terms.
 #[derive(
     Debug,
     Clone,
@@ -24,12 +25,12 @@ use utoipa::{IntoParams, ToSchema};
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Denomination {
-    /// Raw wtStock denomination (default — backwards compatible).
+    /// Raw wrapped (wt*) share denomination (default — backwards compatible).
     #[default]
-    Wtstock,
-    /// Adjusted to underlying tStock using the wrapped exchange rate at the
-    /// trade's block number.
-    Tstock,
+    Wrapped,
+    /// Adjusted to the underlying (tStock) using the wrapped exchange rate
+    /// at the trade's block number.
+    Unwrapped,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
@@ -48,9 +49,9 @@ pub struct TradesPaginationParams {
     #[field(name = "endTime")]
     #[param(example = 1718539200)]
     pub end_time: Option<u64>,
-    /// `wtstock` (default) returns raw on-chain amounts. `tstock` adjusts
-    /// wrapped-side amounts and ratios by the assets-per-share rate that
-    /// was current at each trade's block.
+    /// `wrapped` (default) returns raw on-chain amounts. `unwrapped`
+    /// adjusts wrapped-side amounts and ratios by the assets-per-share
+    /// rate that was current at each trade's block.
     #[field(name = "denomination")]
     pub denomination: Option<Denomination>,
 }
@@ -73,13 +74,13 @@ pub struct TradeByAddress {
     #[schema(example = 12345678)]
     pub block_number: u64,
     /// Denomination applied to amounts in this row. Mirrors the
-    /// `denomination` query parameter — `wtstock` for raw on-chain amounts,
-    /// `tstock` for amounts adjusted by the wrapped exchange rate.
+    /// `denomination` query parameter — `wrapped` for raw on-chain amounts,
+    /// `unwrapped` for amounts adjusted by the wrapped exchange rate.
     #[serde(default)]
     pub denomination: Denomination,
     /// Per-trade assets-per-share rate used to convert wrapped-side amounts
-    /// when `denomination == "tstock"`. Decimal string; `None` when the row
-    /// is in `wtstock` denomination or when no historical snapshot was
+    /// when `denomination == "unwrapped"`. Decimal string; `None` when the
+    /// row is in `wrapped` denomination or when no historical snapshot was
     /// available for the wrapped tokens at the trade's block.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "1.04", value_type = Option<String>)]

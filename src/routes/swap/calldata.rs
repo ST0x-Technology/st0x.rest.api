@@ -59,7 +59,7 @@ pub async fn post_swap_calldata(
         // wrapped-token-denominated. We compute the lookup outside the
         // `process_swap_calldata` helper so that helper stays trivially
         // testable without DB/subgraph dependencies.
-        let (submitted_ratio, aps) = if denomination == Denomination::Tstock {
+        let (submitted_ratio, aps) = if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_map();
@@ -142,7 +142,7 @@ mod tests {
             value: U256::ZERO,
             estimated_input: "150".to_string(),
             approvals: vec![],
-            denomination: Denomination::Wtstock,
+            denomination: Denomination::Wrapped,
             assets_per_share: None,
             submitted_io_ratio: String::new(),
         }
@@ -161,7 +161,7 @@ mod tests {
                 symbol: String::new(),
                 approval_data: Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]),
             }],
-            denomination: Denomination::Wtstock,
+            denomination: Denomination::Wrapped,
             assets_per_share: None,
             submitted_io_ratio: String::new(),
         }

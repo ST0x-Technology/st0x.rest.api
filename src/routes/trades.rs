@@ -436,7 +436,7 @@ async fn process_get_trades_by_tx(
                 output_amount: output_change.formatted_amount(),
                 actual_io_ratio: io_ratio,
             },
-            denomination: crate::types::trades::Denomination::Wtstock,
+            denomination: crate::types::trades::Denomination::Wrapped,
             assets_per_share: None,
         });
     }
@@ -581,7 +581,7 @@ async fn process_get_trades_by_address(
                             order_hash: Some(*order_hash),
                             timestamp: entry.timestamp,
                             block_number: 0, // not available from DirectTradesFetcher
-                            denomination: crate::types::trades::Denomination::Wtstock,
+                            denomination: crate::types::trades::Denomination::Wrapped,
                             assets_per_share: None,
                         });
                     }
@@ -677,7 +677,7 @@ async fn build_trades_from_library(
             order_hash: maybe_parse_trade_order_hash(trade.order_hash()),
             timestamp: to_u64(trade.timestamp(), "timestamp")?,
             block_number: to_u64(trade.transaction().block_number(), "block number")?,
-            denomination: crate::types::trades::Denomination::Wtstock,
+            denomination: crate::types::trades::Denomination::Wrapped,
             assets_per_share: None,
         });
     }
@@ -830,7 +830,7 @@ async fn process_get_trades_by_token(
                             order_hash: Some(*order_hash),
                             timestamp: entry.timestamp,
                             block_number: 0,
-                            denomination: crate::types::trades::Denomination::Wtstock,
+                            denomination: crate::types::trades::Denomination::Wrapped,
                             assets_per_share: None,
                         });
                     }
@@ -1079,7 +1079,7 @@ fn build_trades_by_tx_from_enriched(
                 output_amount: trade.output_amount.clone(),
                 actual_io_ratio: io_ratio,
             },
-            denomination: crate::types::trades::Denomination::Wtstock,
+            denomination: crate::types::trades::Denomination::Wrapped,
             assets_per_share: None,
         });
     }
@@ -1199,7 +1199,7 @@ pub async fn get_trades_by_tx(
         drop(raindex);
 
         let denomination = params.denomination.unwrap_or_default();
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner()).await?.into_set();
             let mut lookup = HistoricalRateLookup::new(pool.inner(), wrapped);
             apply_denomination_by_tx(&mut lookup, denomination, &mut response).await?;
@@ -1257,7 +1257,7 @@ pub async fn get_trades_by_token(
         .await?;
         drop(raindex);
 
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_set();
@@ -1317,7 +1317,7 @@ pub async fn get_trades_by_address(
         .await?;
         drop(raindex);
 
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_set();
@@ -1379,7 +1379,7 @@ pub async fn get_taker_trades(
         .await?;
         drop(raindex);
 
-        if denomination == Denomination::Tstock {
+        if denomination == Denomination::Unwrapped {
             let wrapped = WrappedTokenIndex::load(shared_raindex.inner())
                 .await?
                 .into_set();

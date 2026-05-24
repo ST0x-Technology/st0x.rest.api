@@ -1,4 +1,4 @@
-//! Applies the `denomination=tstock` adjustment to forward-looking (quote /
+//! Applies the `denomination=unwrapped` adjustment to forward-looking (quote /
 //! order / calldata) response payloads.
 //!
 //! Unlike historical trade conversion — which uses each trade's block number
@@ -7,10 +7,10 @@
 //!
 //! The math mirrors `trades_denomination`:
 //! - Amounts on a wrapped side are multiplied by `assetsPerShare`.
-//! - An IO ratio (input/output) becomes `wtstock_ratio * (input_rate / output_rate)`
+//! - An IO ratio (input/output) becomes `wrapped_ratio * (input_rate / output_rate)`
 //!   where the rate for a non-wrapped side is treated as `1.0`.
 //! - The reverse conversion used for `swap/calldata` is the inverse:
-//!   `wtstock_ratio = tstock_ratio * (output_rate / input_rate)`. The
+//!   `wrapped_ratio = unwrapped_ratio * (output_rate / input_rate)`. The
 //!   contract always speaks wtStock, so the caller hands us a tStock ratio
 //!   and we feed the contract its wrapped equivalent.
 //!
@@ -20,7 +20,7 @@
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
 use crate::denomination::{
-    combine_rate_strings, convert_ratio_to_tstock, convert_ratio_to_wtstock, multiply_decimal,
+    combine_rate_strings, convert_ratio_to_unwrapped, convert_ratio_to_wrapped, multiply_decimal,
     RateLookup,
 };
 use crate::error::ApiError;
@@ -112,14 +112,14 @@ impl<'a> RateLookup for CurrentRateLookup<'a> {
 }
 
 /// Adjust a swap quote response to tStock terms. No-op when `denomination`
-/// is `Wtstock`. Mutates `response` in place.
+/// is `Wrapped`. Mutates `response` in place.
 pub(crate) async fn apply_denomination_to_quote(
     response: &mut crate::types::swap::SwapQuoteResponse,
     denomination: Denomination,
     lookup: &mut CurrentRateLookup<'_>,
 ) -> Result<(), ApiError> {
-    if denomination == Denomination::Wtstock {
-        response.denomination = Denomination::Wtstock;
+    if denomination == Denomination::Wrapped {
+        response.denomination = Denomination::Wrapped;
         return Ok(());
     }
 
@@ -132,20 +132,20 @@ pub(crate) async fn apply_denomination_to_quote(
     if let Some(rate) = output_rate.as_deref() {
         response.estimated_output = multiply_decimal(&response.estimated_output, rate)?;
         // The request-side `output_amount` echoes what the caller asked for.
-        // When the user requests tstock, the response should keep the field
+        // When the user requests unwrapped, the response should keep the field
         // self-consistent: `output_amount` is the wtStock amount we actually
         // simulated against. We leave it unchanged so the response is
         // unambiguous about what was simulated; the rescaled estimate moves
         // to `estimated_output`.
     }
 
-    response.estimated_io_ratio = convert_ratio_to_tstock(
+    response.estimated_io_ratio = convert_ratio_to_unwrapped(
         &response.estimated_io_ratio,
         input_rate.as_deref(),
         output_rate.as_deref(),
     )?;
 
-    response.denomination = Denomination::Tstock;
+    response.denomination = Denomination::Unwrapped;
     response.assets_per_share = combine_rate_strings(input_rate.as_deref(), output_rate.as_deref());
     Ok(())
 }
@@ -153,7 +153,7 @@ pub(crate) async fn apply_denomination_to_quote(
 /// Reverse-convert a tStock-denominated `maximum_io_ratio` to its wtStock
 /// equivalent for on-chain submission. Returns the wtStock ratio plus the
 /// combined `assets_per_share` rate string (or unchanged ratio + None for
-/// `wtstock` denomination / non-wrapped pairs).
+/// `wrapped` denomination / non-wrapped pairs).
 pub(crate) async fn reverse_convert_calldata_ratio(
     io_ratio: &str,
     input_token: Address,
@@ -161,15 +161,15 @@ pub(crate) async fn reverse_convert_calldata_ratio(
     denomination: Denomination,
     lookup: &mut CurrentRateLookup<'_>,
 ) -> Result<(String, Option<String>), ApiError> {
-    if denomination == Denomination::Wtstock {
+    if denomination == Denomination::Wrapped {
         return Ok((io_ratio.to_string(), None));
     }
     let input_rate = lookup.rate_for(input_token, ()).await?;
     let output_rate = lookup.rate_for(output_token, ()).await?;
-    let wtstock_ratio =
-        convert_ratio_to_wtstock(io_ratio, input_rate.as_deref(), output_rate.as_deref())?;
+    let wrapped_ratio =
+        convert_ratio_to_wrapped(io_ratio, input_rate.as_deref(), output_rate.as_deref())?;
     let aps = combine_rate_strings(input_rate.as_deref(), output_rate.as_deref());
-    Ok((wtstock_ratio, aps))
+    Ok((wrapped_ratio, aps))
 }
 
 /// Generic order-list adjustment. `extract` returns the `(input_token,
@@ -188,7 +188,7 @@ where
     E: Fn(&T) -> (Address, Address, String),
     U: Fn(&mut T, String, Option<String>, Denomination),
 {
-    if denomination == Denomination::Wtstock {
+    if denomination == Denomination::Wrapped {
         return Ok(());
     }
     // NOTE: ordering is preserved; we iterate in place and only rewrite
@@ -202,13 +202,13 @@ where
         // is consistent.
         if io_ratio == "-" {
             let aps = combine_rate_strings(input_rate.as_deref(), output_rate.as_deref());
-            update(entry, io_ratio, aps, Denomination::Tstock);
+            update(entry, io_ratio, aps, Denomination::Unwrapped);
             continue;
         }
         let new_ratio =
-            convert_ratio_to_tstock(&io_ratio, input_rate.as_deref(), output_rate.as_deref())?;
+            convert_ratio_to_unwrapped(&io_ratio, input_rate.as_deref(), output_rate.as_deref())?;
         let aps = combine_rate_strings(input_rate.as_deref(), output_rate.as_deref());
-        update(entry, new_ratio, aps, Denomination::Tstock);
+        update(entry, new_ratio, aps, Denomination::Unwrapped);
     }
     Ok(())
 }
@@ -294,31 +294,31 @@ mod tests {
             estimated_output: "100".into(),
             estimated_input: "10".into(),
             estimated_io_ratio: "0.1".into(),
-            denomination: Denomination::Wtstock,
+            denomination: Denomination::Wrapped,
             assets_per_share: None,
         }
     }
 
     #[rocket::async_test]
-    async fn test_wtstock_default_is_noop() {
+    async fn test_wrapped_default_is_noop() {
         let pool = fresh_pool().await;
         let fetcher = FixedRateFetcher {
             rates: HashMap::new(),
         };
         let mut lookup = CurrentRateLookup::new(&pool, &fetcher, HashMap::new());
         let mut resp = quote_response_with(USDC, WT_MSTR);
-        apply_denomination_to_quote(&mut resp, Denomination::Wtstock, &mut lookup)
+        apply_denomination_to_quote(&mut resp, Denomination::Wrapped, &mut lookup)
             .await
             .unwrap();
         assert_eq!(resp.estimated_input, "10");
         assert_eq!(resp.estimated_output, "100");
         assert_eq!(resp.estimated_io_ratio, "0.1");
-        assert_eq!(resp.denomination, Denomination::Wtstock);
+        assert_eq!(resp.denomination, Denomination::Wrapped);
         assert!(resp.assets_per_share.is_none());
     }
 
     #[rocket::async_test]
-    async fn test_tstock_scales_input_when_input_wrapped() {
+    async fn test_unwrapped_scales_input_when_input_wrapped() {
         let pool = fresh_pool().await;
         let mut rates = HashMap::new();
         rates.insert(WT_MSTR, "2.0".into());
@@ -328,7 +328,7 @@ mod tests {
         let mut lookup = CurrentRateLookup::new(&pool, &fetcher, wrapped);
 
         let mut resp = quote_response_with(WT_MSTR, USDC);
-        apply_denomination_to_quote(&mut resp, Denomination::Tstock, &mut lookup)
+        apply_denomination_to_quote(&mut resp, Denomination::Unwrapped, &mut lookup)
             .await
             .unwrap();
         // input is wt*, scaled by 2.0
@@ -337,30 +337,30 @@ mod tests {
         assert_eq!(resp.estimated_output, "100");
         // ratio: 0.1 * (2.0 / 1.0) = 0.2
         assert_eq!(resp.estimated_io_ratio, "0.2");
-        assert_eq!(resp.denomination, Denomination::Tstock);
+        assert_eq!(resp.denomination, Denomination::Unwrapped);
         assert_eq!(resp.assets_per_share.as_deref(), Some("2.0"));
     }
 
     #[rocket::async_test]
-    async fn test_tstock_noop_when_neither_side_wrapped() {
+    async fn test_unwrapped_noop_when_neither_side_wrapped() {
         let pool = fresh_pool().await;
         let fetcher = FixedRateFetcher {
             rates: HashMap::new(),
         };
         let mut lookup = CurrentRateLookup::new(&pool, &fetcher, HashMap::new());
         let mut resp = quote_response_with(USDC, USDC);
-        apply_denomination_to_quote(&mut resp, Denomination::Tstock, &mut lookup)
+        apply_denomination_to_quote(&mut resp, Denomination::Unwrapped, &mut lookup)
             .await
             .unwrap();
         assert_eq!(resp.estimated_input, "10");
         assert_eq!(resp.estimated_output, "100");
         assert_eq!(resp.estimated_io_ratio, "0.1");
-        assert_eq!(resp.denomination, Denomination::Tstock);
+        assert_eq!(resp.denomination, Denomination::Unwrapped);
         assert!(resp.assets_per_share.is_none());
     }
 
     #[rocket::async_test]
-    async fn test_tstock_both_sides_wrapped_does_not_panic() {
+    async fn test_unwrapped_both_sides_wrapped_does_not_panic() {
         let pool = fresh_pool().await;
         let mut rates = HashMap::new();
         rates.insert(WT_MSTR, "1.5".into());
@@ -372,7 +372,7 @@ mod tests {
         let mut lookup = CurrentRateLookup::new(&pool, &fetcher, wrapped);
 
         let mut resp = quote_response_with(WT_MSTR, WT_OTHER);
-        apply_denomination_to_quote(&mut resp, Denomination::Tstock, &mut lookup)
+        apply_denomination_to_quote(&mut resp, Denomination::Unwrapped, &mut lookup)
             .await
             .unwrap();
         // input scaled by 1.5, output scaled by 2.5
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(resp.estimated_output, "250");
         // ratio: 0.1 * (1.5 / 2.5) = 0.06
         assert_eq!(resp.estimated_io_ratio, "0.06");
-        assert_eq!(resp.denomination, Denomination::Tstock);
+        assert_eq!(resp.denomination, Denomination::Unwrapped);
         assert_eq!(
             resp.assets_per_share.as_deref(),
             Some("input=1.5;output=2.5")
@@ -401,17 +401,22 @@ mod tests {
         let mut lookup = CurrentRateLookup::new(&pool, &fetcher, wrapped);
 
         // input is wt*, output is USDC
-        let (wt_ratio, aps) =
-            reverse_convert_calldata_ratio("0.4", WT_MSTR, USDC, Denomination::Tstock, &mut lookup)
-                .await
-                .unwrap();
+        let (wt_ratio, aps) = reverse_convert_calldata_ratio(
+            "0.4",
+            WT_MSTR,
+            USDC,
+            Denomination::Unwrapped,
+            &mut lookup,
+        )
+        .await
+        .unwrap();
         // 0.4 * (1.0 / 2.0) = 0.2
         assert_eq!(wt_ratio, "0.2");
         assert_eq!(aps.as_deref(), Some("2.0"));
     }
 
     #[rocket::async_test]
-    async fn test_reverse_convert_wtstock_is_passthrough() {
+    async fn test_reverse_convert_wrapped_is_passthrough() {
         let pool = fresh_pool().await;
         let fetcher = FixedRateFetcher {
             rates: HashMap::new(),
@@ -421,7 +426,7 @@ mod tests {
             "0.5",
             WT_MSTR,
             USDC,
-            Denomination::Wtstock,
+            Denomination::Wrapped,
             &mut lookup,
         )
         .await

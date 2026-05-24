@@ -245,7 +245,7 @@ fn scale_one(decimals: u8) -> U256 {
 /// 1. confirm the token really is an OARV-backed wrapper (errors out otherwise);
 /// 2. resolve the underlying tStock's address/symbol/totalShares;
 /// 3. capture `_meta.block` so the snapshot row records the indexer's head
-///    block — important for historical lookups via the `tstock` denomination
+///    block — important for historical lookups via the `unwrapped` denomination
 ///    toggle on `/v1/trades/*`.
 ///
 /// Today the rate is always `1.0`: OARV enforces `totalAssets() ==

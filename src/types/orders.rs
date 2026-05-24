@@ -15,7 +15,7 @@ pub struct OrdersPaginationParams {
     #[field(name = "pageSize")]
     #[param(example = 20)]
     pub page_size: Option<u16>,
-    /// `wtstock` (default) returns raw on-chain `ioRatio` values. `tstock`
+    /// `wrapped` (default) returns raw on-chain `ioRatio` values. `unwrapped`
     /// converts the ratio using the latest `assetsPerShare` snapshot for any
     /// wrapped side of the order pair.
     #[field(name = "denomination")]
@@ -43,7 +43,7 @@ pub struct OrdersByTokenParams {
     #[field(name = "pageSize")]
     #[param(example = 20)]
     pub page_size: Option<u16>,
-    /// `wtstock` (default) returns raw on-chain `ioRatio` values. `tstock`
+    /// `wrapped` (default) returns raw on-chain `ioRatio` values. `unwrapped`
     /// converts the ratio using the latest `assetsPerShare` snapshot for any
     /// wrapped side of the order pair.
     #[field(name = "denomination")]
@@ -74,12 +74,12 @@ pub struct OrderSummary {
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub orderbook_id: Address,
     /// Denomination applied to `io_ratio`. Mirrors the `denomination` query
-    /// parameter — `wtstock` for raw on-chain ratios, `tstock` for ratios
+    /// parameter — `wrapped` for raw on-chain ratios, `unwrapped` for ratios
     /// rescaled by the wrapped exchange rate.
     #[serde(default)]
     pub denomination: Denomination,
     /// Per-order `assetsPerShare` rate used when
-    /// `denomination == "tstock"`. Decimal string; `None` for `wtstock` or
+    /// `denomination == "unwrapped"`. Decimal string; `None` for `wrapped` or
     /// when neither side of the order pair is wrapped (no conversion
     /// required).
     #[serde(skip_serializing_if = "Option::is_none")]

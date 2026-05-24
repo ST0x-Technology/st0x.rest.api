@@ -263,12 +263,12 @@ optional `denomination` query parameter:
 
 | Value | Meaning |
 |-------|---------|
-| `wtstock` *(default)* | `ioRatio` is returned exactly as quoted on chain — wrapped-token-denominated. Backwards-compatible. |
-| `tstock` | `ioRatio` is converted using the latest `assetsPerShare` snapshot for any wrapped side of the order pair. Orderbook depth ordering is preserved across the conversion. |
+| `wrapped` *(default)* | `ioRatio` is returned exactly as quoted on chain — wrapped-token-denominated. Backwards-compatible. |
+| `unwrapped` | `ioRatio` is converted using the latest `assetsPerShare` snapshot for any wrapped side of the order pair. Orderbook depth ordering is preserved across the conversion. |
 
-When `denomination=tstock`:
+When `denomination=unwrapped`:
 
-- Each response entry includes `denomination: "tstock"` and an
+- Each response entry includes `denomination: "unwrapped"` and an
   `assetsPerShare` rate string (e.g. `"1.04"`, or
   `"input=1.04;output=1.02"` when both sides are wrapped with different
   rates).
@@ -282,7 +282,7 @@ When `denomination=tstock`:
 Example:
 
 ```bash
-curl "https://api.st0x.io/v1/orders/token/0xWtStockAddress?denomination=tstock" \
+curl "https://api.st0x.io/v1/orders/token/0xWtStockAddress?denomination=unwrapped" \
   -H "Authorization: Basic <credentials>"
 ```
 

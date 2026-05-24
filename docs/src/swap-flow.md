@@ -196,26 +196,26 @@ Both `POST /v1/swap/quote` and `POST /v1/swap/calldata` accept an optional
 
 | Value | Meaning |
 |-------|---------|
-| `wtstock` *(default)* | All amounts and ratios are wrapped-token-denominated (i.e. raw `wt*` units). Backwards-compatible. |
-| `tstock` | Wrapped-side amounts and ratios are rescaled by the latest `assetsPerShare` snapshot. The conversion uses the most recent snapshot per wrapped token; snapshots older than 24h are refreshed in-line. |
+| `wrapped` *(default)* | All amounts and ratios are wrapped-token-denominated (i.e. raw `wt*` units). Backwards-compatible. |
+| `unwrapped` | Wrapped-side amounts and ratios are rescaled by the latest `assetsPerShare` snapshot. The conversion uses the most recent snapshot per wrapped token; snapshots older than 24h are refreshed in-line. |
 
 ### Quote semantics
 
-When `denomination=tstock` on `/v1/swap/quote`:
+When `denomination=unwrapped` on `/v1/swap/quote`:
 
 - `estimatedInput`, `estimatedOutput`, and `estimatedIoRatio` are scaled
   using the current rate(s).
 - `denomination` and `assetsPerShare` echo the conversion in the response.
-- `outputAmount` is left unchanged — it echoes the wtStock amount we
+- `outputAmount` is left unchanged — it echoes the wrapped amount we
   actually simulated against.
 
 ### Calldata semantics
 
-When `denomination=tstock` on `/v1/swap/calldata`:
+When `denomination=unwrapped` on `/v1/swap/calldata`:
 
-- The caller's `maximumIoRatio` is interpreted as a *tStock* ratio and
-  reverse-converted to wtStock terms before being submitted on-chain.
-- The wtStock value actually submitted to the contract is echoed in
+- The caller's `maximumIoRatio` is interpreted as an *unwrapped* ratio and
+  reverse-converted to wrapped terms before being submitted on-chain.
+- The wrapped value actually submitted to the contract is echoed in
   `submittedIoRatio` so callers can verify the conversion.
 - `denomination` and `assetsPerShare` are echoed in the response.
 

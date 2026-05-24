@@ -1,4 +1,4 @@
-//! Applies the `denomination=tstock` adjustment to trade response payloads.
+//! Applies the `denomination=unwrapped` adjustment to trade response payloads.
 //!
 //! The on-chain trade record always settles in wrapped (`wt*`) share tokens.
 //! To express a trade in underlying tStock terms we multiply the
@@ -15,7 +15,7 @@
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
 use crate::denomination::{
-    combine_rate_strings, convert_amounts_to_tstock_ratio, format_float, multiply_decimal,
+    combine_rate_strings, convert_amounts_to_unwrapped_ratio, format_float, multiply_decimal,
     parse_float, RateLookup,
 };
 use crate::error::ApiError;
@@ -93,7 +93,7 @@ pub(crate) async fn apply_denomination_by_address(
     denomination: Denomination,
     response: &mut TradesByAddressResponse,
 ) -> Result<(), ApiError> {
-    if denomination == Denomination::Wtstock {
+    if denomination == Denomination::Wrapped {
         return Ok(());
     }
 
@@ -111,7 +111,7 @@ pub(crate) async fn apply_denomination_by_address(
         if let Some(rate) = output_rate.as_deref() {
             trade.output_amount = multiply_decimal(&trade.output_amount, rate)?;
         }
-        trade.denomination = Denomination::Tstock;
+        trade.denomination = Denomination::Unwrapped;
         trade.assets_per_share =
             combine_rate_strings(input_rate.as_deref(), output_rate.as_deref());
     }
@@ -124,7 +124,7 @@ pub(crate) async fn apply_denomination_by_tx(
     denomination: Denomination,
     response: &mut TradesByTxResponse,
 ) -> Result<(), ApiError> {
-    if denomination == Denomination::Wtstock {
+    if denomination == Denomination::Wrapped {
         return Ok(());
     }
 
@@ -153,7 +153,7 @@ pub(crate) async fn apply_denomination_by_tx(
             })?;
         let entry_input = parse_float(&entry.result.input_amount, "trade totals")?;
         adjusted_totals_input = Some(totals_input.add(entry_input).map_err(|e| {
-            tracing::error!(error = %e, "failed to sum tstock input");
+            tracing::error!(error = %e, "failed to sum unwrapped input");
             ApiError::Internal("trade totals calculation failed".into())
         })?);
 
@@ -165,11 +165,11 @@ pub(crate) async fn apply_denomination_by_tx(
                 ApiError::Internal("trade totals calculation failed".into())
             })?;
         // The result.output_amount is negative (vault outflow); accumulate
-        // its magnitude to mirror the wtstock totals semantics.
+        // its magnitude to mirror the wrapped totals semantics.
         let magnitude = entry.result.output_amount.trim_start_matches('-');
         let entry_output = parse_float(magnitude, "trade totals")?;
         adjusted_totals_output = Some(totals_output.add(entry_output).map_err(|e| {
-            tracing::error!(error = %e, "failed to sum tstock output");
+            tracing::error!(error = %e, "failed to sum unwrapped output");
             ApiError::Internal("trade totals calculation failed".into())
         })?);
     }
@@ -183,7 +183,7 @@ pub(crate) async fn apply_denomination_by_tx(
             zero
         } else {
             input.div(output).map_err(|e| {
-                tracing::error!(error = %e, "failed to compute average io ratio in tstock");
+                tracing::error!(error = %e, "failed to compute average io ratio in unwrapped");
                 ApiError::Internal("trade totals calculation failed".into())
             })?
         };
@@ -210,7 +210,7 @@ fn adjust_entry(
         entry.result.output_amount = multiply_decimal(&entry.result.output_amount, rate)?;
     }
 
-    let new_ratio = convert_amounts_to_tstock_ratio(
+    let new_ratio = convert_amounts_to_unwrapped_ratio(
         &entry.result.input_amount,
         &entry.result.output_amount,
         // Amounts above are already scaled — pass None so we don't double-apply.
@@ -219,7 +219,7 @@ fn adjust_entry(
     )?;
     entry.request.maximum_io_ratio = new_ratio.clone();
     entry.result.actual_io_ratio = new_ratio;
-    entry.denomination = Denomination::Tstock;
+    entry.denomination = Denomination::Unwrapped;
     entry.assets_per_share = combine_rate_strings(input_rate, output_rate);
     Ok(())
 }
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_no_adjustment_when_wtstock() {
+    async fn test_no_adjustment_when_wrapped() {
         let pool = fresh_pool().await;
         let mut lookup = HistoricalRateLookup::new(&pool, HashSet::new());
         let mut response = TradesByAddressResponse {
@@ -265,7 +265,7 @@ mod tests {
                 order_hash: None,
                 timestamp: 1,
                 block_number: 100,
-                denomination: Denomination::Wtstock,
+                denomination: Denomination::Wrapped,
                 assets_per_share: None,
             }],
             pagination: TradesPagination {
@@ -276,17 +276,17 @@ mod tests {
                 has_more: false,
             },
         };
-        apply_denomination_by_address(&mut lookup, Denomination::Wtstock, &mut response)
+        apply_denomination_by_address(&mut lookup, Denomination::Wrapped, &mut response)
             .await
             .unwrap();
         assert_eq!(response.trades[0].input_amount, "1.0");
         assert_eq!(response.trades[0].output_amount, "-2.0");
-        assert_eq!(response.trades[0].denomination, Denomination::Wtstock);
+        assert_eq!(response.trades[0].denomination, Denomination::Wrapped);
         assert!(response.trades[0].assets_per_share.is_none());
     }
 
     #[rocket::async_test]
-    async fn test_tstock_adjusts_input_only_when_wrapped() {
+    async fn test_unwrapped_adjusts_input_only_when_wrapped() {
         let pool = fresh_pool().await;
         let wt = token(1, "wtMSTR", 18);
         db_rates::insert_snapshot(
@@ -318,7 +318,7 @@ mod tests {
                 order_hash: None,
                 timestamp: 1,
                 block_number: 100,
-                denomination: Denomination::Wtstock,
+                denomination: Denomination::Wrapped,
                 assets_per_share: None,
             }],
             pagination: TradesPagination {
@@ -329,7 +329,7 @@ mod tests {
                 has_more: false,
             },
         };
-        apply_denomination_by_address(&mut lookup, Denomination::Tstock, &mut response)
+        apply_denomination_by_address(&mut lookup, Denomination::Unwrapped, &mut response)
             .await
             .unwrap();
 
@@ -337,12 +337,12 @@ mod tests {
         assert_eq!(response.trades[0].input_amount, "15");
         // output is USDC, not wrapped — unchanged
         assert_eq!(response.trades[0].output_amount, "-50");
-        assert_eq!(response.trades[0].denomination, Denomination::Tstock);
+        assert_eq!(response.trades[0].denomination, Denomination::Unwrapped);
         assert_eq!(response.trades[0].assets_per_share.as_deref(), Some("1.5"));
     }
 
     #[rocket::async_test]
-    async fn test_tstock_leaves_unchanged_when_no_snapshot_at_block() {
+    async fn test_unwrapped_leaves_unchanged_when_no_snapshot_at_block() {
         let pool = fresh_pool().await;
         let wt = token(1, "wtMSTR", 18);
         // Snapshot only at block 200; trade at block 100 — should not match.
@@ -375,7 +375,7 @@ mod tests {
                 order_hash: None,
                 timestamp: 1,
                 block_number: 100,
-                denomination: Denomination::Wtstock,
+                denomination: Denomination::Wrapped,
                 assets_per_share: None,
             }],
             pagination: TradesPagination {
@@ -386,17 +386,17 @@ mod tests {
                 has_more: false,
             },
         };
-        apply_denomination_by_address(&mut lookup, Denomination::Tstock, &mut response)
+        apply_denomination_by_address(&mut lookup, Denomination::Unwrapped, &mut response)
             .await
             .unwrap();
 
         assert_eq!(response.trades[0].input_amount, "10");
-        assert_eq!(response.trades[0].denomination, Denomination::Tstock);
+        assert_eq!(response.trades[0].denomination, Denomination::Unwrapped);
         assert!(response.trades[0].assets_per_share.is_none());
     }
 
     #[rocket::async_test]
-    async fn test_tstock_adjusts_tx_response_amounts_and_ratios() {
+    async fn test_unwrapped_adjusts_tx_response_amounts_and_ratios() {
         let pool = fresh_pool().await;
         let wt = token(1, "wtMSTR", 18);
         db_rates::insert_snapshot(
@@ -437,7 +437,7 @@ mod tests {
                     output_amount: "-50".into(),
                     actual_io_ratio: "0.2".into(),
                 },
-                denomination: Denomination::Wtstock,
+                denomination: Denomination::Wrapped,
                 assets_per_share: None,
             }],
             totals: TradesTotals {
@@ -447,7 +447,7 @@ mod tests {
             },
         };
 
-        apply_denomination_by_tx(&mut lookup, Denomination::Tstock, &mut response)
+        apply_denomination_by_tx(&mut lookup, Denomination::Unwrapped, &mut response)
             .await
             .unwrap();
 
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(response.trades[0].result.output_amount, "-50");
         // Ratio recomputed: 20 / 50 = 0.4
         assert_eq!(response.trades[0].request.maximum_io_ratio, "0.4");
-        assert_eq!(response.trades[0].denomination, Denomination::Tstock);
+        assert_eq!(response.trades[0].denomination, Denomination::Unwrapped);
         // Totals recomputed
         assert_eq!(response.totals.total_input_amount, "20");
         assert_eq!(response.totals.average_io_ratio, "0.4");

@@ -33,7 +33,7 @@ pub struct Config {
 
     /// Subgraph that indexes the OARV-backed wrapped-token (`wt*`)
     /// contracts. Used by `/v1/tokens/exchange-rates` and the
-    /// `denomination=tstock` toggle on `/v1/trades/*`. Mirrors the URL used
+    /// `denomination=unwrapped` toggle on `/v1/trades/*`. Mirrors the URL used
     /// by `st0x.dividend.processes` and `st0x.issuance`; if the deployment
     /// moves, override here without rebuilding. Defaults to the published
     /// production endpoint when absent from the config file.
