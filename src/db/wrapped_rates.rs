@@ -109,6 +109,27 @@ pub(crate) async fn list_for_token_in_range(
     .await
 }
 
+/// Earliest snapshot for `token`, ordered by `block_number ASC` (ties broken
+/// by insert order via `id`). Returns `None` when no snapshot has been
+/// recorded yet. Used by the donation scanner to seed `from_block` when no
+/// scan-state cursor exists — we'd rather start from the first observation
+/// than walk Base from genesis.
+pub(crate) async fn get_earliest_for_token(
+    pool: &DbPool,
+    token: Address,
+) -> Result<Option<WrappedRateSnapshot>, sqlx::Error> {
+    sqlx::query_as::<_, WrappedRateSnapshot>(
+        "SELECT token_address, block_number, block_timestamp, assets_per_share, \
+                asset_address, asset_symbol, asset_decimals, captured_at \
+         FROM wrapped_exchange_rate_snapshots \
+         WHERE token_address = ? \
+         ORDER BY block_number ASC, id ASC LIMIT 1",
+    )
+    .bind(lowercase_addr(token))
+    .fetch_optional(pool)
+    .await
+}
+
 pub(crate) async fn get_at_or_before_block(
     pool: &DbPool,
     token: Address,

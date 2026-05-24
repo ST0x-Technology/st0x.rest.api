@@ -452,7 +452,7 @@ pub(crate) fn is_wrapped_token(token: &TokenCfg) -> bool {
 /// derived: symbol drops the leading `w` (`wtMSTR` → `tMSTR`) and decimals
 /// fall back to the wrapped token's decimals (always 18 in the current
 /// st0x deployment; both sides of every existing pair share the same scale).
-fn extract_asset_hint(token: &TokenCfg) -> (Address, String, u8) {
+pub(crate) fn extract_asset_hint(token: &TokenCfg) -> (Address, String, u8) {
     let ext = token.extensions.as_ref();
     let addr = extract_extension_string(ext, "unwrappedAddress")
         .or_else(|| extract_extension_string(ext, "assetAddress"))

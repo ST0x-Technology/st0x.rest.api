@@ -7,7 +7,8 @@ use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
 use crate::types::common::TokenRef;
-use crate::wrapped_rates::{self, SubgraphRateFetcher};
+use crate::wrapped_donations;
+use crate::wrapped_rates::{self, extract_asset_hint, SubgraphRateFetcher};
 use alloy::primitives::Address;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
@@ -344,6 +345,30 @@ pub async fn get_exchange_rate_history(
             tracing::info!(token = %params.token, "token not a registered wrapped token");
             ApiError::NotFound("wrapped token not registered".into())
         })?;
+
+        // Best-effort donation backfill: walk OARV Transfer logs since the
+        // last scan-state cursor and persist anything that wasn't a normal
+        // ERC4626 deposit. Failures are logged and ignored — we'd rather
+        // serve a slightly stale view than 500 the user when the RPC blips.
+        let (oarv_address, _, _) = extract_asset_hint(&token_cfg);
+        match wrapped_donations::scan_for_wrapper(pool.inner(), &token_cfg, oarv_address).await {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!(
+                        token = %params.token,
+                        inserted = count,
+                        "inline donation scan persisted new events"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    token = %params.token,
+                    error = %e,
+                    "inline donation scan failed; serving stored state only"
+                );
+            }
+        }
 
         // Pull every event in the requested window first; pagination is
         // applied post-merge so snapshots and donations interleave
