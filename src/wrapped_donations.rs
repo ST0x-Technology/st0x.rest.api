@@ -33,7 +33,9 @@
 use crate::db::wrapped_donations as db_donations;
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
+use crate::denomination::{format_ratio_from_u256, scale_one};
 use crate::error::ApiError;
+use crate::rpc::try_with_providers;
 use crate::wrapped_rates::{extract_asset_hint, IERC4626Rate};
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -54,6 +56,30 @@ pub(crate) const MAX_INLINE_SCAN_BLOCKS: u64 = 50_000;
 /// neither a scan-cursor nor a stored snapshot. Avoids walking Base from
 /// genesis on the first call against a freshly registered token.
 const SEED_LOOKBACK_BLOCKS: u64 = 50_000;
+
+/// How many blocks to lag behind the chain head before treating logs as
+/// final. Base reorgs are rare and shallow (single-block in practice); 32
+/// is generous insurance against a deeper one invalidating a freshly
+/// detected donation. Donations land in the response on the next request
+/// after this delay, which is fine: rates are cached for 24h anyway.
+pub(crate) const REORG_CONFIRMATION_BLOCKS: u64 = 32;
+
+/// Compute the inclusive `to_block` for a scan window, given the chain head
+/// and the cursor. Returns `None` when there is nothing safe to scan yet
+/// (i.e. `current_head - REORG_CONFIRMATION_BLOCKS <= from_block`). The
+/// returned value is additionally capped at
+/// `from_block + MAX_INLINE_SCAN_BLOCKS` so the route stays responsive.
+///
+/// Split out as a pure function so reorg-lag math can be unit-tested
+/// without spinning up an RPC.
+pub(crate) fn safe_to_block(current_head: u64, from_block: u64) -> Option<u64> {
+    let safe_head = current_head.saturating_sub(REORG_CONFIRMATION_BLOCKS);
+    if safe_head <= from_block {
+        return None;
+    }
+    let inline_cap = from_block.saturating_add(MAX_INLINE_SCAN_BLOCKS);
+    Some(safe_head.min(inline_cap))
+}
 
 /// `keccak256("Transfer(address,address,uint256)")`. Computed at runtime to
 /// avoid a hardcoded byte literal that could silently drift from the actual
@@ -229,21 +255,34 @@ pub(crate) async fn scan_for_wrapper(
         return Ok(0);
     }
 
-    // Use the first RPC for all calls in this scan. The fallback story is
-    // intentionally cheap: if the chunk fails we stop and bump the cursor
-    // to whatever we did complete — the next request retries the rest.
-    let rpc = &rpcs[0];
+    // Pick the first RPC that responds to `eth_blockNumber` and use it for
+    // the rest of the scan. Within a single scan we keep the same provider
+    // so the chunk-by-chunk fallback story stays simple: if mid-scan calls
+    // fail we stop, bump the cursor to whatever completed, and the next
+    // request retries the rest (possibly via a different RPC).
+    let (current_head, rpc) = match try_with_providers(&rpcs, |rpc| async move {
+        let provider = ProviderBuilder::new().connect_http(rpc.clone());
+        let head = provider
+            .get_block_number()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<(u64, url::Url), String>((head, rpc.clone()))
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(msg) => {
+            tracing::error!(
+                wrapper = ?wrapper_address,
+                error = %msg,
+                "donation scan: failed to fetch chain head from any rpc"
+            );
+            return Err(ApiError::Internal(
+                "donation scan: chain head lookup failed".into(),
+            ));
+        }
+    };
     let provider = ProviderBuilder::new().connect_http(rpc.clone());
-
-    let head = provider.get_block_number().await.map_err(|e| {
-        tracing::error!(
-            wrapper = ?wrapper_address,
-            rpc = %rpc,
-            error = %e,
-            "donation scan: failed to fetch chain head"
-        );
-        ApiError::Internal("donation scan: chain head lookup failed".into())
-    })?;
 
     let last_scanned = db_donations::get_scan_state(pool, wrapper_address)
         .await
@@ -260,7 +299,7 @@ pub(crate) async fn scan_for_wrapper(
             // Base from genesis.
             match db_rates::get_earliest_for_token(pool, wrapper_address).await {
                 Ok(Some(snapshot)) if snapshot.block_number > 0 => snapshot.block_number as u64,
-                Ok(_) => head.saturating_sub(SEED_LOOKBACK_BLOCKS),
+                Ok(_) => current_head.saturating_sub(SEED_LOOKBACK_BLOCKS),
                 Err(e) => {
                     tracing::error!(error = %e, wrapper = ?wrapper_address, "donation scan: earliest-snapshot lookup failed");
                     return Err(ApiError::Internal(
@@ -271,31 +310,33 @@ pub(crate) async fn scan_for_wrapper(
         }
     };
 
-    if from_block > head {
-        tracing::info!(
-            wrapper = ?wrapper_address,
-            from_block,
-            head,
-            "donation scan: cursor already at or past head; nothing to do"
-        );
-        return Ok(0);
-    }
+    // Lag behind the chain head by REORG_CONFIRMATION_BLOCKS so a shallow
+    // reorg can't invalidate a freshly persisted donation. If we don't have
+    // a safe range yet, log and return 0 without bumping the cursor —
+    // subsequent requests will pick the work up once enough blocks land.
+    let to_block = match safe_to_block(current_head, from_block) {
+        Some(b) => b,
+        None => {
+            tracing::info!(
+                wrapper = ?wrapper_address,
+                from_block,
+                current_head,
+                reorg_lag = REORG_CONFIRMATION_BLOCKS,
+                "donation scan: nothing safe to scan yet (within reorg confirmation lag)"
+            );
+            return Ok(0);
+        }
+    };
 
-    // Cap per-request work so the route stays responsive on first-time scans.
-    let raw_to_block = head;
-    let to_block = if raw_to_block.saturating_sub(from_block) > MAX_INLINE_SCAN_BLOCKS {
-        let capped = from_block.saturating_add(MAX_INLINE_SCAN_BLOCKS);
+    if to_block.saturating_sub(from_block) >= MAX_INLINE_SCAN_BLOCKS {
         tracing::warn!(
             wrapper = ?wrapper_address,
             from_block,
-            head,
-            capped_to = capped,
+            current_head,
+            capped_to = to_block,
             "donation scan: range exceeds MAX_INLINE_SCAN_BLOCKS; scanning a partial window"
         );
-        capped
-    } else {
-        raw_to_block
-    };
+    }
 
     tracing::info!(
         wrapper = ?wrapper_address,
@@ -306,13 +347,7 @@ pub(crate) async fn scan_for_wrapper(
     );
 
     let share_decimals = wrapper_token.decimals.unwrap_or(18);
-    let one_share = {
-        let mut v = U256::from(1u64);
-        for _ in 0..share_decimals {
-            v *= U256::from(10u64);
-        }
-        v
-    };
+    let one_share = scale_one(share_decimals);
     let (_asset_addr, _asset_sym, asset_decimals_hint) = extract_asset_hint(wrapper_token);
     let effective_asset_decimals = if asset_decimals_hint == 0 {
         share_decimals
@@ -451,30 +486,34 @@ pub(crate) async fn scan_for_wrapper(
             }
         }
 
-        // For each donation: compute new assetsPerShare at its block, persist.
+        // For each donation: compute new assetsPerShare at its block,
+        // persist. If the rate read fails (RPC pruned that block, transient
+        // error, etc.) we still persist the row with a NULL rate so the
+        // cursor can safely advance — the route layer lazily backfills the
+        // value on the next history request. Without this, a failed rate
+        // fetch lost the donation forever once the cursor moved past.
         let contract = IERC4626Rate::new(wrapper_address, &provider);
         for donation in donations {
-            let assets = match contract
+            let rate = match contract
                 .convertToAssets(one_share)
                 .block(BlockNumberOrTag::Number(donation.block_number).into())
                 .call()
                 .await
             {
-                Ok(a) => a,
+                Ok(a) => Some(format_ratio_from_u256(a, effective_asset_decimals)),
                 Err(e) => {
                     tracing::warn!(
                         wrapper = ?wrapper_address,
                         block = donation.block_number,
                         tx_hash = ?donation.tx_hash,
                         error = %e,
-                        "donation scan: convertToAssets failed; skipping donation"
+                        "donation scan: convertToAssets failed; persisting donation with null rate for later backfill"
                     );
-                    continue;
+                    None
                 }
             };
 
-            let formatted = format_ratio(assets, effective_asset_decimals);
-            let asset_amount = format_ratio(donation.value, effective_asset_decimals);
+            let asset_amount = format_ratio_from_u256(donation.value, effective_asset_decimals);
             let block_timestamp = block_ts_cache
                 .get(&donation.block_number)
                 .copied()
@@ -487,7 +526,7 @@ pub(crate) async fn scan_for_wrapper(
                 block_number: donation.block_number,
                 block_timestamp,
                 tx_hash: donation.tx_hash,
-                new_assets_per_share: &formatted,
+                new_assets_per_share: rate.as_deref(),
             };
             if let Err(e) = db_donations::insert_event(pool, &new_event).await {
                 tracing::error!(
@@ -527,25 +566,6 @@ pub(crate) async fn scan_for_wrapper(
         "donation scan: complete"
     );
     Ok(inserts)
-}
-
-/// Render `assets / 10^decimals` as a decimal string. Mirrors the helper in
-/// [`crate::wrapped_rates`] (kept local to avoid widening that module's
-/// public surface for a single caller).
-fn format_ratio(assets: U256, decimals: u8) -> String {
-    let mut scale = U256::from(1u64);
-    for _ in 0..decimals {
-        scale *= U256::from(10u64);
-    }
-    let integer = assets / scale;
-    let remainder = assets % scale;
-    if remainder.is_zero() {
-        return format!("{integer}.0");
-    }
-    let frac_full = format!("{remainder:0width$}", width = decimals as usize);
-    let trimmed = frac_full.trim_end_matches('0');
-    let frac = if trimmed.is_empty() { "0" } else { trimmed };
-    format!("{integer}.{frac}")
 }
 
 #[cfg(test)]
@@ -738,26 +758,33 @@ mod tests {
     }
 
     #[test]
-    fn test_format_ratio_one() {
-        let mut scale = U256::from(1u64);
-        for _ in 0..18 {
-            scale *= U256::from(10u64);
-        }
-        assert_eq!(format_ratio(scale, 18), "1.0");
+    fn test_safe_to_block_returns_none_within_reorg_window() {
+        // current_head=1000, from_block=970, reorg=32 → safe_head=968
+        // 968 <= 970 → None (nothing safe to scan yet).
+        assert_eq!(safe_to_block(1000, 970), None);
     }
 
     #[test]
-    fn test_format_ratio_fractional() {
-        // 1.05 * 10^18
-        let mut scale = U256::from(1u64);
-        for _ in 0..18 {
-            scale *= U256::from(10u64);
-        }
-        // 5 * 10^16
-        let mut bump = U256::from(5u64);
-        for _ in 0..16 {
-            bump *= U256::from(10u64);
-        }
-        assert_eq!(format_ratio(scale + bump, 18), "1.05");
+    fn test_safe_to_block_caps_at_safe_head() {
+        // current_head=1000, from_block=900 → safe_head=968.
+        // Window (68 blocks) is well under MAX_INLINE_SCAN_BLOCKS, so the
+        // returned value is exactly safe_head.
+        assert_eq!(safe_to_block(1000, 900), Some(968));
+    }
+
+    #[test]
+    fn test_safe_to_block_caps_at_inline_max() {
+        // safe_head far past from_block + MAX_INLINE_SCAN_BLOCKS → cap.
+        let from_block = 100u64;
+        let current_head = from_block + MAX_INLINE_SCAN_BLOCKS + REORG_CONFIRMATION_BLOCKS + 10_000;
+        let got = safe_to_block(current_head, from_block).expect("safe range exists");
+        assert_eq!(got, from_block + MAX_INLINE_SCAN_BLOCKS);
+    }
+
+    #[test]
+    fn test_safe_to_block_handles_genesis_head() {
+        // current_head smaller than the reorg lag — saturating_sub keeps it
+        // at 0, which is by definition <= from_block, so we return None.
+        assert_eq!(safe_to_block(10, 0), None);
     }
 }

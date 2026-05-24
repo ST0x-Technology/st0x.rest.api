@@ -15,6 +15,7 @@ mod fairings;
 mod market_calendar;
 mod raindex;
 mod routes;
+mod rpc;
 mod telemetry;
 mod types;
 mod wrapped_donations;

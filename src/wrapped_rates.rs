@@ -41,7 +41,9 @@
 use crate::db::settings;
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
-use alloy::primitives::{Address, U256};
+use crate::denomination::{format_ratio_from_u256, scale_one};
+use crate::rpc::try_with_providers;
+use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use async_trait::async_trait;
 use rain_orderbook_app_settings::token::TokenCfg;
@@ -162,12 +164,6 @@ impl RateFetcher for RpcRateFetcher {
         &self,
         token: &TokenCfg,
     ) -> Result<RateObservation, RateFetchError> {
-        if self.rpcs.is_empty() {
-            return Err(RateFetchError::RpcUnavailable(
-                "no rpc urls configured for token network".into(),
-            ));
-        }
-
         let share_decimals = token.decimals.unwrap_or(18);
         let one_share = scale_one(share_decimals);
         let (asset_address, asset_symbol, asset_decimals) = extract_asset_hint(token);
@@ -177,28 +173,33 @@ impl RateFetcher for RpcRateFetcher {
             asset_decimals
         };
 
-        let mut last_err: Option<String> = None;
-        for rpc in &self.rpcs {
+        // Fetch the raw `assets` value (plus the block number we observe
+        // it at) from the first responsive RPC. Format/owning fields are
+        // assembled outside the closure to keep the `FnMut` borrow shape
+        // minimal — `asset_symbol` is moved into the final `RateObservation`
+        // exactly once.
+        let token_address = token.address;
+        let (assets, block_number) = try_with_providers(&self.rpcs, |rpc| async move {
             let provider = ProviderBuilder::new().connect_http(rpc.clone());
-            let contract = IERC4626Rate::new(token.address, &provider);
+            let contract = IERC4626Rate::new(token_address, &provider);
 
-            let assets = match contract.convertToAssets(one_share).call().await {
-                Ok(value) => value,
-                Err(e) => {
+            let assets = contract
+                .convertToAssets(one_share)
+                .call()
+                .await
+                .map_err(|e| {
                     tracing::warn!(
-                        token = ?token.address,
+                        token = ?token_address,
                         rpc = %rpc,
                         error = %e,
                         "convertToAssets call failed; trying next rpc"
                     );
-                    last_err = Some(e.to_string());
-                    continue;
-                }
-            };
+                    e.to_string()
+                })?;
 
             let block_number = provider.get_block_number().await.unwrap_or_else(|e| {
                 tracing::warn!(
-                    token = ?token.address,
+                    token = ?token_address,
                     rpc = %rpc,
                     error = %e,
                     "block_number lookup failed; recording snapshot with block 0"
@@ -206,35 +207,26 @@ impl RateFetcher for RpcRateFetcher {
                 0
             });
 
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            Ok::<(alloy::primitives::U256, u64), String>((assets, block_number))
+        })
+        .await
+        .map_err(RateFetchError::RpcUnavailable)?;
 
-            let formatted = format_ratio(assets, effective_asset_decimals);
-            return Ok(RateObservation {
-                token_address: token.address,
-                block_number,
-                block_timestamp: now,
-                assets_per_share: formatted,
-                asset_address,
-                asset_symbol,
-                asset_decimals: effective_asset_decimals,
-            });
-        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-        Err(RateFetchError::RpcUnavailable(
-            last_err.unwrap_or_else(|| "all rpcs failed".into()),
-        ))
+        Ok(RateObservation {
+            token_address,
+            block_number,
+            block_timestamp: now,
+            assets_per_share: format_ratio_from_u256(assets, effective_asset_decimals),
+            asset_address,
+            asset_symbol,
+            asset_decimals: effective_asset_decimals,
+        })
     }
-}
-
-fn scale_one(decimals: u8) -> U256 {
-    let mut value = U256::from(1u64);
-    for _ in 0..decimals {
-        value *= U256::from(10u64);
-    }
-    value
 }
 
 /// Default production fetcher: pulls wrapper state out of the sft-base
@@ -370,7 +362,7 @@ impl RateFetcher for SubgraphRateFetcher {
         // same code path the variable-rate case will use, so a future indexer
         // upgrade that surfaces a dynamic ratio drops in without touching
         // call sites.
-        let assets_per_share = format_ratio(scale_one(share_decimals), share_decimals);
+        let assets_per_share = format_ratio_from_u256(scale_one(share_decimals), share_decimals);
 
         let asset_address = vault
             .id
@@ -415,22 +407,6 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Renders `assets / 10^decimals` as a decimal string, trimming trailing
-/// zeros but always keeping at least one fractional digit so the result is
-/// unambiguously a decimal (e.g. `1.0`, not `1`).
-fn format_ratio(assets: U256, decimals: u8) -> String {
-    let scale = scale_one(decimals);
-    let integer = assets / scale;
-    let remainder = assets % scale;
-    if remainder.is_zero() {
-        return format!("{integer}.0");
-    }
-    let frac_full = format!("{remainder:0width$}", width = decimals as usize);
-    let trimmed = frac_full.trim_end_matches('0');
-    let frac = if trimmed.is_empty() { "0" } else { trimmed };
-    format!("{integer}.{frac}")
 }
 
 /// Treat a token as wrapped if its `extensions.category == "ST0x"` (this is
@@ -613,30 +589,6 @@ mod tests {
     fn test_derived_asset_symbol_strips_wt() {
         let token = make_token(Some("wtMSTR"), None);
         assert_eq!(derived_asset_symbol(&token).unwrap(), "tMSTR");
-    }
-
-    #[test]
-    fn test_format_ratio_handles_integer_result() {
-        let one = scale_one(18);
-        assert_eq!(format_ratio(one, 18), "1.0");
-    }
-
-    #[test]
-    fn test_format_ratio_renders_one_point_five() {
-        let one_point_five = scale_one(18) + scale_one(18) / U256::from(2u64);
-        assert_eq!(format_ratio(one_point_five, 18), "1.5");
-    }
-
-    #[test]
-    fn test_format_ratio_strips_trailing_zeros() {
-        // 1.04 * 10^18
-        let value = scale_one(18) + scale_one(16) * U256::from(4u64);
-        assert_eq!(format_ratio(value, 18), "1.04");
-    }
-
-    #[test]
-    fn test_format_ratio_zero() {
-        assert_eq!(format_ratio(U256::ZERO, 18), "0.0");
     }
 
     #[test]

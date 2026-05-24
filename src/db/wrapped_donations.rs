@@ -12,6 +12,7 @@ use alloy::primitives::{Address, B256};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct DonationEventRow {
+    pub id: i64,
     #[allow(dead_code)]
     pub wrapper_address: String,
     pub donor_address: String,
@@ -19,7 +20,11 @@ pub(crate) struct DonationEventRow {
     pub block_number: i64,
     pub block_timestamp: i64,
     pub tx_hash: String,
-    pub new_assets_per_share: String,
+    /// `None` when the scanner could not read `convertToAssets` at the
+    /// donation block (RPC pruned, transient failure). The route handler
+    /// performs a bounded best-effort backfill on read; until that
+    /// succeeds, callers see JSON `null` for this field.
+    pub new_assets_per_share: Option<String>,
     #[allow(dead_code)]
     pub captured_at: String,
 }
@@ -31,7 +36,10 @@ pub(crate) struct NewDonationEvent<'a> {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub tx_hash: B256,
-    pub new_assets_per_share: &'a str,
+    /// `None` indicates the scanner couldn't read the rate at this block.
+    /// The row is still persisted so the cursor can advance safely; the
+    /// route layer attempts a lazy backfill on the next history request.
+    pub new_assets_per_share: Option<&'a str>,
 }
 
 fn lowercase_addr(addr: Address) -> String {
@@ -42,9 +50,14 @@ fn lowercase_b256(value: B256) -> String {
     format!("{value:#x}")
 }
 
-/// Insert a donation event. The `(wrapper_address, tx_hash, donor_address)`
-/// unique constraint makes this idempotent — replays of the scanner over
-/// the same block range silently no-op via `INSERT OR IGNORE`.
+/// Insert a donation event. The widened `(wrapper_address, tx_hash,
+/// donor_address, asset_amount, block_number)` unique constraint makes this
+/// idempotent — replays of the scanner over the same block range silently
+/// no-op via `INSERT OR IGNORE`.
+///
+/// `new_assets_per_share` may be `None` when the scanner couldn't read the
+/// rate at the donation block; the route layer will lazily backfill on
+/// the next history request.
 #[allow(dead_code)]
 pub(crate) async fn insert_event(
     pool: &DbPool,
@@ -68,6 +81,20 @@ pub(crate) async fn insert_event(
     Ok(())
 }
 
+/// Backfill the `new_assets_per_share` value for a row that was originally
+/// stored with NULL because the scanner couldn't read the rate at the
+/// donation block. Targeted by `id` so we only touch the exact row we just
+/// re-fetched for.
+#[allow(dead_code)]
+pub(crate) async fn update_rate(pool: &DbPool, id: i64, new_rate: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE wrapped_donation_events SET new_assets_per_share = ? WHERE id = ?")
+        .bind(new_rate)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Return every donation event for `wrapper` within the optional
 /// `[from_block, to_block]` window (inclusive on both ends). Ordering is by
 /// `block_number` ascending so the route can merge with snapshots in
@@ -81,7 +108,7 @@ pub(crate) async fn list_for_wrapper(
     let from = from_block.map(|b| b as i64).unwrap_or(0);
     let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
     sqlx::query_as::<_, DonationEventRow>(
-        "SELECT wrapper_address, donor_address, asset_amount, block_number, \
+        "SELECT id, wrapper_address, donor_address, asset_amount, block_number, \
                 block_timestamp, tx_hash, new_assets_per_share, captured_at \
          FROM wrapped_donation_events \
          WHERE wrapper_address = ? AND block_number BETWEEN ? AND ? \
@@ -166,7 +193,7 @@ mod tests {
                 block_number: 100,
                 block_timestamp: 1_700_000_000,
                 tx_hash: tx(1),
-                new_assets_per_share: "1.05",
+                new_assets_per_share: Some("1.05"),
             },
         )
         .await
@@ -180,7 +207,7 @@ mod tests {
                 block_number: 200,
                 block_timestamp: 1_700_001_000,
                 tx_hash: tx(2),
-                new_assets_per_share: "1.10",
+                new_assets_per_share: Some("1.10"),
             },
         )
         .await
@@ -204,7 +231,7 @@ mod tests {
             block_number: 100,
             block_timestamp: 1_700_000_000,
             tx_hash: tx(1),
-            new_assets_per_share: "1.05",
+            new_assets_per_share: Some("1.05"),
         };
         insert_event(&pool, &event).await.unwrap();
         // Replay — should be silently ignored.
@@ -229,7 +256,7 @@ mod tests {
                     block_number: bn,
                     block_timestamp: bn * 10,
                     tx_hash: tx(i),
-                    new_assets_per_share: "1.0",
+                    new_assets_per_share: Some("1.0"),
                 },
             )
             .await
@@ -240,6 +267,58 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].block_number, 200);
+    }
+
+    #[rocket::async_test]
+    async fn test_insert_event_persists_null_rate() {
+        let pool = fresh_pool().await;
+        let wrapper = addr(1);
+        let donor = addr(2);
+        insert_event(
+            &pool,
+            &NewDonationEvent {
+                wrapper_address: wrapper,
+                donor_address: donor,
+                asset_amount: "5.0",
+                block_number: 500,
+                block_timestamp: 1_700_005_000,
+                tx_hash: tx(9),
+                new_assets_per_share: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = list_for_wrapper(&pool, wrapper, None, None).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].new_assets_per_share.is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_update_rate_backfills_null_row() {
+        let pool = fresh_pool().await;
+        let wrapper = addr(1);
+        let donor = addr(2);
+        insert_event(
+            &pool,
+            &NewDonationEvent {
+                wrapper_address: wrapper,
+                donor_address: donor,
+                asset_amount: "5.0",
+                block_number: 500,
+                block_timestamp: 1_700_005_000,
+                tx_hash: tx(9),
+                new_assets_per_share: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rows = list_for_wrapper(&pool, wrapper, None, None).await.unwrap();
+        update_rate(&pool, rows[0].id, "1.07").await.unwrap();
+
+        let rows = list_for_wrapper(&pool, wrapper, None, None).await.unwrap();
+        assert_eq!(rows[0].new_assets_per_share.as_deref(), Some("1.07"));
     }
 
     #[rocket::async_test]

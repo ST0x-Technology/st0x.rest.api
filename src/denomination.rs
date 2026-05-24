@@ -18,12 +18,44 @@
 use crate::error::ApiError;
 use crate::raindex::SharedRaindexProvider;
 use crate::wrapped_rates;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use rain_math_float::Float;
 use rain_orderbook_app_settings::token::TokenCfg;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Div, Mul};
+
+/// Build `10^decimals` as a `U256`. Used by both the on-chain
+/// `convertToAssets(10^shareDecimals)` call sites and the decimal-string
+/// formatter below.
+pub(crate) fn scale_one(decimals: u8) -> U256 {
+    let mut value = U256::from(1u64);
+    for _ in 0..decimals {
+        value *= U256::from(10u64);
+    }
+    value
+}
+
+/// Renders `assets / 10^decimals` as a decimal string, trimming trailing
+/// zeros but always keeping at least one fractional digit so the result is
+/// unambiguously a decimal (e.g. `1.0`, not `1`).
+///
+/// Lives alongside [`format_float`] — both are the math-utility home and the
+/// signatures are sibling concerns (this one operates on raw `U256` from
+/// ERC4626 reads; the `Float` variant operates on parsed `rain_math_float`
+/// values).
+pub(crate) fn format_ratio_from_u256(assets: U256, decimals: u8) -> String {
+    let scale = scale_one(decimals);
+    let integer = assets / scale;
+    let remainder = assets % scale;
+    if remainder.is_zero() {
+        return format!("{integer}.0");
+    }
+    let frac_full = format!("{remainder:0width$}", width = decimals as usize);
+    let trimmed = frac_full.trim_end_matches('0');
+    let frac = if trimmed.is_empty() { "0" } else { trimmed };
+    format!("{integer}.{frac}")
+}
 
 /// Parse a decimal string into a [`Float`], mapping errors onto [`ApiError`].
 /// `context` is folded into the error message and tracing entry so callers can
@@ -322,6 +354,23 @@ mod tests {
             serde_json::from_str::<Denomination>("\"unwrapped\"").unwrap(),
             Denomination::Unwrapped
         );
+    }
+
+    #[test]
+    fn test_format_ratio_from_u256_one() {
+        assert_eq!(format_ratio_from_u256(scale_one(18), 18), "1.0");
+    }
+
+    #[test]
+    fn test_format_ratio_from_u256_fractional() {
+        // 1.05 * 10^18
+        let value = scale_one(18) + scale_one(16) * U256::from(5u64);
+        assert_eq!(format_ratio_from_u256(value, 18), "1.05");
+    }
+
+    #[test]
+    fn test_format_ratio_from_u256_zero() {
+        assert_eq!(format_ratio_from_u256(U256::ZERO, 18), "0.0");
     }
 
     #[test]

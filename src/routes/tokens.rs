@@ -2,14 +2,17 @@ use crate::auth::AuthenticatedKey;
 use crate::db::wrapped_donations as db_donations;
 use crate::db::wrapped_rates as db_rates;
 use crate::db::DbPool;
-use crate::denomination::WrappedTokenIndex;
+use crate::denomination::{format_ratio_from_u256, scale_one, WrappedTokenIndex};
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
+use crate::rpc::try_with_providers;
 use crate::types::common::TokenRef;
 use crate::wrapped_donations;
-use crate::wrapped_rates::{self, extract_asset_hint, SubgraphRateFetcher};
+use crate::wrapped_rates::{self, extract_asset_hint, IERC4626Rate, SubgraphRateFetcher};
 use alloy::primitives::Address;
+use alloy::providers::ProviderBuilder;
+use alloy::rpc::types::eth::BlockNumberOrTag;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rocket::form::FromForm;
@@ -260,8 +263,10 @@ pub enum ExchangeRateHistoryEvent {
     },
     /// Donation event detected by the wrapper scanner — an OARV transfer
     /// straight to the wrapper that bumped `assetsPerShare` without
-    /// minting new wrapper shares. Currently the scanner is a stub
-    /// (see `crate::wrapped_donations`); rows only appear once it lands.
+    /// minting new wrapper shares. `new_assets_per_share` is `null` only
+    /// when both the scanner and the route-level backfill failed to read
+    /// `convertToAssets` at the donation block (e.g. the RPC pruned that
+    /// height); a subsequent request will retry the backfill.
     #[serde(rename_all = "camelCase")]
     Donation {
         #[schema(example = 12345700)]
@@ -275,7 +280,7 @@ pub enum ExchangeRateHistoryEvent {
         #[schema(example = "100.0")]
         asset_amount: String,
         #[schema(example = "1.05")]
-        new_assets_per_share: String,
+        new_assets_per_share: Option<String>,
     },
 }
 
@@ -386,7 +391,7 @@ pub async fn get_exchange_rate_history(
             ApiError::Internal("snapshot history lookup failed".into())
         })?;
 
-        let donations = db_donations::list_for_wrapper(
+        let mut donations = db_donations::list_for_wrapper(
             pool.inner(),
             token_addr,
             params.from_block,
@@ -397,6 +402,13 @@ pub async fn get_exchange_rate_history(
             tracing::error!(error = %e, "donation history lookup failed");
             ApiError::Internal("donation history lookup failed".into())
         })?;
+
+        // Best-effort lazy backfill: rows the scanner stored with a NULL
+        // rate (RPC couldn't read `convertToAssets` at the donation block)
+        // get a second chance now. Capped to keep request latency bounded;
+        // anything still NULL after this serialises as JSON null and will
+        // be retried on the next request.
+        backfill_null_rates(pool.inner(), &token_cfg, &mut donations).await;
 
         let (asset_addr, asset_symbol, asset_decimals) = derive_asset_ref(&snapshots);
 
@@ -497,12 +509,96 @@ fn merge_events(
                 tx_hash: d.tx_hash,
                 donor: d.donor_address,
                 asset_amount: d.asset_amount,
-                new_assets_per_share: d.new_assets_per_share,
+                new_assets_per_share: d.new_assets_per_share.clone(),
             },
         ));
     }
     events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     events.into_iter().map(|(_, _, ev)| ev).collect()
+}
+
+/// Cap on how many NULL-rate donation rows the route will attempt to
+/// backfill per request. Backfill makes one historical `convertToAssets`
+/// RPC call per row, so capping keeps endpoint latency predictable when
+/// many rows accumulated during an RPC outage. Anything still NULL after
+/// this cap is serialised as JSON `null`; subsequent requests retry.
+const HISTORY_BACKFILL_MAX_ROWS: usize = 25;
+
+/// Best-effort lazy backfill for donation rows the scanner persisted with
+/// `new_assets_per_share = NULL`. Mutates `donations` in place so the
+/// in-memory rows reflect any newly-fetched rates before serialisation.
+///
+/// Errors are swallowed: this is purely opportunistic. If every RPC fails
+/// or the share-token has no configured RPCs, the rows stay NULL and the
+/// API surfaces `null` to the caller — strictly better than the previous
+/// behaviour, where a failed read at scan time silently dropped the entire
+/// donation.
+async fn backfill_null_rates(
+    pool: &DbPool,
+    wrapper_token: &TokenCfg,
+    donations: &mut [db_donations::DonationEventRow],
+) {
+    let rpcs = &wrapper_token.network.rpcs;
+    if rpcs.is_empty() {
+        return;
+    }
+    let share_decimals = wrapper_token.decimals.unwrap_or(18);
+    let one_share = scale_one(share_decimals);
+    let (_, _, asset_decimals_hint) = extract_asset_hint(wrapper_token);
+    let effective_asset_decimals = if asset_decimals_hint == 0 {
+        share_decimals
+    } else {
+        asset_decimals_hint
+    };
+    let wrapper_address = wrapper_token.address;
+
+    let mut budget = HISTORY_BACKFILL_MAX_ROWS;
+    for row in donations.iter_mut() {
+        if row.new_assets_per_share.is_some() {
+            continue;
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let block_number = u64::try_from(row.block_number).unwrap_or(0);
+        let fetched = try_with_providers(rpcs, |rpc| async move {
+            let provider = ProviderBuilder::new().connect_http(rpc.clone());
+            let contract = IERC4626Rate::new(wrapper_address, &provider);
+            let assets = contract
+                .convertToAssets(one_share)
+                .block(BlockNumberOrTag::Number(block_number).into())
+                .call()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<alloy::primitives::U256, String>(assets)
+        })
+        .await;
+        match fetched {
+            Ok(assets) => {
+                let formatted = format_ratio_from_u256(assets, effective_asset_decimals);
+                if let Err(e) = db_donations::update_rate(pool, row.id, &formatted).await {
+                    tracing::warn!(
+                        error = %e,
+                        wrapper = ?wrapper_address,
+                        donation_id = row.id,
+                        "donation rate backfill: db update failed"
+                    );
+                    continue;
+                }
+                row.new_assets_per_share = Some(formatted);
+            }
+            Err(msg) => {
+                tracing::warn!(
+                    wrapper = ?wrapper_address,
+                    donation_id = row.id,
+                    block_number,
+                    error = %msg,
+                    "donation rate backfill: every rpc failed; leaving null"
+                );
+            }
+        }
+    }
 }
 
 /// Pulls the underlying-asset metadata off the most recent snapshot in the
@@ -822,7 +918,7 @@ using-tokens-from:
                 block_number: 200,
                 block_timestamp: 1_700_001_000,
                 tx_hash: tx1,
-                new_assets_per_share: "1.02",
+                new_assets_per_share: Some("1.02"),
             },
         )
         .await
@@ -836,7 +932,7 @@ using-tokens-from:
                 block_number: 300,
                 block_timestamp: 1_700_002_000,
                 tx_hash: tx2,
-                new_assets_per_share: "1.08",
+                new_assets_per_share: Some("1.08"),
             },
         )
         .await
