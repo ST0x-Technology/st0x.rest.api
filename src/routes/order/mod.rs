@@ -8,7 +8,10 @@ use alloy::primitives::{Bytes, B256};
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
 use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
-use rain_orderbook_common::raindex_client::trades::RaindexTrade;
+use rain_orderbook_common::raindex_client::trades::{
+    GetTradesByOrderHashesFilters, OrderHashes, RaindexTrade,
+};
+use rain_orderbook_common::raindex_client::types::TimeFilter;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 
@@ -55,14 +58,27 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
     }
 
     async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError> {
-        order
-            .get_trades_list(None, None, None)
+        let order_hash = order.order_hash();
+        let filters = GetTradesByOrderHashesFilters {
+            time_filter: Some(TimeFilter::default()),
+            ..Default::default()
+        };
+
+        let result = self
+            .client
+            .get_trades_by_order_hashes(None, OrderHashes(vec![order_hash]), Some(filters))
             .await
-            .map(|r| r.trades().to_vec())
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query order trades");
                 ApiError::Internal("failed to query order trades".into())
-            })
+            })?;
+
+        Ok(result
+            .trades_by_order_hash()
+            .iter()
+            .find(|entry| entry.order_hash() == order_hash)
+            .map(|entry| entry.trades().to_vec())
+            .unwrap_or_default())
     }
 
     async fn get_remove_calldata(&self, order: &RaindexOrder) -> Result<Bytes, ApiError> {
