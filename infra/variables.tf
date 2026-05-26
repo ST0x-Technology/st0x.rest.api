@@ -45,3 +45,17 @@ variable "preview_volume_size_gb" {
   type        = number
   default     = 5
 }
+
+variable "preview_bootstrap_ssh_public_key" {
+  description = "Public SSH key authorized on the preview droplet before NixOS bootstrap"
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.preview_bootstrap_ssh_public_key == ""
+      || can(regex("^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))\\s+[A-Za-z0-9+/=]+(\\s+.+)?$", var.preview_bootstrap_ssh_public_key))
+    )
+    error_message = "preview_bootstrap_ssh_public_key must be empty or a valid SSH public key."
+  }
+}

@@ -3,7 +3,7 @@
 # st0x-rest-api instance. Designed to be run post-deploy or on a cron.
 #
 # Usage:
-#   API_URL=https://api.preview.st0x.io \
+#   API_URL=https://api.staging.st0x.io \
 #     API_KEY=<key-id> API_SECRET=<secret> \
 #     ./scripts/smoke.sh
 #
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-API_URL="${API_URL:-https://api.preview.st0x.io}"
+API_URL="${API_URL:-https://api.staging.st0x.io}"
 API_KEY="${API_KEY:-}"
 API_SECRET="${API_SECRET:-}"
 

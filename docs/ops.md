@@ -6,10 +6,10 @@ Quick journalctl + curl recipes for the deployed `rest-api` service. SSH into pr
 
 ```bash
 # Quick liveness probe (no auth)
-curl -sS https://api.preview.st0x.io/health | jq
+curl -sS https://api.staging.st0x.io/health | jq
 
 # Full status — includes db connectivity, raindex sync, cache_warmer
-curl -sS https://api.preview.st0x.io/health/detailed | jq
+curl -sS https://api.staging.st0x.io/health/detailed | jq
 ```
 
 Key fields in `/health/detailed.cache_warmer`:
@@ -20,7 +20,7 @@ Key fields in `/health/detailed.cache_warmer`:
 
 ## Common journalctl queries
 
-All preview queries run via `ssh root@api.preview.st0x.io '...'` or after `nix develop -c remote-preview`.
+All preview queries run via `ssh root@api.staging.st0x.io '...'` or after `nix develop -c remote-preview`.
 
 ### 429 rate
 

@@ -40,6 +40,10 @@ resource "digitalocean_volume" "preview_data" {
   size                    = var.preview_volume_size_gb
   initial_filesystem_type = "ext4"
   description             = "Persistent preview storage for SQLite database and logs"
+
+  lifecycle {
+    ignore_changes = [droplet_ids, initial_filesystem_type]
+  }
 }
 
 resource "digitalocean_droplet" "preview_nixos" {
@@ -50,6 +54,27 @@ resource "digitalocean_droplet" "preview_nixos" {
   region   = var.region
   size     = var.preview_droplet_size
   ssh_keys = [data.digitalocean_ssh_key.deploy.id]
+  user_data = "#cloud-config\n${yamlencode({
+    disable_root = false
+    users = [
+      "default",
+      {
+        name                = "root"
+        lock_passwd         = true
+        shell               = "/bin/bash"
+        ssh_authorized_keys = [var.preview_bootstrap_ssh_public_key]
+      }
+    ]
+  })}"
+
+  lifecycle {
+    ignore_changes = [ssh_keys, volume_ids, user_data]
+
+    precondition {
+      condition     = length(trimspace(var.preview_bootstrap_ssh_public_key)) > 0
+      error_message = "preview_bootstrap_ssh_public_key must be set when preview_enabled is true."
+    }
+  }
 }
 
 resource "digitalocean_volume_attachment" "preview_data" {
@@ -70,4 +95,6 @@ resource "digitalocean_reserved_ip_assignment" "preview_nixos" {
 
   ip_address = digitalocean_reserved_ip.preview_nixos[0].ip_address
   droplet_id = digitalocean_droplet.preview_nixos[0].id
+
+  depends_on = [digitalocean_volume_attachment.preview_data]
 }

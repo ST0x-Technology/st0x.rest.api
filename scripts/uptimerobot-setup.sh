@@ -7,7 +7,7 @@
 # Usage:
 #   UPTIMEROBOT_API_KEY=<your-main-api-key> ./scripts/uptimerobot-setup.sh
 #
-#   # Override target (default: https://api.preview.st0x.io)
+#   # Override target (default: https://api.staging.st0x.io)
 #   API_URL=https://api.st0x.io \
 #     UPTIMEROBOT_API_KEY=... ./scripts/uptimerobot-setup.sh
 #
@@ -21,7 +21,7 @@
 set -uo pipefail
 
 : "${UPTIMEROBOT_API_KEY:?UPTIMEROBOT_API_KEY is required}"
-API_URL="${API_URL:-https://api.preview.st0x.io}"
+API_URL="${API_URL:-https://api.staging.st0x.io}"
 INTERVAL_SECONDS="${INTERVAL:-300}"  # 5 minutes (free-tier minimum)
 # Optional: attach an existing alert contact (e.g. a Telegram integration).
 # Discover candidate IDs with:

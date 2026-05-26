@@ -243,7 +243,7 @@ Bootstrap preview after the host exists:
 DEPLOY_ENV=preview nix develop -c bootstrap
 ```
 
-Point `api.preview.st0x.io` at the preview reserved IP:
+Point `api.staging.st0x.io` at the preview reserved IP:
 
 ```bash
 nix develop -c resolve-preview-ip
@@ -273,7 +273,7 @@ After deploy, wait for `/health/detailed` to report a ready raindex state before
 running performance checks:
 
 ```bash
-export API_URL=https://api.preview.st0x.io
+export API_URL=https://api.staging.st0x.io
 read -r -p "API_KEY: " API_KEY && export API_KEY
 read -r -s -p "API_SECRET: " API_SECRET && export API_SECRET
 printf "\n"

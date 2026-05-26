@@ -5,3 +5,6 @@ do_token = ""
 
 # Set to true to provision the reusable preview API host and volume.
 preview_enabled = false
+
+# Public key authorized during first preview bootstrap. Required when preview_enabled is true.
+preview_bootstrap_ssh_public_key = ""

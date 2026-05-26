@@ -31,8 +31,7 @@
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
-    in
-    {
+    in {
       nixosConfigurations.st0x-rest-api-prod = mkNixosConfiguration {
         name = "prod";
         virtualHost = "api.st0x.io";
@@ -43,7 +42,7 @@
 
       nixosConfigurations.st0x-rest-api-preview = mkNixosConfiguration {
         name = "preview";
-        virtualHost = "api.preview.st0x.io";
+        virtualHost = "api.staging.st0x.io";
         configFile = ./config/preview.toml;
         dataDir = "/mnt/data/st0x-rest-api-preview";
         dataVolumeName = "st0x-rest-api-preview-data";
@@ -98,7 +97,8 @@
               cargo test --workspace
             '';
           };
-          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
+          inherit (infraPkgs)
+            tfInit tfPlan tfApply tfImport tfDestroy tfEditVars;
 
           st0x-rest-api = st0xRust.package;
           st0x-clippy = st0xRust.clippy;
@@ -179,6 +179,12 @@
             name = "tf-rekey";
             additionalBuildInputs = infraPkgs.buildInputs;
             body = infraPkgs.tfRekey;
+          };
+
+          tfPreviewProvision = rainix.mkTask.${system} {
+            name = "tf-preview-provision";
+            additionalBuildInputs = infraPkgs.buildInputs;
+            body = infraPkgs.tfPreviewProvision;
           };
 
           resolveIp = pkgs.writeShellApplication {

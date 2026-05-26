@@ -6,7 +6,14 @@ let
 
   tfState = "infra/terraform.tfstate";
   tfVars = "infra/terraform.tfvars";
+  tfSecretVars = "infra/zz_secret.auto.tfvars";
   tfPlanFile = "infra/tfplan";
+  previewVolumeAddr = "digitalocean_volume.preview_data[0]";
+  previewVolumeId = "475f705e-54f8-11f1-9077-0a58ac129076";
+  previewDropletAddr = "digitalocean_droplet.preview_nixos[0]";
+  previewDropletId = "572288021";
+  previewReservedIpAddr = "digitalocean_reserved_ip.preview_nixos[0]";
+  previewReservedIp = "138.197.53.151";
 
   parseIdentity = ''
     set -eo pipefail
@@ -33,7 +40,7 @@ let
     fi
   '';
 
-  cleanup = "rm -f ${tfState} ${tfState}.backup ${tfVars}";
+  cleanup = "rm -f ${tfState} ${tfState}.backup ${tfVars} ${tfSecretVars}";
   cleanupWithPlan = "${cleanup} ${tfPlanFile}";
 
   preamble = ''
@@ -83,6 +90,9 @@ let
 
   decryptVars = ''
     rage -d -i "$identity" ${tfVars}.age > ${tfVars}
+    if [ -n "''${TF_VAR_do_token:-}" ]; then
+      printf 'do_token = "%s"\n' "$TF_VAR_do_token" > ${tfSecretVars}
+    fi
   '';
 
   encryptVars = ''
@@ -102,8 +112,50 @@ let
     ${encryptVars}
   '';
 
+  tfPreviewProvision = ''
+    ${preambleWithEncrypt}
+    ${decryptState}
+
+    import_if_needed() {
+      local addr="$1"
+      local id="$2"
+      local output
+
+      if output=$(terraform -chdir=infra import \
+        -var preview_enabled=true "$addr" "$id" 2>&1); then
+        echo "$output"
+        return 0
+      fi
+
+      if echo "$output" | grep -qiE \
+        'already managed by Terraform|Resource already managed|already exists in the state'; then
+        echo "Import skipped for $addr: already managed"
+        return 0
+      fi
+
+      echo "$output" >&2
+      return 1
+    }
+
+    terraform -chdir=infra init
+    import_if_needed '${previewVolumeAddr}' '${previewVolumeId}'
+    import_if_needed '${previewDropletAddr}' '${previewDropletId}'
+    import_if_needed '${previewReservedIpAddr}' '${previewReservedIp}'
+
+    if [ "''${RECREATE_PREVIEW_HOST:-false}" = "true" ]; then
+      terraform -chdir=infra plan \
+        -out=tfplan \
+        -var preview_enabled=true \
+        -replace='${previewDropletAddr}'
+    else
+      terraform -chdir=infra plan -out=tfplan -var preview_enabled=true
+    fi
+
+    terraform -chdir=infra apply tfplan
+  '';
+
 in {
-  inherit buildInputs parseIdentity resolveIp tfRekey;
+  inherit buildInputs parseIdentity resolveIp tfRekey tfPreviewProvision;
 
   tfInit = rainix.mkTask.${system} {
     name = "tf-init";
@@ -131,6 +183,16 @@ in {
       ${preambleWithEncrypt}
       ${decryptState}
       terraform -chdir=infra apply "$@" tfplan
+    '';
+  };
+
+  tfImport = rainix.mkTask.${system} {
+    name = "tf-import";
+    additionalBuildInputs = buildInputs;
+    body = ''
+      ${preambleWithEncrypt}
+      ${decryptState}
+      terraform -chdir=infra import "$@"
     '';
   };
 

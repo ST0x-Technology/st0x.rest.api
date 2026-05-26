@@ -15,6 +15,11 @@ on:
         options:
           - service
           - all
+      recreate_host:
+        description: "Recreate the preview droplet before deploy"
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-preview
@@ -74,14 +79,18 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
 
       - name: Provision preview infrastructure
+        env:
+          TF_VAR_do_token: ${{ secrets.DO_TOKEN }}
         run: |
-          nix run .#tfPlan -- -var preview_enabled=true
-          nix run .#tfApply
-          nix run .#tfRekey
+          if [ -z "$TF_VAR_do_token" ]; then
+            echo "DO_TOKEN secret is required for preview infrastructure deploys" >&2
+            exit 1
+          fi
+          RECREATE_PREVIEW_HOST="${{ inputs.recreate_host }}" nix run .#tfPreviewProvision
 
       - name: Commit encrypted Terraform state
         run: |
-          git add infra/terraform.tfstate.age infra/terraform.tfvars.age keys.nix
+          git add infra/terraform.tfstate.age keys.nix
           if git diff --cached --quiet; then
             echo "No encrypted infra changes to commit"
           else
