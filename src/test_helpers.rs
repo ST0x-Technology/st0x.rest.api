@@ -105,7 +105,7 @@ pub(crate) async fn mock_raindex_config() -> crate::raindex::RaindexProvider {
 }
 
 pub(crate) async fn mock_raindex_registry_url() -> String {
-    let settings = r#"version: 5
+    let settings = r#"version: 6
 networks:
   base:
     rpcs:
@@ -114,7 +114,7 @@ networks:
     currency: ETH
 subgraphs:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
-orderbooks:
+raindexes:
   base:
     address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
     network: base
@@ -137,7 +137,7 @@ pub(crate) async fn mock_raindex_registry_url_with_settings(settings: &str) -> S
 }
 
 pub(crate) fn mock_raindex_registry_artifact() -> String {
-    let settings = r#"version: 5
+    let settings = r#"version: 6
 networks:
   base:
     rpcs:
@@ -146,7 +146,7 @@ networks:
     currency: ETH
 subgraphs:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
-orderbooks:
+raindexes:
   base:
     address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
     network: base
@@ -278,8 +278,8 @@ pub(crate) fn basic_auth_header(key_id: &str, secret: &str) -> String {
 
 fn stub_raindex_client() -> serde_json::Value {
     json!({
-        "orderbook_yaml": {
-            "documents": ["version: 5\nnetworks:\n  base:\n    rpcs:\n      - https://mainnet.base.org\n    chain-id: 8453\n    currency: ETH\nsubgraphs:\n  base: https://example.com/sg\norderbooks:\n  base:\n    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7\n    network: base\n    subgraph: base\n    deployment-block: 0\ndeployers:\n  base:\n    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D\n    network: base\n"],
+        "raindex_yaml": {
+            "documents": ["version: 6\nnetworks:\n  base:\n    rpcs:\n      - https://mainnet.base.org\n    chain-id: 8453\n    currency: ETH\nsubgraphs:\n  base: https://example.com/sg\nraindexes:\n  base:\n    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7\n    network: base\n    subgraph: base\n    deployment-block: 0\ndeployers:\n  base:\n    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D\n    network: base\n"],
             "profile": "strict"
         }
     })
@@ -294,7 +294,7 @@ fn order_json() -> serde_json::Value {
         "orderBytes": "0x01",
         "orderHash": "0x000000000000000000000000000000000000000000000000000000000000abcd",
         "owner": "0x0000000000000000000000000000000000000001",
-        "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+        "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
         "active": true,
         "timestampAdded": "0x000000000000000000000000000000000000000000000000000000006553f100",
         "meta": null,
@@ -324,7 +324,7 @@ fn order_json() -> serde_json::Value {
                 "symbol": "USDC",
                 "decimals": 6
             },
-            "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+            "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
             "ordersAsInputs": [],
             "ordersAsOutputs": []
         }],
@@ -345,7 +345,7 @@ fn order_json() -> serde_json::Value {
                 "symbol": "WETH",
                 "decimals": 18
             },
-            "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+            "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
             "ordersAsInputs": [],
             "ordersAsOutputs": []
         }]
@@ -360,7 +360,7 @@ pub(crate) fn mock_candidate(max_output: &str, ratio: &str) -> TakeOrderCandidat
     let token_a = Address::from([4u8; 20]);
     let token_b = Address::from([5u8; 20]);
     TakeOrderCandidate {
-        orderbook: Address::from([0xAAu8; 20]),
+        raindex: Address::from([0xAAu8; 20]),
         order: OrderV4 {
             owner: Address::from([1u8; 20]),
             nonce: U256::from(1).into(),

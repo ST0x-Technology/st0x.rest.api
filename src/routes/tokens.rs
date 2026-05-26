@@ -133,7 +133,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_get_tokens_returns_multiple_tokens() {
-        let settings = r#"version: 5
+        let settings = r#"version: 6
 networks:
   base:
     rpcs:
@@ -142,7 +142,7 @@ networks:
     currency: ETH
 subgraphs:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
-orderbooks:
+raindexes:
   base:
     address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
     network: base
@@ -193,7 +193,7 @@ tokens:
     async fn test_get_tokens_clears_network_rpcs() {
         let private_rpc = "https://private-rpc.example.com/secret-token";
         let settings = format!(
-            r#"version: 5
+            r#"version: 6
 networks:
   base:
     rpcs:
@@ -202,7 +202,7 @@ networks:
     currency: ETH
 subgraphs:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
-orderbooks:
+raindexes:
   base:
     address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
     network: base
@@ -253,7 +253,7 @@ tokens:
 
     #[rocket::async_test]
     async fn test_get_tokens_adds_name_and_isin_from_remote_tokens() {
-        let settings = r#"version: 5
+        let settings = r#"version: 6
 networks:
   base:
     rpcs:
@@ -262,7 +262,7 @@ networks:
     currency: ETH
 subgraphs:
   base: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/0.9/gn
-orderbooks:
+raindexes:
   base:
     address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
     network: base

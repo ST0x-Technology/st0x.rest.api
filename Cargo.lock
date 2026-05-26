@@ -6582,13 +6582,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_app_settings"
+name = "raindex_app_settings"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
  "derive_builder 0.20.2",
  "futures",
- "rain_orderbook_bindings",
+ "raindex_bindings",
  "reqwest 0.12.20",
  "serde",
  "serde_json",
@@ -6600,7 +6600,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_bindings"
+name = "raindex_bindings"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
@@ -6613,7 +6613,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_common"
+name = "raindex_common"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
@@ -6639,10 +6639,10 @@ dependencies = [
  "rain-metaboard-subgraph",
  "rain-metadata 0.0.2-alpha.6",
  "rain-metadata-bindings",
- "rain_orderbook_app_settings",
- "rain_orderbook_bindings",
- "rain_orderbook_quote",
- "rain_orderbook_subgraph_client",
+ "raindex_app_settings",
+ "raindex_bindings",
+ "raindex_quote",
+ "raindex_subgraph_client",
  "rainlang-eval",
  "rainlang_bindings",
  "rainlang_dispair",
@@ -6668,7 +6668,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_js_api"
+name = "raindex_js_api"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
@@ -6682,11 +6682,11 @@ dependencies = [
  "rain-math-float",
  "rain-metaboard-subgraph",
  "rain-metadata 0.0.2-alpha.6",
- "rain_orderbook_app_settings",
- "rain_orderbook_bindings",
- "rain_orderbook_common",
- "rain_orderbook_quote",
- "rain_orderbook_subgraph_client",
+ "raindex_app_settings",
+ "raindex_bindings",
+ "raindex_common",
+ "raindex_quote",
+ "raindex_subgraph_client",
  "reqwest 0.12.20",
  "serde",
  "sha2 0.10.9",
@@ -6698,7 +6698,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_math"
+name = "raindex_math"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
@@ -6707,7 +6707,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_quote"
+name = "raindex_quote"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
@@ -6721,8 +6721,8 @@ dependencies = [
  "rain-error-decoding 0.1.0 (git+https://github.com/rainlanguage/rain.error?rev=3d2ed70fb2f7c6156706846e10f163d1e493a8d3)",
  "rain-math-float",
  "rain-metadata 0.0.2-alpha.6",
- "rain_orderbook_bindings",
- "rain_orderbook_subgraph_client",
+ "raindex_bindings",
+ "raindex_subgraph_client",
  "rainlang-eval",
  "reqwest 0.12.20",
  "serde",
@@ -6736,7 +6736,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rain_orderbook_subgraph_client"
+name = "raindex_subgraph_client"
 version = "0.0.0-alpha.0"
 dependencies = [
  "alloy",
@@ -6747,8 +6747,8 @@ dependencies = [
  "futures",
  "once_cell",
  "rain-math-float",
- "rain_orderbook_bindings",
- "rain_orderbook_math",
+ "raindex_bindings",
+ "raindex_math",
  "reqwest 0.12.20",
  "serde",
  "serde_json",
@@ -8958,10 +8958,10 @@ dependencies = [
  "futures",
  "moka",
  "rain-math-float",
- "rain_orderbook_app_settings",
- "rain_orderbook_bindings",
- "rain_orderbook_common",
- "rain_orderbook_js_api",
+ "raindex_app_settings",
+ "raindex_bindings",
+ "raindex_common",
+ "raindex_js_api",
  "rand 0.9.1",
  "reqwest 0.13.2",
  "rocket",

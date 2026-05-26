@@ -116,8 +116,8 @@ pub(crate) mod test_fixtures {
 
     pub fn stub_raindex_client() -> serde_json::Value {
         json!({
-            "orderbook_yaml": {
-                "documents": ["version: 5\nnetworks:\n  base:\n    rpcs:\n      - https://mainnet.base.org\n    chain-id: 8453\n    currency: ETH\nsubgraphs:\n  base: https://example.com/sg\norderbooks:\n  base:\n    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7\n    network: base\n    subgraph: base\n    deployment-block: 0\ndeployers:\n  base:\n    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D\n    network: base\n"],
+            "raindex_yaml": {
+                "documents": ["version: 6\nnetworks:\n  base:\n    rpcs:\n      - https://mainnet.base.org\n    chain-id: 8453\n    currency: ETH\nsubgraphs:\n  base: https://example.com/sg\nraindexes:\n  base:\n    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7\n    network: base\n    subgraph: base\n    deployment-block: 0\ndeployers:\n  base:\n    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D\n    network: base\n"],
                 "profile": "strict"
             }
         })
@@ -132,7 +132,7 @@ pub(crate) mod test_fixtures {
             "orderBytes": "0x01",
             "orderHash": "0x000000000000000000000000000000000000000000000000000000000000abcd",
             "owner": "0x0000000000000000000000000000000000000001",
-            "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+            "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
             "active": true,
             "timestampAdded": "0x000000000000000000000000000000000000000000000000000000006553f100",
             "meta": null,
@@ -162,7 +162,7 @@ pub(crate) mod test_fixtures {
                     "symbol": "USDC",
                     "decimals": 6
                 },
-                "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
                 "ordersAsInputs": [],
                 "ordersAsOutputs": []
             }],
@@ -183,7 +183,7 @@ pub(crate) mod test_fixtures {
                     "symbol": "WETH",
                     "decimals": 18
                 },
-                "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
                 "ordersAsInputs": [],
                 "ordersAsOutputs": []
             }]
@@ -228,7 +228,7 @@ pub(crate) mod test_fixtures {
                     "blockNumber": "0x0000000000000000000000000000000000000000000000000000000000000064",
                     "timestamp": "0x000000000000000000000000000000000000000000000000000000006553f4e8"
                 },
-                "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
+                "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
             },
             "outputVaultBalanceChange": {
                 "type": "takeOrder",
@@ -254,10 +254,10 @@ pub(crate) mod test_fixtures {
                     "blockNumber": "0x0000000000000000000000000000000000000000000000000000000000000064",
                     "timestamp": "0x000000000000000000000000000000000000000000000000000000006553f4e8"
                 },
-                "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
+                "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
             },
             "timestamp": "0x000000000000000000000000000000000000000000000000000000006553f4e8",
-            "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
+            "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7"
         })
     }
 
@@ -310,7 +310,7 @@ pub(crate) mod test_fixtures {
                     "symbol": token_symbol,
                     "decimals": decimals
                 },
-                "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+                "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
                 "ordersAsInputs": [],
                 "ordersAsOutputs": []
             })
@@ -340,7 +340,7 @@ pub(crate) mod test_fixtures {
             "orderBytes": "0x01",
             "orderHash": "0x000000000000000000000000000000000000000000000000000000000000beef",
             "owner": "0x0000000000000000000000000000000000000001",
-            "orderbook": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
+            "raindex": "0xd2938e7c9fe3597f78832ce780feb61945c377d7",
             "active": true,
             "timestampAdded": "0x000000000000000000000000000000000000000000000000000000006553f100",
             "meta": null,

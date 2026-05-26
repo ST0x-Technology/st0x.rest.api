@@ -7,7 +7,7 @@ use crate::types::health::{
     NetworkSyncInfo, OrderbookSyncInfo, RaindexSyncStatus, RaindexSyncStatusKind,
 };
 use rain_orderbook_common::raindex_client::local_db::{
-    LocalDbSyncSnapshot, NetworkSyncStatusSnapshot, OrderbookSyncStatusSnapshot,
+    LocalDbSyncSnapshot, NetworkSyncStatusSnapshot, RaindexSyncStatusSnapshot,
 };
 use rocket::serde::json::Json;
 use rocket::{Route, State};
@@ -126,9 +126,9 @@ fn map_raindex_snapshot(snapshot: LocalDbSyncSnapshot) -> RaindexSyncStatus {
             .map(map_network_snapshot)
             .collect(),
         orderbooks: snapshot
-            .orderbooks
+            .raindexes
             .into_iter()
-            .map(map_orderbook_snapshot)
+            .map(map_raindex_status_snapshot)
             .collect(),
     }
 }
@@ -138,17 +138,17 @@ fn map_network_snapshot(snapshot: NetworkSyncStatusSnapshot) -> NetworkSyncInfo 
         chain_id: snapshot.chain_id,
         network_key: snapshot.network_key,
         status: snapshot.status.into(),
-        orderbook_count: snapshot.orderbook_count,
+        orderbook_count: snapshot.raindex_count,
         ready: snapshot.ready,
         error: snapshot.error.map(|_| "network sync failed".to_string()),
     }
 }
 
-fn map_orderbook_snapshot(snapshot: OrderbookSyncStatusSnapshot) -> OrderbookSyncInfo {
+fn map_raindex_status_snapshot(snapshot: RaindexSyncStatusSnapshot) -> OrderbookSyncInfo {
     OrderbookSyncInfo {
-        chain_id: snapshot.ob_id.chain_id,
-        orderbook_address: format!("{:#x}", snapshot.ob_id.orderbook_address),
-        orderbook_key: snapshot.orderbook_key,
+        chain_id: snapshot.raindex_id.chain_id,
+        orderbook_address: format!("{:#x}", snapshot.raindex_id.raindex_address),
+        orderbook_key: snapshot.raindex_key,
         network_key: snapshot.network_key,
         status: snapshot.status.into(),
         ready: snapshot.ready,
@@ -171,13 +171,13 @@ fn log_raindex_snapshot_errors(snapshot: &LocalDbSyncSnapshot) {
         }
     }
 
-    for orderbook in &snapshot.orderbooks {
-        if let Some(error) = &orderbook.error {
+    for raindex in &snapshot.raindexes {
+        if let Some(error) = &raindex.error {
             tracing::warn!(
-                chain_id = orderbook.ob_id.chain_id,
-                orderbook_address = %format!("{:#x}", orderbook.ob_id.orderbook_address),
-                orderbook_key = orderbook.orderbook_key.as_deref(),
-                network_key = orderbook.network_key.as_deref(),
+                chain_id = raindex.raindex_id.chain_id,
+                orderbook_address = %format!("{:#x}", raindex.raindex_id.raindex_address),
+                orderbook_key = raindex.raindex_key.as_deref(),
+                network_key = raindex.network_key.as_deref(),
                 error = %error,
                 "raindex orderbook sync failed"
             );
@@ -215,7 +215,7 @@ pub fn routes() -> Vec<Route> {
 mod tests {
     use super::*;
     use alloy::primitives::address;
-    use rain_orderbook_common::local_db::OrderbookIdentifier;
+    use rain_orderbook_common::local_db::RaindexIdentifier;
     use rain_orderbook_common::raindex_client::local_db::{LocalDbStatus, SchedulerState};
 
     #[test]
@@ -278,20 +278,20 @@ mod tests {
     #[test]
     fn map_raindex_snapshot_preserves_network_and_orderbook_status() {
         let orderbook_id =
-            OrderbookIdentifier::new(8453, address!("d2938e7c9fe3597f78832ce780feb61945c377d7"));
+            RaindexIdentifier::new(8453, address!("d2938e7c9fe3597f78832ce780feb61945c377d7"));
         let snapshot = LocalDbSyncSnapshot::from_parts(
             vec![NetworkSyncStatusSnapshot {
                 chain_id: 8453,
                 network_key: Some("base".to_string()),
                 status: LocalDbStatus::Active,
                 scheduler_state: SchedulerState::Leader,
-                orderbook_count: 1,
+                raindex_count: 1,
                 ready: true,
                 error: None,
             }],
-            vec![OrderbookSyncStatusSnapshot {
-                ob_id: orderbook_id,
-                orderbook_key: Some("base-orderbook".to_string()),
+            vec![RaindexSyncStatusSnapshot {
+                raindex_id: orderbook_id,
+                raindex_key: Some("base-orderbook".to_string()),
                 network_key: Some("base".to_string()),
                 status: LocalDbStatus::Active,
                 scheduler_state: SchedulerState::Leader,
@@ -325,20 +325,20 @@ mod tests {
     #[test]
     fn map_raindex_snapshot_sanitizes_sync_errors() {
         let orderbook_id =
-            OrderbookIdentifier::new(8453, address!("d2938e7c9fe3597f78832ce780feb61945c377d7"));
+            RaindexIdentifier::new(8453, address!("d2938e7c9fe3597f78832ce780feb61945c377d7"));
         let snapshot = LocalDbSyncSnapshot::from_parts(
             vec![NetworkSyncStatusSnapshot {
                 chain_id: 8453,
                 network_key: Some("base".to_string()),
                 status: LocalDbStatus::Failure,
                 scheduler_state: SchedulerState::Leader,
-                orderbook_count: 1,
+                raindex_count: 1,
                 ready: false,
                 error: Some("sqlite: no such table sync_status".to_string()),
             }],
-            vec![OrderbookSyncStatusSnapshot {
-                ob_id: orderbook_id,
-                orderbook_key: Some("base-orderbook".to_string()),
+            vec![RaindexSyncStatusSnapshot {
+                raindex_id: orderbook_id,
+                raindex_key: Some("base-orderbook".to_string()),
                 network_key: Some("base".to_string()),
                 status: LocalDbStatus::Failure,
                 scheduler_state: SchedulerState::Leader,

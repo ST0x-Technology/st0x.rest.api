@@ -61,7 +61,7 @@ async fn process_cancel_order(
     let calldata = ds.get_remove_calldata(&order).await?;
 
     let tx = CancelTransaction {
-        to: order.orderbook(),
+        to: order.raindex(),
         data: calldata,
         value: U256::ZERO,
     };

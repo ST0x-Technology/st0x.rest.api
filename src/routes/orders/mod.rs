@@ -247,7 +247,7 @@ pub(crate) fn build_order_summary(
         output_vault_balance: output.formatted_balance(),
         io_ratio: io_ratio.to_string(),
         created_at,
-        orderbook_id: order.orderbook(),
+        orderbook_id: order.raindex(),
     })
 }
 

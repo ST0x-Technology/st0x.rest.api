@@ -14,7 +14,7 @@ async fn shared_client_contract(
 
     provider
         .client()
-        .get_orderbook_client(orderbook_address)
+        .get_raindex_subgraph_client(orderbook_address)
         .map(|_| "ok")
         .map_err(|e| ApiError::Internal(format!("{e}")))
 }

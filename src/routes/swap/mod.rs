@@ -155,7 +155,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 ApiError::Internal("failed to format expected sell".into())
             })?;
             Ok(SwapCalldataResponse {
-                to: take_orders_info.orderbook(),
+                to: take_orders_info.raindex(),
                 data: take_orders_info.calldata().clone(),
                 value: alloy::primitives::U256::ZERO,
                 estimated_input: expected_sell,
