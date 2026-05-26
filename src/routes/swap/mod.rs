@@ -90,6 +90,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 inputs: Some(vec![input_token]),
                 outputs: Some(vec![output_token]),
             }),
+            has_positive_output_vault_balance: Some(true),
             ..Default::default()
         };
         self.client
