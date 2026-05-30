@@ -1,5 +1,7 @@
 log_dir = "/mnt/data/st0x-rest-api/logs"
 database_url = "sqlite:///mnt/data/st0x-rest-api/st0x.db"
+database_max_connections = 20
+usage_log_max_concurrency = 2
 registry_url = "https://raw.githubusercontent.com/rainlanguage/rain.strategies/5d0a11ad4a3e89531c922317b09216200ea7bdc0/registry"
 private_registry_path = "/mnt/data/st0x-rest-api/private-registry.data"
 rate_limit_global_rpm = 600

@@ -125,6 +125,7 @@ pub(crate) fn rocket(
     raindex_config: raindex::SharedRaindexProvider,
     registry_artifact_store: registry_artifact::RegistryArtifactStore,
     docs_dir: String,
+    usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
     let cors = configure_cors()?;
 
@@ -152,7 +153,7 @@ pub(crate) fn rocket(
         )
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
-        .attach(fairings::UsageLogger)
+        .attach(fairings::UsageLogger::new(usage_log_max_concurrency))
         .attach(fairings::RateLimitHeadersFairing)
         .attach(cors))
 }
@@ -189,7 +190,7 @@ async fn main() {
         }
     };
 
-    let pool = match db::init(&cfg.database_url).await {
+    let pool = match db::init(&cfg.database_url, cfg.database_max_connections).await {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize database");
@@ -201,6 +202,8 @@ async fn main() {
     tracing::info!(
         global_rpm = cfg.rate_limit_global_rpm,
         per_key_rpm = cfg.rate_limit_per_key_rpm,
+        database_max_connections = cfg.database_max_connections,
+        usage_log_max_concurrency = cfg.usage_log_max_concurrency,
         "rate limiter configured"
     );
 
@@ -336,6 +339,7 @@ async fn main() {
                 shared_raindex,
                 registry_artifact_store,
                 cfg.docs_dir,
+                cfg.usage_log_max_concurrency,
             ) {
                 Ok(r) => r,
                 Err(e) => {

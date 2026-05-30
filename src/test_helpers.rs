@@ -55,7 +55,9 @@ impl TestClientBuilder {
         let database_url = self
             .database_url
             .unwrap_or_else(|| format!("sqlite:file:{id}?mode=memory&cache=shared"));
-        let pool = crate::db::init(&database_url).await.expect("database init");
+        let pool = crate::db::init(&database_url, 5)
+            .await
+            .expect("database init");
 
         let private_registry_path = self.private_registry_path.unwrap_or_else(|| {
             std::env::temp_dir().join(format!(
@@ -90,6 +92,7 @@ impl TestClientBuilder {
             shared_raindex,
             artifact_store,
             docs_dir,
+            2,
         )
         .expect("valid rocket instance");
 

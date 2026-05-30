@@ -194,7 +194,7 @@ mod tests {
 
     async fn test_pool() -> DbPool {
         let id = uuid::Uuid::new_v4();
-        crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"))
+        crate::db::init(&format!("sqlite:file:{id}?mode=memory&cache=shared"), 5)
             .await
             .expect("test database init")
     }

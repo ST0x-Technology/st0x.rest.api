@@ -4,8 +4,8 @@ pub(crate) mod registry_history;
 
 pub type DbPool = sqlx::Pool<sqlx::Sqlite>;
 
-pub async fn init(database_url: &str) -> Result<DbPool, sqlx::Error> {
-    let pool = pool::create(database_url).await?;
+pub async fn init(database_url: &str, max_connections: u32) -> Result<DbPool, sqlx::Error> {
+    let pool = pool::create(database_url, max_connections).await?;
     migrate::run(&pool).await?;
     Ok(pool)
 }

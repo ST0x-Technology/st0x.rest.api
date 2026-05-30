@@ -2,11 +2,23 @@ use crate::auth::AuthKeyId;
 use crate::db::DbPool;
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::{Data, Request, Response};
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 
 struct UsageStart(Instant);
 
-pub struct UsageLogger;
+pub struct UsageLogger {
+    semaphore: Arc<Semaphore>,
+}
+
+impl UsageLogger {
+    pub fn new(max_concurrency: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+        }
+    }
+}
 
 #[rocket::async_trait]
 impl Fairing for UsageLogger {
@@ -37,8 +49,22 @@ impl Fairing for UsageLogger {
         let method = req.method().as_str().to_owned();
         let path = req.uri().path().to_string();
         let status_code = res.status().code as i32;
+        let permit = match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    api_key_id,
+                    method,
+                    path,
+                    status_code,
+                    "dropping usage log because usage logger is saturated"
+                );
+                return;
+            }
+        };
 
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = sqlx::query(
                 "INSERT INTO usage_logs (api_key_id, method, path, status_code, latency_ms) \
                  VALUES (?, ?, ?, ?, ?)",

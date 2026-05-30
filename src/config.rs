@@ -5,6 +5,8 @@ use std::path::Path;
 pub struct Config {
     pub log_dir: String,
     pub database_url: String,
+    pub database_max_connections: u32,
+    pub usage_log_max_concurrency: usize,
     pub registry_url: String,
     pub private_registry_path: String,
     pub rate_limit_global_rpm: u64,
