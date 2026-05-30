@@ -2,6 +2,7 @@ use super::{
     build_orders_list_response, OrdersListDataSource, RaindexOrdersListDataSource,
     DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -89,6 +90,7 @@ pub async fn get_orders_by_token(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersByTokenParams,
@@ -99,15 +101,53 @@ pub async fn get_orders_by_token(
         let side = params.side;
         let page = params.page;
         let page_size = params.page_size;
-        let raindex = shared_raindex.read().await;
-        let ds = RaindexOrdersListDataSource {
-            client: raindex.client(),
-        };
-        let response = process_get_orders_by_token(&ds, addr, side, page, page_size).await?;
+        if !app_state.response_caches.is_enabled() {
+            let raindex = shared_raindex.read().await;
+            let ds = RaindexOrdersListDataSource {
+                client: raindex.client(),
+            };
+            let response = process_get_orders_by_token(&ds, addr, side, page, page_size).await?;
+            return Ok(Json(response));
+        }
+
+        let cache_key = orders_by_token_cache_key(addr, side.as_ref(), page, page_size);
+        let response = app_state
+            .response_caches
+            .orders_by_token
+            .get_or_try_insert(cache_key, || async move {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexOrdersListDataSource {
+                    client: raindex.client(),
+                };
+                process_get_orders_by_token(&ds, addr, side, page, page_size).await
+            })
+            .await
+            .map_err(|e| (*e).clone())?;
         Ok(Json(response))
     }
     .instrument(span.0)
     .await
+}
+
+fn orders_by_token_cache_key(
+    address: Address,
+    side: Option<&OrderSide>,
+    page: Option<u16>,
+    page_size: Option<u16>,
+) -> String {
+    let side = match side {
+        Some(OrderSide::Input) => "input",
+        Some(OrderSide::Output) => "output",
+        None => "all",
+    };
+    let page = page.unwrap_or(1);
+    let page_size = page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE as u16)
+        .min(MAX_PAGE_SIZE);
+    format!(
+        "orders/token/{}/{side}/{page}/{page_size}",
+        address.to_string().to_ascii_lowercase()
+    )
 }
 
 #[cfg(test)]
@@ -237,6 +277,21 @@ mod tests {
         let p = build_pagination(101, 1, 100);
         assert_eq!(p.total_pages, 2);
         assert!(p.has_more);
+    }
+
+    #[test]
+    fn test_orders_by_token_cache_key_normalizes_defaults_and_address_case() {
+        let lower: Address = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+            .parse()
+            .unwrap();
+        let mixed: Address = "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            orders_by_token_cache_key(lower, None, None, None),
+            orders_by_token_cache_key(mixed, None, Some(1), Some(DEFAULT_PAGE_SIZE as u16))
+        );
     }
 
     #[rocket::async_test]

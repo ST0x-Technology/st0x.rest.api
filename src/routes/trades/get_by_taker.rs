@@ -1,6 +1,7 @@
 use super::{
     build_trades_list_response, trades_pagination_params, RaindexTradesDataSource, TradesDataSource,
 };
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -34,18 +35,40 @@ pub async fn get_trades_by_taker(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
-        let client = {
-            let raindex = shared_raindex.read().await;
-            raindex.client().clone()
-        };
-        let ds = RaindexTradesDataSource { client: &client };
-        process_get_trades_by_taker(&ds, address.0, params).await
+        let addr = address.0;
+        if !app_state.response_caches.is_enabled() {
+            let client = {
+                let raindex = shared_raindex.read().await;
+                raindex.client().clone()
+            };
+            let ds = RaindexTradesDataSource { client: &client };
+            return process_get_trades_by_taker(&ds, addr, params).await;
+        }
+
+        let cache_key = super::get_by_token::trades_cache_key("trades/taker", addr, &params);
+        let response = app_state
+            .response_caches
+            .trades_by_taker
+            .get_or_try_insert(cache_key, || async move {
+                let client = {
+                    let raindex = shared_raindex.read().await;
+                    raindex.client().clone()
+                };
+                let ds = RaindexTradesDataSource { client: &client };
+                process_get_trades_by_taker(&ds, addr, params)
+                    .await
+                    .map(Json::into_inner)
+            })
+            .await
+            .map_err(|e| (*e).clone())?;
+        Ok(Json(response))
     }
     .instrument(span.0)
     .await

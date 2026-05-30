@@ -1,9 +1,10 @@
+use crate::app_state::ApplicationState;
 use crate::auth::AdminKey;
 use crate::db::{registry_history, DbPool};
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::{RaindexProvider, SharedRaindexProvider};
-use crate::registry_artifact::{artifact_sha256, RegistryArtifactStore};
+use crate::registry_artifact::artifact_sha256;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
@@ -36,7 +37,7 @@ pub async fn put_registry(
     _global: GlobalRateLimit,
     admin: AdminKey,
     shared_raindex: &State<SharedRaindexProvider>,
-    artifact_store: &State<RegistryArtifactStore>,
+    app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
     span: TracingSpan,
     request: Json<UploadRegistryArtifactRequest>,
@@ -86,6 +87,7 @@ pub async fn put_registry(
             }
         };
 
+        let artifact_store = &app_state.registry_artifact_store;
         let _update_guard = artifact_store.lock_update().await;
 
         let previous_artifact = artifact_store.load().await.map_err(|e| {
@@ -127,6 +129,7 @@ pub async fn put_registry(
         let mut guard = shared_raindex.write().await;
         *guard = new_provider;
         drop(guard);
+        app_state.response_caches.invalidate_all();
 
         tracing::info!(
             source_commit = %req.source_commit,

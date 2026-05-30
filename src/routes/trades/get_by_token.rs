@@ -1,6 +1,7 @@
 use super::{
     build_trades_list_response, trades_pagination_params, RaindexTradesDataSource, TradesDataSource,
 };
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -34,20 +35,62 @@ pub async fn get_trades_by_token(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
-        let raindex = shared_raindex.read().await;
-        let ds = RaindexTradesDataSource {
-            client: raindex.client(),
-        };
-        process_get_trades_by_token(&ds, address.0, params).await
+        let addr = address.0;
+        if !app_state.response_caches.is_enabled() {
+            let raindex = shared_raindex.read().await;
+            let ds = RaindexTradesDataSource {
+                client: raindex.client(),
+            };
+            return process_get_trades_by_token(&ds, addr, params).await;
+        }
+
+        let cache_key = trades_cache_key("trades/token", addr, &params);
+        let response = app_state
+            .response_caches
+            .trades_by_token
+            .get_or_try_insert(cache_key, || async move {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexTradesDataSource {
+                    client: raindex.client(),
+                };
+                process_get_trades_by_token(&ds, addr, params)
+                    .await
+                    .map(Json::into_inner)
+            })
+            .await
+            .map_err(|e| (*e).clone())?;
+        Ok(Json(response))
     }
     .instrument(span.0)
     .await
+}
+
+pub(super) fn trades_cache_key(
+    route: &str,
+    address: Address,
+    params: &TradesPaginationParams,
+) -> String {
+    format!(
+        "{route}/{}/{}/{}/{}/{}",
+        address.to_string().to_ascii_lowercase(),
+        params.page.unwrap_or(1),
+        params.page_size.unwrap_or(20),
+        params
+            .start_time
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        params
+            .end_time
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    )
 }
 
 pub(super) async fn process_get_trades_by_token(
@@ -168,6 +211,31 @@ mod tests {
         assert_eq!(t.output_amount, "-0.250000000000000000");
         assert_eq!(t.input_token.symbol, "USDC");
         assert_eq!(t.output_token.symbol, "WETH");
+    }
+
+    #[test]
+    fn test_trades_cache_key_normalizes_defaults_and_address_case() {
+        let lower = address!("31c2c14134e6e3b7ef9478297f199331133fc2d8");
+        let mixed: Address = "0x31C2C14134e6E3B7ef9478297F199331133Fc2d8"
+            .parse()
+            .unwrap();
+        let default_params = TradesPaginationParams {
+            page: None,
+            page_size: None,
+            start_time: None,
+            end_time: None,
+        };
+        let explicit_params = TradesPaginationParams {
+            page: Some(1),
+            page_size: Some(20),
+            start_time: None,
+            end_time: None,
+        };
+
+        assert_eq!(
+            trades_cache_key("trades/token", lower, &default_params),
+            trades_cache_key("trades/token", mixed, &explicit_params)
+        );
     }
 
     #[rocket::async_test]

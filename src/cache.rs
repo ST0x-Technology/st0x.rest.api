@@ -3,7 +3,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) struct AppCache<K, V>(Cache<K, V>)
+use crate::types::orders::OrdersListResponse;
+use crate::types::trades::TradesByAddressResponse;
+
+pub(crate) struct AppCache<K, V>(pub(crate) Cache<K, V>)
 where
     K: std::hash::Hash + Eq + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static;
@@ -41,6 +44,50 @@ where
 
     pub(crate) fn invalidate_all(&self) {
         self.0.invalidate_all()
+    }
+}
+
+pub(crate) struct RouteResponseCaches {
+    enabled: bool,
+    pub orders_by_token: AppCache<String, OrdersListResponse>,
+    pub trades_by_token: AppCache<String, TradesByAddressResponse>,
+    pub trades_by_taker: AppCache<String, TradesByAddressResponse>,
+    group: CacheGroup,
+}
+
+impl RouteResponseCaches {
+    pub(crate) fn new(max_capacity: u64, ttl: Duration) -> Self {
+        let enabled = max_capacity > 0 && !ttl.is_zero();
+        let max_capacity = max_capacity.max(1);
+        let ttl = if ttl.is_zero() {
+            Duration::from_nanos(1)
+        } else {
+            ttl
+        };
+        let orders_by_token = AppCache::new(max_capacity, ttl);
+        let trades_by_token = AppCache::new(max_capacity, ttl);
+        let trades_by_taker = AppCache::new(max_capacity, ttl);
+
+        let mut group = CacheGroup::new();
+        group.register(&orders_by_token);
+        group.register(&trades_by_token);
+        group.register(&trades_by_taker);
+
+        Self {
+            enabled,
+            orders_by_token,
+            trades_by_token,
+            trades_by_taker,
+            group,
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        self.group.invalidate_all();
     }
 }
 

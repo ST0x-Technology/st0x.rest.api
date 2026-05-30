@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate rocket;
 
+mod app_state;
 mod auth;
 mod cache;
 mod catchers;
@@ -123,7 +124,7 @@ pub(crate) fn rocket(
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
-    registry_artifact_store: registry_artifact::RegistryArtifactStore,
+    app_state: app_state::ApplicationState,
     docs_dir: String,
     usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
@@ -137,7 +138,7 @@ pub(crate) fn rocket(
         .manage(pool)
         .manage(rate_limiter)
         .manage(raindex_config)
-        .manage(registry_artifact_store)
+        .manage(app_state)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -204,6 +205,8 @@ async fn main() {
         per_key_rpm = cfg.rate_limit_per_key_rpm,
         database_max_connections = cfg.database_max_connections,
         usage_log_max_concurrency = cfg.usage_log_max_concurrency,
+        response_cache_max_entries = cfg.response_cache_max_entries,
+        response_cache_ttl_seconds = cfg.response_cache_ttl_seconds,
         "rate limiter configured"
     );
 
@@ -211,6 +214,10 @@ async fn main() {
         cli::Command::Serve { .. } => {
             let registry_artifact_store = registry_artifact::RegistryArtifactStore::new(
                 std::path::PathBuf::from(&cfg.private_registry_path),
+            );
+            let response_caches = cache::RouteResponseCaches::new(
+                cfg.response_cache_max_entries,
+                std::time::Duration::from_secs(cfg.response_cache_ttl_seconds),
             );
 
             let private_registry_artifact = match registry_artifact_store.load().await {
@@ -333,11 +340,14 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
+            let app_state =
+                app_state::ApplicationState::new(registry_artifact_store, response_caches);
+
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
-                registry_artifact_store,
+                app_state,
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
             ) {

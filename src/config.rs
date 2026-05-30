@@ -7,6 +7,8 @@ pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
     pub usage_log_max_concurrency: usize,
+    pub response_cache_max_entries: u64,
+    pub response_cache_ttl_seconds: u64,
     pub registry_url: String,
     pub private_registry_path: String,
     pub rate_limit_global_rpm: u64,
