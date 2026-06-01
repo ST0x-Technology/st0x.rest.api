@@ -7,8 +7,8 @@ export COMMIT_SHA=$(git rev-parse HEAD)
 echo "Initializing all submodules..."
 git submodule update --init --recursive
 
-echo "Running orderbook prep-base..."
-(cd lib/rain.orderbook && ./prep-base.sh)
+echo "Preparing orderbook Solidity artifacts..."
+nix run .#prepSolArtifacts
 
 echo "Building docs..."
 nix build .#st0x-docs
