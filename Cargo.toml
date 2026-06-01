@@ -12,7 +12,7 @@ thiserror = "2"
 utoipa = { version = "5", features = ["rocket_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["rocket"] }
 tokio = { version = "1", features = ["full"] }
-alloy = { version = "=1.0.12", default-features = false, features = ["std", "serde"] }
+alloy = { version = "=1.8.3", default-features = false, features = ["std", "serde"] }
 async-trait = "0.1"
 futures = "0.3"
 tracing = "0.1"
@@ -32,8 +32,8 @@ rain_orderbook_js_api = { package = "raindex_js_api", path = "lib/rain.orderbook
 rain_orderbook_common = { package = "raindex_common", path = "lib/rain.orderbook/crates/common", default-features = false }
 rain_orderbook_app_settings = { package = "raindex_app_settings", path = "lib/rain.orderbook/crates/settings", default-features = false }
 rain_orderbook_bindings = { package = "raindex_bindings", path = "lib/rain.orderbook/crates/bindings", default-features = false }
-rain-math-float = { path = "lib/rain.orderbook/lib/rain.interpreter/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
-wasm-bindgen = "=0.2.100"
+rain-math-float = "0.1.7"
+wasm-bindgen = "=0.2.122"
 
 [dev-dependencies]
 tracing-test = "0.2"

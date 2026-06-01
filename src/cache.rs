@@ -25,10 +25,12 @@ where
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn get(&self, key: &K) -> Option<V> {
         self.0.get(key).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn insert(&self, key: K, value: V) {
         self.0.insert(key, value).await
     }
@@ -42,6 +44,7 @@ where
         self.0.try_get_with(key, async move { fetch().await }).await
     }
 
+    #[cfg(test)]
     pub(crate) fn invalidate_all(&self) {
         self.0.invalidate_all()
     }

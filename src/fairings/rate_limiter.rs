@@ -119,7 +119,7 @@ impl RateLimiter {
         let cutoff = now - WINDOW_DURATION;
         let check_count = self.per_key_check_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if check_count % PER_KEY_CLEANUP_EVERY == 0 {
+        if check_count.is_multiple_of(PER_KEY_CLEANUP_EVERY) {
             windows.retain(|_, window| {
                 Self::prune_window(window, cutoff);
                 !window.is_empty()

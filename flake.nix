@@ -109,8 +109,7 @@
             body = ''
               set -euxo pipefail
 
-              (cd lib/rain.orderbook/ && forge build)
-              (cd lib/rain.orderbook/lib/rain.raindex.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
+              (cd lib/rain.orderbook/ && forge soldeer install && forge build)
             '';
           };
 
