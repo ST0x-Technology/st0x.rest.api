@@ -2,24 +2,6 @@ name: Deploy Preview
 
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch to deploy to preview"
-        required: true
-        default: "main"
-      deploy_scope:
-        description: "Deploy scope"
-        required: true
-        type: choice
-        default: "service"
-        options:
-          - service
-          - all
-      recreate_host:
-        description: "Recreate the preview droplet before deploy"
-        required: true
-        type: boolean
-        default: false
 
 concurrency:
   group: deploy-preview
@@ -36,22 +18,16 @@ jobs:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref || github.ref }}
           submodules: recursive
           fetch-depth: 0
 
-      - name: Verify deploy branch
+      - name: Resolve deploy branch
         run: |
-          deploy_branch="${{ inputs.ref }}"
-          deploy_branch="${deploy_branch#refs/heads/}"
-          if [ -z "$deploy_branch" ] || [[ "$deploy_branch" == refs/* ]]; then
-            echo "Deploy Preview requires a branch ref, got '${{ inputs.ref }}'" >&2
-            exit 1
-          fi
+          deploy_branch="${GITHUB_REF_NAME}"
           if ! git ls-remote --exit-code --heads origin "$deploy_branch" >/dev/null; then
-            echo "Deploy Preview requires an existing remote branch, got '${{ inputs.ref }}'" >&2
+            echo "Deploy Preview requires an existing remote branch, got '${GITHUB_REF_NAME}'" >&2
             exit 1
           fi
           git fetch origin "refs/heads/$deploy_branch:refs/remotes/origin/$deploy_branch"
@@ -68,6 +44,7 @@ jobs:
           extra-conf: |
             accept-flake-config = true
             fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
             sandbox = false
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
@@ -86,7 +63,7 @@ jobs:
             echo "DO_TOKEN secret is required for preview infrastructure deploys" >&2
             exit 1
           fi
-          RECREATE_PREVIEW_HOST="${{ inputs.recreate_host }}" nix run .#tfPreviewProvision
+          nix run .#tfPreviewProvision
 
       - name: Commit encrypted Terraform state
         run: |
@@ -126,12 +103,6 @@ jobs:
       # Prepare local build artifacts used by deploy-rs.
       - run: ./prep.sh
 
-      - name: Deploy preview service
-        if: (inputs.deploy_scope || 'all') == 'service'
-        timeout-minutes: 30
-        run: nix run .#deployPreviewService
-
       - name: Deploy preview system and service
-        if: (inputs.deploy_scope || 'all') == 'all'
         timeout-minutes: 60
         run: nix run .#deployPreviewAll
