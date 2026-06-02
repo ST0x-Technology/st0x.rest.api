@@ -61,10 +61,7 @@ in {
 
       profiles = {
         system.path = activate.nixos self.nixosConfigurations.st0x-rest-api-preview;
-      } // mkProfiles {
-        resetState = true;
-        dataDir = "/mnt/data/st0x-rest-api-preview";
-      };
+      } // mkProfiles { };
     };
   };
 
