@@ -25,6 +25,7 @@ use clap::Parser;
 use rocket::fs::{FileServer, Options};
 use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
@@ -49,6 +50,26 @@ enum StartupError {
     InvalidMethod(String),
     #[error("CORS configuration failed: {0}")]
     Cors(#[from] rocket_cors::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StartupRegistryError {
+    #[error("failed to read private registry artifact")]
+    PrivateArtifactRead(#[source] registry_artifact::RegistryArtifactStoreError),
+    #[error("failed to query private registry history")]
+    PrivateRegistryHistory(#[source] sqlx::Error),
+    #[error("configured registry_url is empty")]
+    MissingConfiguredRegistry,
+    #[error("private registry artifact does not match latest successful history")]
+    PrivateRegistryMismatch,
+    #[error("private registry artifact exists but no successful history row was found")]
+    PrivateArtifactWithoutHistory,
+    #[error("private registry history exists but artifact file is missing")]
+    HistoryWithoutPrivateArtifact,
+    #[error("failed to load private registry")]
+    PrivateRegistryLoad(#[source] raindex::RaindexProviderError),
+    #[error("failed to load configured registry")]
+    ConfiguredRegistryLoad(#[source] raindex::RaindexProviderError),
 }
 
 #[derive(OpenApi)]
@@ -159,6 +180,110 @@ pub(crate) fn rocket(
         .attach(cors))
 }
 
+async fn load_configured_raindex(
+    cfg: &config::Config,
+    local_db_path: PathBuf,
+) -> Result<raindex::RaindexProvider, StartupRegistryError> {
+    if cfg.registry_url.is_empty() {
+        return Err(StartupRegistryError::MissingConfiguredRegistry);
+    }
+
+    tracing::info!("loading raindex registry from config");
+    raindex::RaindexProvider::load(&cfg.registry_url, Some(local_db_path))
+        .await
+        .map_err(StartupRegistryError::ConfiguredRegistryLoad)
+}
+
+async fn load_startup_raindex(
+    cfg: &config::Config,
+    pool: &db::DbPool,
+    registry_artifact_store: &registry_artifact::RegistryArtifactStore,
+    local_db_path: PathBuf,
+) -> Result<raindex::RaindexProvider, StartupRegistryError> {
+    let private_registry_artifact = registry_artifact_store
+        .load()
+        .await
+        .map_err(StartupRegistryError::PrivateArtifactRead)?;
+
+    let latest_private_registry = db::registry_history::latest_successful_private_registry(pool)
+        .await
+        .map_err(StartupRegistryError::PrivateRegistryHistory)?;
+
+    let private_registry_source = match (
+        private_registry_artifact.filter(|artifact| !artifact.is_empty()),
+        latest_private_registry,
+    ) {
+        (Some(artifact), Some(row)) => {
+            let payload_sha256 = registry_artifact::artifact_sha256(&artifact);
+            if row.payload_sha256 != payload_sha256 {
+                tracing::error!(
+                    expected_payload_sha256 = %row.payload_sha256,
+                    actual_payload_sha256 = %payload_sha256,
+                    path = %registry_artifact_store.path().display(),
+                    "private registry artifact does not match latest successful history"
+                );
+                if cfg.allow_registry_fallback {
+                    None
+                } else {
+                    return Err(StartupRegistryError::PrivateRegistryMismatch);
+                }
+            } else {
+                Some(artifact)
+            }
+        }
+        (Some(artifact), None) => {
+            let payload_sha256 = registry_artifact::artifact_sha256(&artifact);
+            tracing::error!(
+                payload_sha256 = %payload_sha256,
+                path = %registry_artifact_store.path().display(),
+                "private registry artifact exists but no successful history row was found"
+            );
+            if cfg.allow_registry_fallback {
+                None
+            } else {
+                return Err(StartupRegistryError::PrivateArtifactWithoutHistory);
+            }
+        }
+        (None, Some(_)) => {
+            tracing::error!(
+                path = %registry_artifact_store.path().display(),
+                "private registry history exists but artifact file is missing"
+            );
+            if cfg.allow_registry_fallback {
+                None
+            } else {
+                return Err(StartupRegistryError::HistoryWithoutPrivateArtifact);
+            }
+        }
+        (None, None) => None,
+    };
+
+    if let Some(private_registry_source) = private_registry_source {
+        tracing::info!(
+            path = %registry_artifact_store.path().display(),
+            "loading private registry artifact from file"
+        );
+        match raindex::RaindexProvider::load(&private_registry_source, Some(local_db_path.clone()))
+            .await
+        {
+            Ok(provider) => {
+                tracing::info!("loaded private raindex registry");
+                return Ok(provider);
+            }
+            Err(e) if cfg.allow_registry_fallback => {
+                tracing::error!(
+                    error = %e.safe_summary(),
+                    path = %registry_artifact_store.path().display(),
+                    "failed to load private registry artifact; falling back to configured registry"
+                );
+            }
+            Err(e) => return Err(StartupRegistryError::PrivateRegistryLoad(e)),
+        }
+    }
+
+    load_configured_raindex(cfg, local_db_path).await
+}
+
 #[rocket::main]
 async fn main() {
     let parsed = cli::Cli::parse();
@@ -220,86 +345,6 @@ async fn main() {
                 std::time::Duration::from_secs(cfg.response_cache_ttl_seconds),
             );
 
-            let private_registry_artifact = match registry_artifact_store.load().await {
-                Ok(artifact) => artifact,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        path = %registry_artifact_store.path().display(),
-                        "failed to load private registry artifact"
-                    );
-                    drop(log_guard);
-                    std::process::exit(1);
-                }
-            };
-
-            let latest_private_registry =
-                match db::registry_history::latest_successful_private_registry(&pool).await {
-                    Ok(row) => row,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "failed to query private registry history during startup"
-                        );
-                        drop(log_guard);
-                        std::process::exit(1);
-                    }
-                };
-
-            let registry_source = match (
-                private_registry_artifact.filter(|artifact| !artifact.is_empty()),
-                latest_private_registry,
-            ) {
-                (Some(artifact), Some(row)) => {
-                    let payload_sha256 = registry_artifact::artifact_sha256(&artifact);
-                    if row.payload_sha256 != payload_sha256 {
-                        tracing::error!(
-                            expected_payload_sha256 = %row.payload_sha256,
-                            actual_payload_sha256 = %payload_sha256,
-                            path = %registry_artifact_store.path().display(),
-                            "private registry artifact does not match latest successful history"
-                        );
-                        drop(log_guard);
-                        std::process::exit(1);
-                    }
-
-                    tracing::info!(
-                        path = %registry_artifact_store.path().display(),
-                        "loaded private registry artifact from file"
-                    );
-                    artifact
-                }
-                (Some(artifact), None) => {
-                    let payload_sha256 = registry_artifact::artifact_sha256(&artifact);
-                    tracing::error!(
-                        payload_sha256 = %payload_sha256,
-                        path = %registry_artifact_store.path().display(),
-                        "private registry artifact exists but no successful history row was found"
-                    );
-                    drop(log_guard);
-                    std::process::exit(1);
-                }
-                (None, Some(_)) => {
-                    tracing::error!(
-                        path = %registry_artifact_store.path().display(),
-                        "private registry history exists but artifact file is missing"
-                    );
-                    drop(log_guard);
-                    std::process::exit(1);
-                }
-                (None, None) => {
-                    if cfg.registry_url.is_empty() {
-                        tracing::error!(
-                            "private registry artifact not present and registry_url not set in config file"
-                        );
-                        drop(log_guard);
-                        std::process::exit(1);
-                    }
-                    tracing::info!("loaded public registry URL from config");
-                    cfg.registry_url
-                }
-            };
-
             let local_db_path = std::path::PathBuf::from(&cfg.local_db_path);
             if let Some(parent) = local_db_path
                 .parent()
@@ -312,22 +357,20 @@ async fn main() {
                 }
             }
 
-            let raindex_config = match raindex::RaindexProvider::load(
-                &registry_source,
-                Some(local_db_path),
-            )
-            .await
-            {
-                Ok(config) => {
-                    tracing::info!("raindex registry loaded");
-                    config
-                }
-                Err(e) => {
-                    tracing::error!(error = %e.safe_summary(), "failed to load raindex registry");
-                    drop(log_guard);
-                    std::process::exit(1);
-                }
-            };
+            let raindex_config =
+                match load_startup_raindex(&cfg, &pool, &registry_artifact_store, local_db_path)
+                    .await
+                {
+                    Ok(config) => {
+                        tracing::info!("raindex registry loaded");
+                        config
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to load raindex registry");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
 
             let shared_raindex = tokio::sync::RwLock::new(raindex_config);
             let rate_limiter =
@@ -379,7 +422,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_helpers::{basic_auth_header, client, seed_api_key};
+    use crate::test_helpers::{basic_auth_header, client, mock_raindex_registry_url, seed_api_key};
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -390,6 +433,109 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         assert_eq!(body["status"], "ok");
+    }
+
+    fn test_config(
+        registry_url: String,
+        private_registry_path: std::path::PathBuf,
+        local_db_path: std::path::PathBuf,
+        allow_registry_fallback: bool,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            log_dir: "./logs".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            database_max_connections: 5,
+            usage_log_max_concurrency: 2,
+            response_cache_max_entries: 0,
+            response_cache_ttl_seconds: 0,
+            registry_url,
+            private_registry_path: private_registry_path.to_string_lossy().into_owned(),
+            allow_registry_fallback,
+            rate_limit_global_rpm: 600,
+            rate_limit_per_key_rpm: 60,
+            docs_dir: "./docs/book".to_string(),
+            local_db_path: local_db_path.to_string_lossy().into_owned(),
+        }
+    }
+
+    async fn insert_successful_registry_history(pool: &crate::db::DbPool, artifact: &str) {
+        crate::db::registry_history::insert_private_registry_change(
+            pool,
+            &crate::db::registry_history::NewPrivateRegistryHistory {
+                source_commit: "1111111111111111111111111111111111111111",
+                payload_sha256: &crate::registry_artifact::artifact_sha256(artifact),
+                actor_key_id: "deploy",
+                actor_label: "deploy",
+                actor_owner: "deploy",
+                validation_status: crate::db::registry_history::VALIDATION_STATUS_SUCCESS,
+                validation_error: None,
+            },
+        )
+        .await
+        .expect("insert registry history");
+    }
+
+    #[rocket::async_test]
+    async fn test_load_startup_raindex_falls_back_when_private_registry_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let private_registry_path = dir.path().join("private-registry.data");
+        let local_db_path = dir.path().join("raindex.db");
+        let invalid_artifact = "data:text/plain;base64,dGhpcyBpcyBub3QgYSByZWdpc3RyeQo=";
+        let fallback_registry_url = mock_raindex_registry_url().await;
+        let cfg = test_config(
+            fallback_registry_url,
+            private_registry_path.clone(),
+            local_db_path.clone(),
+            true,
+        );
+        let pool = crate::db::init("sqlite::memory:", 5)
+            .await
+            .expect("database init");
+        let store = crate::registry_artifact::RegistryArtifactStore::new(private_registry_path);
+
+        store
+            .persist(invalid_artifact)
+            .await
+            .expect("persist invalid artifact");
+        insert_successful_registry_history(&pool, invalid_artifact).await;
+
+        let provider = super::load_startup_raindex(&cfg, &pool, &store, local_db_path).await;
+
+        assert!(provider.is_ok());
+    }
+
+    #[rocket::async_test]
+    async fn test_load_startup_raindex_errors_when_fallback_disabled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let private_registry_path = dir.path().join("private-registry.data");
+        let local_db_path = dir.path().join("raindex.db");
+        let invalid_artifact = "data:text/plain;base64,dGhpcyBpcyBub3QgYSByZWdpc3RyeQo=";
+        let fallback_registry_url = mock_raindex_registry_url().await;
+        let cfg = test_config(
+            fallback_registry_url,
+            private_registry_path.clone(),
+            local_db_path.clone(),
+            false,
+        );
+        let pool = crate::db::init("sqlite::memory:", 5)
+            .await
+            .expect("database init");
+        let store = crate::registry_artifact::RegistryArtifactStore::new(private_registry_path);
+
+        store
+            .persist(invalid_artifact)
+            .await
+            .expect("persist invalid artifact");
+        insert_successful_registry_history(&pool, invalid_artifact).await;
+
+        let err = super::load_startup_raindex(&cfg, &pool, &store, local_db_path)
+            .await
+            .expect_err("private registry load should fail");
+
+        assert!(matches!(
+            err,
+            super::StartupRegistryError::PrivateRegistryLoad(_)
+        ));
     }
 
     #[rocket::async_test]

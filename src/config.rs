@@ -11,6 +11,7 @@ pub struct Config {
     pub response_cache_ttl_seconds: u64,
     pub registry_url: String,
     pub private_registry_path: String,
+    pub allow_registry_fallback: bool,
     pub rate_limit_global_rpm: u64,
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,
