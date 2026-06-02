@@ -2,6 +2,16 @@ name: Deploy
 
 on:
   workflow_dispatch:
+    inputs:
+      deploy_scope:
+        description: "Deploy scope"
+        required: true
+        type: choice
+        default: "service"
+        options:
+          - service
+          - system
+          - all
 
 concurrency:
   group: deploy
@@ -50,5 +60,14 @@ jobs:
 
       - run: ./prep.sh
 
-      - name: Build and deploy
+      - name: Deploy service
+        if: (inputs.deploy_scope || 'service') == 'service'
+        run: nix run .#deployService -- rest-api
+
+      - name: Deploy system
+        if: (inputs.deploy_scope || 'service') == 'system'
+        run: nix run .#deployNixos
+
+      - name: Deploy system and service
+        if: (inputs.deploy_scope || 'service') == 'all'
         run: nix run .#deployAll
