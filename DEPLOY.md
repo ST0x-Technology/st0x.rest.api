@@ -370,10 +370,10 @@ Server (NixOS on DigitalOcean)
 
 ## Environment variables
 
-Set `RUST_LOG` to control log verbosity (configured in `.env`):
+Set `RUST_LOG` to control log verbosity. The deployed systemd service sets this
+in `os.nix`:
 ```
-RUST_LOG=st0x_rest_api=info,rocket=warn,warn
+RUST_LOG=st0x_rest_api=info,raindex_common=info,raindex_quote=info,rocket=warn,warn
 ```
 
-This is read by the systemd service environment. To change it on the server,
-update `os.nix` and redeploy with `deploy-nixos`.
+To change it on the server, update `os.nix` and redeploy with `deploy-nixos`.

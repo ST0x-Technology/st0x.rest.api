@@ -30,6 +30,11 @@ let
         ConditionPathExists = "/run/st0x/${name}.ready";
       };
 
+      environment = {
+        RUST_LOG =
+          "st0x_rest_api=info,raindex_common=info,raindex_quote=info,rocket=warn,warn";
+      };
+
       serviceConfig = {
         User = "st0x-rest-api";
         Group = "st0x";
