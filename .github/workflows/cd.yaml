@@ -1,5 +1,4 @@
 name: Deploy
-
 on:
   workflow_dispatch:
     inputs:
@@ -12,63 +11,62 @@ on:
           - service
           - system
           - all
-
 concurrency:
   group: deploy
   cancel-in-progress: false
-
 permissions:
   id-token: write
   contents: read
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
-
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: nixbuild/nix-quick-install-action@v30
         with:
-          extra-conf: |
+          nix_conf: |
             accept-flake-config = true
             fallback = true
+            keep-env-derivations = true
+            keep-outputs = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
             sandbox = false
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-
       - name: Resolve host IP
         run: |
           host_ip=$(nix run .#resolveIp)
           echo "::add-mask::$host_ip"
           echo "HOST_IP=$host_ip" >> "$GITHUB_ENV"
-
       - name: Trust host key
         run: |
           host_key=$(nix eval --raw --file keys.nix keys.host)
           echo "$HOST_IP $host_key" > ~/.ssh/known_hosts
-
       - run: ./prep.sh
-
       - name: Deploy service
         if: (inputs.deploy_scope || 'service') == 'service'
         run: nix run .#deployService -- rest-api
-
       - name: Deploy system
         if: (inputs.deploy_scope || 'service') == 'system'
         run: nix run .#deployNixos
-
       - name: Deploy system and service
         if: (inputs.deploy_scope || 'service') == 'all'
         run: nix run .#deployAll

@@ -1,45 +1,44 @@
 name: CI
-
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "AGENTS.md"
+      - "README*"
   pull_request:
-
+    paths-ignore:
+      - "AGENTS.md"
+      - "README*"
 concurrency:
   group: ${{ github.ref }}-ci
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
 permissions:
   contents: read
-  id-token: write
-
 jobs:
   rust-validation:
     name: rust ${{ matrix.name }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: check
-            cache_target: check
-            command: nix develop -c cargo check --workspace
-          - name: test 1 of 4
+          - name: test+static 1 of 4
             cache_target: test
-            command: nix develop -c cargo nextest run --workspace --partition hash:1/4
+            partition: 1
+            run_static: "true"
           - name: test 2 of 4
             cache_target: test
-            command: nix develop -c cargo nextest run --workspace --partition hash:2/4
+            partition: 2
+            run_static: "false"
           - name: test 3 of 4
             cache_target: test
-            command: nix develop -c cargo nextest run --workspace --partition hash:3/4
+            partition: 3
+            run_static: "false"
           - name: test 4 of 4
             cache_target: test
-            command: nix develop -c cargo nextest run --workspace --partition hash:4/4
-          - name: static
-            cache_target: static
-            command: nix develop -c rainix-rs-static
+            partition: 4
+            run_static: "false"
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/${{ matrix.cache_target }}
@@ -48,11 +47,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - name: Compute submodule cache key
         id: sub-key
         run: echo "hash=$(git submodule status | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-
       - name: Cache submodules
         id: cache-sub
         uses: actions/cache@v5
@@ -62,7 +59,6 @@ jobs:
             .git/modules/
           key: submodules-${{ steps.sub-key.outputs.hash }}
           restore-keys: submodules-
-
       - name: Checkout submodules
         run: |
           if [ "${{ steps.cache-sub.outputs.cache-hit }}" = "true" ]; then
@@ -75,16 +71,25 @@ jobs:
             echo "Cache miss - full submodule fetch"
             git submodule update --init --recursive
           fi
-
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: nixbuild/nix-quick-install-action@v30
         with:
-          extra-conf: |
+          nix_conf: |
             accept-flake-config = true
             fallback = true
+            keep-env-derivations = true
+            keep-outputs = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
       - name: Cache Solidity artifacts
         id: cache-sol
         uses: actions/cache@v5
@@ -94,25 +99,20 @@ jobs:
             lib/**/out/
           key: sol-artifacts-${{ hashFiles('.gitmodules', 'flake.lock', 'lib/**/*.sol', 'lib/**/foundry.toml', 'lib/**/remappings.txt') }}
           restore-keys: sol-artifacts-
-
       - name: Build Solidity artifacts
         if: steps.cache-sol.outputs.cache-hit != 'true'
         run: nix run .#prepSolArtifacts
-
       - name: Cache cargo artifacts
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/git/db/
-            ~/.cargo/registry/cache/
-            ~/.cargo/registry/index/
-            target/${{ matrix.cache_target }}/
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
-
+          prefix-key: rust-${{ github.workflow }}-${{ matrix.cache_target }}-${{ matrix.partition }}
       - name: ${{ matrix.name }}
-        run: ${{ matrix.command }}
-
+        run: |
+          set -euxo pipefail
+          if [ "${{ matrix.run_static }}" = "true" ]; then
+            nix develop -c rainix-rs-static
+          fi
+          nix develop -c cargo nextest run --workspace --partition hash:${{ matrix.partition }}/4
   rust-checks:
     name: rust-checks
     needs: rust-validation
@@ -125,20 +125,28 @@ jobs:
             echo "rust validation failed"
             exit 1
           fi
-
   docs:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: nixbuild/nix-quick-install-action@v30
         with:
-          extra-conf: |
+          nix_conf: |
             accept-flake-config = true
             fallback = true
+            keep-env-derivations = true
+            keep-outputs = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
       - name: Build docs
         run: nix build .#st0x-docs
