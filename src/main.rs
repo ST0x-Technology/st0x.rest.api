@@ -13,6 +13,7 @@ mod fairings;
 mod raindex;
 mod registry_artifact;
 mod routes;
+mod signing;
 mod telemetry;
 mod types;
 
@@ -146,6 +147,7 @@ pub(crate) fn rocket(
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     app_state: app_state::ApplicationState,
+    gating: signing::GatingState,
     docs_dir: String,
     usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
@@ -160,6 +162,7 @@ pub(crate) fn rocket(
         .manage(rate_limiter)
         .manage(raindex_config)
         .manage(app_state)
+        .manage(gating)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -385,12 +388,38 @@ async fn main() {
 
             let app_state =
                 app_state::ApplicationState::new(registry_artifact_store, response_caches);
+            let gating_key = match std::env::var("ST0X_GATING_SIGNER_KEY") {
+                Ok(k) if !k.is_empty() => k,
+                _ => {
+                    tracing::error!(
+                        "ST0X_GATING_SIGNER_KEY env var is required but missing or empty"
+                    );
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let gating_signer = match signing::GatingSigner::from_hex_key(&gating_key) {
+                Ok(s) => {
+                    tracing::info!(signer = %s.address(), "gating signer loaded");
+                    s
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to parse ST0X_GATING_SIGNER_KEY");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let gating_state = signing::GatingState {
+                signer: gating_signer,
+                ttl_seconds: cfg.gating_signature_ttl_seconds,
+            };
 
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
                 app_state,
+                gating_state,
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
             ) {
@@ -455,6 +484,7 @@ mod tests {
             rate_limit_per_key_rpm: 60,
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
+            gating_signature_ttl_seconds: 60,
         }
     }
 
