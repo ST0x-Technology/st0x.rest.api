@@ -3,6 +3,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
+use rain_orderbook_common::take_orders::TakeOrderCandidate;
+
 use crate::types::orders::OrdersListResponse;
 use crate::types::trades::TradesByAddressResponse;
 
@@ -25,12 +28,10 @@ where
         )
     }
 
-    #[cfg(test)]
     pub(crate) async fn get(&self, key: &K) -> Option<V> {
         self.0.get(key).await
     }
 
-    #[cfg(test)]
     pub(crate) async fn insert(&self, key: K, value: V) {
         self.0.insert(key, value).await
     }
@@ -52,7 +53,9 @@ where
 
 pub(crate) struct RouteResponseCaches {
     enabled: bool,
+    pub order_quotes: AppCache<String, Vec<RaindexOrderQuote>>,
     pub orders_by_token: AppCache<String, OrdersListResponse>,
+    pub swap_candidates: AppCache<String, Vec<TakeOrderCandidate>>,
     pub trades_by_token: AppCache<String, TradesByAddressResponse>,
     pub trades_by_taker: AppCache<String, TradesByAddressResponse>,
     group: CacheGroup,
@@ -67,18 +70,24 @@ impl RouteResponseCaches {
         } else {
             ttl
         };
+        let order_quotes = AppCache::new(max_capacity, ttl);
         let orders_by_token = AppCache::new(max_capacity, ttl);
+        let swap_candidates = AppCache::new(max_capacity, ttl);
         let trades_by_token = AppCache::new(max_capacity, ttl);
         let trades_by_taker = AppCache::new(max_capacity, ttl);
 
         let mut group = CacheGroup::new();
+        group.register(&order_quotes);
         group.register(&orders_by_token);
+        group.register(&swap_candidates);
         group.register(&trades_by_token);
         group.register(&trades_by_taker);
 
         Self {
             enabled,
+            order_quotes,
             orders_by_token,
+            swap_candidates,
             trades_by_token,
             trades_by_taker,
             group,

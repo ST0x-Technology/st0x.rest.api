@@ -2,6 +2,7 @@ use super::{
     build_orders_list_response, OrdersListDataSource, RaindexOrdersListDataSource,
     DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -72,6 +73,7 @@ pub async fn get_orders_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,
@@ -84,6 +86,7 @@ pub async fn get_orders_by_address(
         let raindex = shared_raindex.read().await;
         let ds = RaindexOrdersListDataSource {
             client: raindex.client(),
+            caches: &app_state.response_caches,
         };
         let response = process_get_orders_by_owner(&ds, addr, page, page_size).await?;
         Ok(Json(response))

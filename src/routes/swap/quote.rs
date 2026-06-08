@@ -1,4 +1,5 @@
 use super::{RaindexSwapDataSource, SwapDataSource};
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -30,6 +31,7 @@ pub async fn post_swap_quote(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
@@ -39,6 +41,7 @@ pub async fn post_swap_quote(
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
+            caches: &app_state.response_caches,
         };
         let response = process_swap_quote(&ds, req).await?;
         Ok(Json(response))

@@ -1,6 +1,7 @@
 mod calldata;
 mod quote;
 
+use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
 use crate::types::swap::SwapCalldataResponse;
 use alloy::primitives::Address;
@@ -45,6 +46,28 @@ pub(crate) trait SwapDataSource: Send + Sync {
 
 pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
+    pub caches: &'a RouteResponseCaches,
+}
+
+fn swap_candidates_cache_key(
+    orders: &[RaindexOrder],
+    input_token: Address,
+    output_token: Address,
+) -> String {
+    let mut order_keys = orders
+        .iter()
+        .map(|order| {
+            format!(
+                "{}:{}:{}",
+                order.chain_id(),
+                order.raindex(),
+                order.order_hash()
+            )
+        })
+        .collect::<Vec<_>>();
+    order_keys.sort_unstable();
+    let order_keys = order_keys.join(",");
+    format!("swap-candidates/latest/default/{input_token}/{output_token}/{order_keys}")
 }
 
 #[async_trait]
@@ -109,20 +132,35 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
-        build_take_order_candidates_for_pair(
-            orders,
-            input_token,
-            output_token,
-            None,
-            None,
-            Address::ZERO,
-            &NoopInjector,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to build order candidates");
-            ApiError::Internal("failed to build order candidates".into())
-        })
+        let fetch = || async {
+            build_take_order_candidates_for_pair(
+                orders,
+                input_token,
+                output_token,
+                None,
+                None,
+                Address::ZERO,
+                &NoopInjector,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to build order candidates");
+                ApiError::Internal("failed to build order candidates".into())
+            })
+        };
+
+        if !self.caches.is_enabled() {
+            return fetch().await;
+        }
+
+        self.caches
+            .swap_candidates
+            .get_or_try_insert(
+                swap_candidates_cache_key(orders, input_token, output_token),
+                fetch,
+            )
+            .await
+            .map_err(|e| (*e).clone())
     }
 
     async fn get_calldata(
@@ -200,6 +238,44 @@ pub use quote::*;
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![quote::post_swap_quote, calldata::post_swap_calldata]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::swap_candidates_cache_key;
+    use alloy::primitives::address;
+    use rain_orderbook_common::raindex_client::orders::RaindexOrder;
+    use serde_json::json;
+
+    fn mock_order(chain_id: u32, order_hash: &str) -> RaindexOrder {
+        let mut value = crate::test_helpers::order_json();
+        value["chainId"] = json!(chain_id);
+        value["orderHash"] = json!(order_hash);
+        serde_json::from_value(value).expect("deserialize mock order")
+    }
+
+    #[test]
+    fn test_swap_candidates_cache_key_is_order_insensitive() {
+        let input_token = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let output_token = address!("4200000000000000000000000000000000000006");
+        let order_a = mock_order(
+            8453,
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        let order_b = mock_order(
+            8453,
+            "0x0000000000000000000000000000000000000000000000000000000000000002",
+        );
+
+        assert_eq!(
+            swap_candidates_cache_key(
+                &[order_a.clone(), order_b.clone()],
+                input_token,
+                output_token,
+            ),
+            swap_candidates_cache_key(&[order_b, order_a], input_token, output_token)
+        );
+    }
 }
 
 #[cfg(test)]

@@ -291,7 +291,7 @@ fn stub_raindex_client() -> serde_json::Value {
     })
 }
 
-fn order_json() -> serde_json::Value {
+pub(crate) fn order_json() -> serde_json::Value {
     let rc = stub_raindex_client();
     json!({
         "raindexClient": rc,

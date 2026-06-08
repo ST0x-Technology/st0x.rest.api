@@ -1,4 +1,5 @@
 use super::{OrderDataSource, RaindexOrderDataSource};
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -33,6 +34,7 @@ pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
 ) -> Result<Json<OrderDetail>, ApiError> {
@@ -42,6 +44,7 @@ pub async fn get_order(
         let raindex = shared_raindex.read().await;
         let ds = RaindexOrderDataSource {
             client: raindex.client(),
+            caches: &app_state.response_caches,
         };
         let detail = process_get_order(&ds, hash).await?;
         Ok(Json(detail))

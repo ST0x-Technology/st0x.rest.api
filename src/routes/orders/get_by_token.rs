@@ -105,6 +105,7 @@ pub async fn get_orders_by_token(
             let raindex = shared_raindex.read().await;
             let ds = RaindexOrdersListDataSource {
                 client: raindex.client(),
+                caches: &app_state.response_caches,
             };
             let response = process_get_orders_by_token(&ds, addr, side, page, page_size).await?;
             return Ok(Json(response));
@@ -118,6 +119,7 @@ pub async fn get_orders_by_token(
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexOrdersListDataSource {
                     client: raindex.client(),
+                    caches: &app_state.response_caches,
                 };
                 process_get_orders_by_token(&ds, addr, side, page, page_size).await
             })

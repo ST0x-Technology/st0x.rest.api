@@ -2,6 +2,7 @@ mod get_by_owner;
 mod get_by_token;
 mod get_by_tx;
 
+use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
 use crate::types::common::TokenRef;
 use crate::types::orders::{OrderSummary, OrdersListResponse, OrdersPagination};
@@ -54,6 +55,16 @@ pub(crate) trait OrdersListDataSource: Send + Sync {
 
 pub(crate) struct RaindexOrdersListDataSource<'a> {
     pub client: &'a RaindexClient,
+    pub caches: &'a RouteResponseCaches,
+}
+
+pub(crate) fn order_quote_cache_key(order: &RaindexOrder) -> String {
+    format!(
+        "order-quotes/latest/default/{}/{}/{}",
+        order.chain_id(),
+        order.raindex(),
+        order.order_hash()
+    )
 }
 
 fn group_orders_by_chain(orders: &[RaindexOrder]) -> GroupedOrders {
@@ -193,21 +204,73 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         &self,
         order: &RaindexOrder,
     ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
-        order.get_quotes(None, None).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to query order quotes");
-            ApiError::Internal("failed to query order quotes".into())
-        })
+        let fetch = || async {
+            order.get_quotes(None, None).await.map_err(|e| {
+                tracing::error!(error = %e, "failed to query order quotes");
+                ApiError::Internal("failed to query order quotes".into())
+            })
+        };
+
+        if !self.caches.is_enabled() {
+            return fetch().await;
+        }
+
+        self.caches
+            .order_quotes
+            .get_or_try_insert(order_quote_cache_key(order), fetch)
+            .await
+            .map_err(|e| (*e).clone())
     }
 
     async fn get_order_quotes_batch_for_chain(
         &self,
         orders: &[RaindexOrder],
     ) -> OrderQuoteBatchResult {
+        if !self.caches.is_enabled() {
+            return fetch_order_quotes_batch(orders, None, None)
+                .await
+                .map_err(|error| {
+                    let chain_id = orders
+                        .first()
+                        .map(RaindexOrder::chain_id)
+                        .unwrap_or_default();
+                    tracing::error!(
+                        chain_id,
+                        error = %error,
+                        "failed to batch query order quotes"
+                    );
+                    ApiError::Internal("failed to query order quotes".into())
+                });
+        }
+
+        let mut ordered_quotes: Vec<Option<Vec<RaindexOrderQuote>>> =
+            Vec::with_capacity(orders.len());
+        ordered_quotes.resize_with(orders.len(), || None);
+        let mut missed_orders = Vec::new();
+        let mut missed_keys = Vec::new();
+
+        for (index, order) in orders.iter().enumerate() {
+            let key = order_quote_cache_key(order);
+            if let Some(quotes) = self.caches.order_quotes.get(&key).await {
+                ordered_quotes[index] = Some(quotes);
+            } else {
+                missed_orders.push(order.clone());
+                missed_keys.push((index, key));
+            }
+        }
+
+        if missed_orders.is_empty() {
+            return Ok(ordered_quotes
+                .into_iter()
+                .map(|quotes| quotes.unwrap_or_default())
+                .collect());
+        }
+
         let chain_id = orders
             .first()
             .map(RaindexOrder::chain_id)
             .unwrap_or_default();
-        fetch_order_quotes_batch(orders, None, None)
+        let missed_quotes = fetch_order_quotes_batch(&missed_orders, None, None)
             .await
             .map_err(|error| {
                 tracing::error!(
@@ -216,7 +279,26 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
                     "failed to batch query order quotes"
                 );
                 ApiError::Internal("failed to query order quotes".into())
-            })
+            })?;
+
+        if missed_quotes.len() != missed_keys.len() {
+            tracing::error!(
+                expected_results = missed_keys.len(),
+                actual_results = missed_quotes.len(),
+                "order quote cache miss batch returned unexpected result count"
+            );
+            return Err(ApiError::Internal("failed to query order quotes".into()));
+        }
+
+        for ((index, key), quotes) in missed_keys.into_iter().zip(missed_quotes) {
+            self.caches.order_quotes.insert(key, quotes.clone()).await;
+            ordered_quotes[index] = Some(quotes);
+        }
+
+        Ok(ordered_quotes
+            .into_iter()
+            .map(|quotes| quotes.unwrap_or_default())
+            .collect())
     }
 }
 

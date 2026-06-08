@@ -3,6 +3,7 @@ mod deploy_dca;
 mod deploy_solver;
 mod get_order;
 
+use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
 use alloy::primitives::{Bytes, B256};
 use async_trait::async_trait;
@@ -28,6 +29,7 @@ pub(crate) trait OrderDataSource: Send + Sync {
 
 pub(crate) struct RaindexOrderDataSource<'a> {
     pub client: &'a RaindexClient,
+    pub caches: &'a RouteResponseCaches,
 }
 
 #[async_trait]
@@ -51,10 +53,22 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
         &self,
         order: &RaindexOrder,
     ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
-        order.get_quotes(None, None).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to query order quotes");
-            ApiError::Internal("failed to query order quotes".into())
-        })
+        let fetch = || async {
+            order.get_quotes(None, None).await.map_err(|e| {
+                tracing::error!(error = %e, "failed to query order quotes");
+                ApiError::Internal("failed to query order quotes".into())
+            })
+        };
+
+        if !self.caches.is_enabled() {
+            return fetch().await;
+        }
+
+        self.caches
+            .order_quotes
+            .get_or_try_insert(crate::routes::orders::order_quote_cache_key(order), fetch)
+            .await
+            .map_err(|e| (*e).clone())
     }
 
     async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError> {

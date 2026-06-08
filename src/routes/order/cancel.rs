@@ -1,4 +1,5 @@
 use super::{OrderDataSource, RaindexOrderDataSource};
+use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -29,6 +30,7 @@ use tracing::Instrument;
 pub async fn post_order_cancel(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
+    app_state: &State<ApplicationState>,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     request: Json<CancelOrderRequest>,
@@ -40,6 +42,7 @@ pub async fn post_order_cancel(
         let raindex = shared_raindex.read().await;
         let ds = RaindexOrderDataSource {
             client: raindex.client(),
+            caches: &app_state.response_caches,
         };
         let response = process_cancel_order(&ds, hash).await?;
         Ok(Json(response))
