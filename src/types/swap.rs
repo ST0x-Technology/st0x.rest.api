@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum SwapQuoteDenomination {
+pub enum SwapDenomination {
     #[default]
     Wrapped,
     Unwrapped,
@@ -22,7 +22,7 @@ pub struct SwapQuoteRequest {
     pub output_amount: String,
     #[serde(default)]
     #[schema(example = "wrapped", default = "wrapped")]
-    pub denomination: SwapQuoteDenomination,
+    pub denomination: SwapDenomination,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -35,7 +35,7 @@ pub struct SwapQuoteResponse {
     #[schema(example = "0.5")]
     pub output_amount: String,
     #[schema(example = "wrapped")]
-    pub denomination: SwapQuoteDenomination,
+    pub denomination: SwapDenomination,
     #[schema(example = "0.5")]
     pub estimated_output: String,
     #[schema(example = "1250.75")]
@@ -57,6 +57,9 @@ pub struct SwapCalldataRequest {
     pub output_amount: String,
     #[schema(example = "2600")]
     pub maximum_io_ratio: String,
+    #[serde(default)]
+    #[schema(example = "wrapped", default = "wrapped")]
+    pub denomination: SwapDenomination,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -70,5 +73,7 @@ pub struct SwapCalldataResponse {
     pub value: U256,
     #[schema(example = "1250.75")]
     pub estimated_input: String,
+    #[schema(example = "wrapped")]
+    pub denomination: SwapDenomination,
     pub approvals: Vec<Approval>,
 }

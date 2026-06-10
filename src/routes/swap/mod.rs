@@ -1,9 +1,10 @@
 mod calldata;
+mod denomination;
 mod quote;
 
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
-use crate::types::swap::SwapCalldataResponse;
+use crate::types::swap::{SwapCalldataResponse, SwapDenomination};
 use crate::wrap_ratio::{read_wrap_ratio_values_for_addresses, WrapRatioValue};
 use alloy::primitives::Address;
 use async_trait::async_trait;
@@ -189,6 +190,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 data: alloy::primitives::Bytes::new(),
                 value: alloy::primitives::U256::ZERO,
                 estimated_input: formatted_amount.clone(),
+                denomination: SwapDenomination::Wrapped,
                 approvals: vec![crate::types::common::Approval {
                     token: approval_info.token(),
                     spender: approval_info.spender(),
@@ -207,6 +209,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 data: take_orders_info.calldata().clone(),
                 value: alloy::primitives::U256::ZERO,
                 estimated_input: expected_sell,
+                denomination: SwapDenomination::Wrapped,
                 approvals: vec![],
             })
         } else {

@@ -3,13 +3,13 @@ use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::types::swap::{SwapQuoteDenomination, SwapQuoteRequest, SwapQuoteResponse};
-use alloy::primitives::Address;
+use crate::routes::swap::denomination::normalize_quote_amounts;
+use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
 use rain_math_float::Float;
 use rain_orderbook_common::take_orders::simulate_buy_over_candidates;
 use rocket::serde::json::Json;
 use rocket::State;
-use std::ops::{Div, Mul};
+use std::ops::Div;
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -137,68 +137,12 @@ async fn process_swap_quote(
     })
 }
 
-async fn normalize_quote_amounts(
-    ds: &dyn SwapDataSource,
-    denomination: SwapQuoteDenomination,
-    input_token: Address,
-    output_token: Address,
-    estimated_input: Float,
-    estimated_output: Float,
-) -> Result<(Float, Float), ApiError> {
-    match denomination {
-        SwapQuoteDenomination::Wrapped => Ok((estimated_input, estimated_output)),
-        SwapQuoteDenomination::Unwrapped => {
-            tracing::info!("normalizing swap quote response to unwrapped denomination");
-            let ratios = ds
-                .get_wrap_ratios_for_tokens(&[input_token, output_token])
-                .await?;
-
-            let converted_input = match ratios.get(&input_token) {
-                Some(ratio) => {
-                    tracing::info!(
-                        share_address = %ratio.share_address,
-                        assets_per_share = %ratio.assets_per_share,
-                        "normalizing estimated input to unwrapped denomination"
-                    );
-                    convert_wrapped_amount(estimated_input, &ratio.assets_per_share)?
-                }
-                None => estimated_input,
-            };
-
-            let converted_output = match ratios.get(&output_token) {
-                Some(ratio) => {
-                    tracing::info!(
-                        share_address = %ratio.share_address,
-                        assets_per_share = %ratio.assets_per_share,
-                        "normalizing estimated output to unwrapped denomination"
-                    );
-                    convert_wrapped_amount(estimated_output, &ratio.assets_per_share)?
-                }
-                None => estimated_output,
-            };
-
-            Ok((converted_input, converted_output))
-        }
-    }
-}
-
-fn convert_wrapped_amount(amount: Float, assets_per_share: &str) -> Result<Float, ApiError> {
-    let ratio = Float::parse(assets_per_share.to_string()).map_err(|e| {
-        tracing::error!(error = %e, "failed to parse wrapped token ratio");
-        ApiError::Internal("failed to read wrapped token ratio".into())
-    })?;
-
-    amount.mul(ratio).map_err(|e| {
-        tracing::error!(error = %e, "failed to normalize wrapped token amount");
-        ApiError::Internal("failed to normalize wrapped token amount".into())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
+    use crate::types::swap::SwapDenomination;
     use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::address;
     use async_trait::async_trait;
@@ -213,7 +157,7 @@ mod tests {
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
-            denomination: SwapQuoteDenomination::Wrapped,
+            denomination: SwapDenomination::Wrapped,
         }
     }
 
@@ -226,7 +170,7 @@ mod tests {
             input_token,
             output_token,
             output_amount: output_amount.to_string(),
-            denomination: SwapQuoteDenomination::Unwrapped,
+            denomination: SwapDenomination::Unwrapped,
         }
     }
 
@@ -314,7 +258,7 @@ mod tests {
         assert_eq!(result.input_token, USDC);
         assert_eq!(result.output_token, WETH);
         assert_eq!(result.output_amount, "100");
-        assert_eq!(result.denomination, SwapQuoteDenomination::Wrapped);
+        assert_eq!(result.denomination, SwapDenomination::Wrapped);
         assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "150");
         assert_eq!(result.estimated_io_ratio, "1.5");
@@ -386,7 +330,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "300");
@@ -410,7 +354,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "200");
         assert_eq!(result.estimated_input, "150");
@@ -438,7 +382,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "300");
         assert_eq!(result.estimated_input, "300");
@@ -461,7 +405,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "150");

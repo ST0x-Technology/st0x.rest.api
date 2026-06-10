@@ -64,10 +64,8 @@ is not pre-converted.
 
 Do not pass unwrapped-normalized quote values into other endpoints unless those
 endpoints explicitly support `denomination=unwrapped` and you call them that
-way. In particular, `/v1/swap/calldata` currently expects `outputAmount` and
-`maximumIoRatio` in wrapped/orderbook-denominated units, so using an
-unwrapped-normalized `estimatedIoRatio` as calldata slippage input will produce
-different calculations.
+way. `/v1/swap/calldata` supports the same `denomination` field, but the swap
+still purchases wrapped/orderbook tokens.
 
 ## Step 2: Get Calldata
 
@@ -86,20 +84,28 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
     "outputAmount": "1.0",
-    "maximumIoRatio": "2600.0"
+    "maximumIoRatio": "2600.0",
+    "denomination": "wrapped"
   }'
 ```
 
-| Field            | Type   | Description                                           |
-| ---------------- | ------ | ----------------------------------------------------- |
-| `taker`          | string | Your wallet address that will execute the transaction |
-| `inputToken`     | string | Address of the token you are selling                  |
-| `outputToken`    | string | Address of the token you want to receive              |
-| `outputAmount`   | string | Desired output amount (human-readable)                |
-| `maximumIoRatio` | string | Maximum acceptable IO ratio (slippage protection)     |
+| Field            | Type   | Description                                                                                                                                                                     |
+| ---------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `taker`          | string | Your wallet address that will execute the transaction                                                                                                                           |
+| `inputToken`     | string | Wrapped/orderbook token address you are selling                                                                                                                                 |
+| `outputToken`    | string | Wrapped/orderbook token address you want to receive                                                                                                                             |
+| `outputAmount`   | string | Desired output amount in the selected `denomination`                                                                                                                            |
+| `maximumIoRatio` | string | Maximum acceptable IO ratio in the selected `denomination`                                                                                                                      |
+| `denomination`   | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `outputAmount` and `maximumIoRatio` as unwrapped display values for wrapped ST0x/ERC4626 tokens. |
 
 Set `maximumIoRatio` slightly above the `estimatedIoRatio` from the quote to
 allow for price movement.
+
+For calldata, `denomination=unwrapped` only changes how numeric fields are
+interpreted and displayed. The API converts `outputAmount` and `maximumIoRatio`
+to wrapped/orderbook units before generating calldata. Clients must still pass
+the wrapped/orderbook token addresses for `inputToken` and `outputToken`; the
+endpoint does not translate unwrapped asset addresses.
 
 ### Response
 
@@ -115,6 +121,7 @@ required transactions:
   "data": "0x",
   "value": "0x0",
   "estimatedInput": "2500.0",
+  "denomination": "wrapped",
   "approvals": [
     {
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -136,6 +143,7 @@ the swap calldata:
   "data": "0xabcdef...",
   "value": "0x0",
   "estimatedInput": "2500.0",
+  "denomination": "wrapped",
   "approvals": []
 }
 ```
@@ -145,8 +153,13 @@ the swap calldata:
 | `to`             | string | Contract address to send the transaction to                                        |
 | `data`           | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed            |
 | `value`          | string | Native token value to send (usually `"0x0"`)                                       |
-| `estimatedInput` | string | Expected input amount                                                              |
+| `estimatedInput` | string | Expected input amount in the requested `denomination`                              |
+| `denomination`   | string | Denomination used for `estimatedInput`                                             |
 | `approvals`      | array  | Token approvals needed — if non-empty, approve first then call this endpoint again |
+
+Approval entries always describe the actual on-chain approval requirements in
+wrapped/orderbook token units. They are not converted or relabeled when
+`denomination=unwrapped`.
 
 ## Step 3: Handle Approvals
 

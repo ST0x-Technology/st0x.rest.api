@@ -3,6 +3,9 @@ use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::swap::denomination::{
+    normalize_calldata_request_values, normalize_calldata_response,
+};
 use crate::types::swap::{SwapCalldataRequest, SwapCalldataResponse};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
@@ -21,6 +24,7 @@ use tracing::Instrument;
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "No liquidity found", body = ApiErrorResponse),
+        (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
@@ -56,17 +60,28 @@ async fn process_swap_calldata(
     ds.validate_supported_tokens(req.input_token, req.output_token)
         .await?;
 
+    let (output_amount, maximum_io_ratio, wrap_ratios) = normalize_calldata_request_values(
+        ds,
+        req.denomination,
+        req.input_token,
+        req.output_token,
+        req.output_amount,
+        req.maximum_io_ratio,
+    )
+    .await?;
+
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
         chain_id: crate::CHAIN_ID,
         sell_token: req.input_token.to_string(),
         buy_token: req.output_token.to_string(),
         mode: TakeOrdersMode::BuyUpTo,
-        amount: req.output_amount,
-        price_cap: req.maximum_io_ratio,
+        amount: output_amount,
+        price_cap: maximum_io_ratio,
     };
 
-    ds.get_calldata(take_req).await
+    let response = ds.get_calldata(take_req).await?;
+    normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
 }
 
 #[cfg(test)]
@@ -75,13 +90,20 @@ mod tests {
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::TestClientBuilder;
     use crate::types::common::Approval;
+    use crate::types::swap::SwapDenomination;
+    use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::{address, Address, Bytes, U256};
+    use async_trait::async_trait;
     use rocket::http::{ContentType, Status};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: Address = address!("4200000000000000000000000000000000000006");
     const TAKER: Address = address!("1111111111111111111111111111111111111111");
     const ORDERBOOK: Address = address!("d2938e7c9fe3597f78832ce780feb61945c377d7");
+    const WT_MSTR: Address = address!("Ff05e1BD696900DC6A52cA35cA61bB1024eDA8e2");
+    const WT_COIN: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
     fn calldata_request(output_amount: &str, max_ratio: &str) -> SwapCalldataRequest {
         SwapCalldataRequest {
@@ -90,6 +112,23 @@ mod tests {
             output_token: WETH,
             output_amount: output_amount.to_string(),
             maximum_io_ratio: max_ratio.to_string(),
+            denomination: SwapDenomination::Wrapped,
+        }
+    }
+
+    fn unwrapped_calldata_request(
+        input_token: Address,
+        output_token: Address,
+        output_amount: &str,
+        max_ratio: &str,
+    ) -> SwapCalldataRequest {
+        SwapCalldataRequest {
+            taker: TAKER,
+            input_token,
+            output_token,
+            output_amount: output_amount.to_string(),
+            maximum_io_ratio: max_ratio.to_string(),
+            denomination: SwapDenomination::Unwrapped,
         }
     }
 
@@ -99,6 +138,7 @@ mod tests {
             data: Bytes::from(vec![0xab, 0xcd, 0xef]),
             value: U256::ZERO,
             estimated_input: "150".to_string(),
+            denomination: SwapDenomination::Wrapped,
             approvals: vec![],
         }
     }
@@ -109,6 +149,7 @@ mod tests {
             data: Bytes::new(),
             value: U256::ZERO,
             estimated_input: "1000".to_string(),
+            denomination: SwapDenomination::Wrapped,
             approvals: vec![Approval {
                 token: USDC,
                 spender: ORDERBOOK,
@@ -117,6 +158,120 @@ mod tests {
                 approval_data: Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]),
             }],
         }
+    }
+
+    fn wrap_ratio(share_address: Address, assets_per_share: &str) -> WrapRatioValue {
+        WrapRatioValue {
+            share_address,
+            assets_per_share: assets_per_share.to_string(),
+        }
+    }
+
+    fn capture_ds(
+        response: SwapCalldataResponse,
+        wrap_ratios: HashMap<Address, WrapRatioValue>,
+    ) -> (
+        MockCalldataDataSource,
+        Arc<Mutex<Option<TakeOrdersRequest>>>,
+    ) {
+        capture_ds_with_wrap_result(response, Ok(wrap_ratios))
+    }
+
+    fn capture_ds_with_wrap_result(
+        response: SwapCalldataResponse,
+        wrap_ratios: Result<HashMap<Address, WrapRatioValue>, ApiError>,
+    ) -> (
+        MockCalldataDataSource,
+        Arc<Mutex<Option<TakeOrdersRequest>>>,
+    ) {
+        let captured_request = Arc::new(Mutex::new(None));
+        (
+            MockCalldataDataSource {
+                base: MockSwapDataSource {
+                    supported_tokens: Ok(()),
+                    orders: Ok(vec![]),
+                    candidates: vec![],
+                    calldata_result: Ok(response),
+                },
+                wrap_ratios,
+                captured_request: Arc::clone(&captured_request),
+            },
+            captured_request,
+        )
+    }
+
+    struct MockCalldataDataSource {
+        base: MockSwapDataSource,
+        wrap_ratios: Result<HashMap<Address, WrapRatioValue>, ApiError>,
+        captured_request: Arc<Mutex<Option<TakeOrdersRequest>>>,
+    }
+
+    #[async_trait]
+    impl SwapDataSource for MockCalldataDataSource {
+        async fn validate_supported_tokens(
+            &self,
+            input_token: Address,
+            output_token: Address,
+        ) -> Result<(), ApiError> {
+            self.base
+                .validate_supported_tokens(input_token, output_token)
+                .await
+        }
+
+        async fn get_orders_for_pair(
+            &self,
+            input_token: Address,
+            output_token: Address,
+        ) -> Result<Vec<rain_orderbook_common::raindex_client::orders::RaindexOrder>, ApiError>
+        {
+            self.base
+                .get_orders_for_pair(input_token, output_token)
+                .await
+        }
+
+        async fn build_candidates_for_pair(
+            &self,
+            orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
+            input_token: Address,
+            output_token: Address,
+        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+            self.base
+                .build_candidates_for_pair(orders, input_token, output_token)
+                .await
+        }
+
+        async fn get_calldata(
+            &self,
+            request: TakeOrdersRequest,
+        ) -> Result<SwapCalldataResponse, ApiError> {
+            *self.captured_request.lock().unwrap() = Some(request);
+            self.base.calldata_result.clone()
+        }
+
+        async fn get_wrap_ratios_for_tokens(
+            &self,
+            token_addresses: &[Address],
+        ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+            let wrap_ratios = self.wrap_ratios.clone()?;
+            Ok(token_addresses
+                .iter()
+                .filter_map(|address| {
+                    wrap_ratios
+                        .get(address)
+                        .map(|ratio| (*address, ratio.clone()))
+                })
+                .collect())
+        }
+    }
+
+    fn captured_take_orders_request(
+        captured_request: &Arc<Mutex<Option<TakeOrdersRequest>>>,
+    ) -> TakeOrdersRequest {
+        captured_request.lock().unwrap().clone().unwrap()
+    }
+
+    fn no_take_orders_request_was_made(captured_request: &Arc<Mutex<Option<TakeOrdersRequest>>>) {
+        assert!(captured_request.lock().unwrap().is_none());
     }
 
     #[rocket::async_test]
@@ -135,6 +290,7 @@ mod tests {
         assert!(!result.data.is_empty());
         assert_eq!(result.value, U256::ZERO);
         assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.denomination, SwapDenomination::Wrapped);
         assert!(result.approvals.is_empty());
     }
 
@@ -152,9 +308,244 @@ mod tests {
 
         assert_eq!(result.to, ORDERBOOK);
         assert!(result.data.is_empty());
+        assert_eq!(result.denomination, SwapDenomination::Wrapped);
         assert_eq!(result.approvals.len(), 1);
         assert_eq!(result.approvals[0].token, USDC);
         assert_eq!(result.approvals[0].spender, ORDERBOOK);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_default_denomination_preserves_request() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
+            .await
+            .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.sell_token, USDC.to_string());
+        assert_eq!(request.buy_token, WETH.to_string());
+        assert_eq!(request.amount, "100");
+        assert_eq!(request.price_cap, "2.5");
+        assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.denomination, SwapDenomination::Wrapped);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_explicit_wrapped_preserves_request() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let mut request = calldata_request("100", "2.5");
+        request.denomination = SwapDenomination::Wrapped;
+        let result = process_swap_calldata(&ds, request).await.unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.amount, "100");
+        assert_eq!(request.price_cap, "2.5");
+        assert_eq!(result.denomination, SwapDenomination::Wrapped);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_converts_wrapped_output_amount() {
+        let (ds, captured_request) = capture_ds(
+            ready_response(),
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
+        );
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"))
+                .await
+                .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.sell_token, USDC.to_string());
+        assert_eq!(request.buy_token, WT_MSTR.to_string());
+        assert_eq!(request.amount, "50");
+        assert_eq!(request.price_cap, "5");
+        assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_converts_wrapped_input_ratio_and_response() {
+        let (ds, captured_request) = capture_ds(
+            ready_response(),
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
+        );
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
+                .await
+                .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.sell_token, WT_MSTR.to_string());
+        assert_eq!(request.buy_token, WETH.to_string());
+        assert_eq!(request.amount, "100");
+        assert_eq!(request.price_cap, "1.25");
+        assert_eq!(result.estimated_input, "300");
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_converts_both_wrapped_sides() {
+        let (ds, captured_request) = capture_ds(
+            ready_response(),
+            HashMap::from([
+                (WT_MSTR, wrap_ratio(WT_MSTR, "2")),
+                (WT_COIN, wrap_ratio(WT_COIN, "4")),
+            ]),
+        );
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(WT_MSTR, WT_COIN, "100", "2.5"),
+        )
+        .await
+        .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.amount, "25");
+        assert_eq!(request.price_cap, "5");
+        assert_eq!(result.estimated_input, "300");
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_noop_for_non_wrapped_tokens() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WETH, "100.0", "2.50"))
+                .await
+                .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.amount, "100.0");
+        assert_eq!(request.price_cap, "2.50");
+        assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_keeps_approval_amount_wrapped() {
+        let (ds, captured_request) = capture_ds(
+            SwapCalldataResponse {
+                estimated_input: "1000".to_string(),
+                approvals: vec![Approval {
+                    token: WT_MSTR,
+                    spender: ORDERBOOK,
+                    amount: "1000".to_string(),
+                    symbol: "wtMSTR".to_string(),
+                    approval_data: Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]),
+                }],
+                ..approval_response()
+            },
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
+        );
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
+                .await
+                .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.price_cap, "1.25");
+        assert_eq!(result.estimated_input, "2000");
+        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+        assert_eq!(result.approvals.len(), 1);
+        assert_eq!(result.approvals[0].token, WT_MSTR);
+        assert_eq!(result.approvals[0].amount, "1000");
+        assert_eq!(result.approvals[0].symbol, "wtMSTR");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_invalid_output_amount_is_bad_request() {
+        let (ds, captured_request) = capture_ds(
+            ready_response(),
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
+        );
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(USDC, WT_MSTR, "not-a-number", "2.5"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::BadRequest(msg)) if msg == "invalid output_amount"));
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_invalid_maximum_io_ratio_is_bad_request() {
+        let (ds, captured_request) = capture_ds(
+            ready_response(),
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
+        );
+        let result = process_swap_calldata(
+            &ds,
+            unwrapped_calldata_request(USDC, WT_MSTR, "100", "not-a-number"),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(msg)) if msg == "invalid maximum_io_ratio")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_wrap_ratio_lookup_failure() {
+        let (ds, captured_request) = capture_ds_with_wrap_result(
+            ready_response(),
+            Err(ApiError::Internal("failed to read wrap ratios".into())),
+        );
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
+                .await;
+
+        assert!(
+            matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read wrap ratios")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_malformed_wrap_ratio_is_internal_error() {
+        let (ds, captured_request) = capture_ds(
+            ready_response(),
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "not-a-number"))]),
+        );
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"))
+                .await;
+
+        assert!(
+            matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read wrapped token ratio")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_unwrapped_invalid_estimated_input_is_internal_error() {
+        let (ds, captured_request) = capture_ds(
+            SwapCalldataResponse {
+                estimated_input: "not-a-number".to_string(),
+                ..ready_response()
+            },
+            HashMap::from([(WT_MSTR, wrap_ratio(WT_MSTR, "2"))]),
+        );
+        let result =
+            process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
+                .await;
+
+        let request = captured_take_orders_request(&captured_request);
+        assert_eq!(request.price_cap, "1.25");
+        assert!(
+            matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read estimated_input")
+        );
+    }
+
+    #[test]
+    fn test_swap_calldata_request_defaults_to_wrapped_denomination() {
+        let request: SwapCalldataRequest = serde_json::from_str(
+            r#"{"taker":"0x1111111111111111111111111111111111111111","inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100","maximumIoRatio":"2.5"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.denomination, SwapDenomination::Wrapped);
     }
 
     #[rocket::async_test]
@@ -236,5 +627,20 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_calldata_422_for_invalid_denomination() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let response = client
+            .post("/v1/swap/calldata")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new("Authorization", header))
+            .body(r#"{"taker":"0x1111111111111111111111111111111111111111","inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100","maximumIoRatio":"2.5","denomination":"invalid"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 }
