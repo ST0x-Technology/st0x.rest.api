@@ -16,6 +16,7 @@ mod registry_artifact;
 mod routes;
 mod telemetry;
 mod types;
+mod wrap_ratio;
 
 pub(crate) const CHAIN_ID: u32 = 8453;
 

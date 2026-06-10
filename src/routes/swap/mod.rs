@@ -4,6 +4,7 @@ mod quote;
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
 use crate::types::swap::SwapCalldataResponse;
+use crate::wrap_ratio::{read_wrap_ratio_values_for_addresses, WrapRatioValue};
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::orders::{
@@ -16,6 +17,7 @@ use rain_orderbook_common::take_orders::{
     build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate,
 };
 use rocket::Route;
+use std::collections::HashMap;
 
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
@@ -42,6 +44,13 @@ pub(crate) trait SwapDataSource: Send + Sync {
         &self,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError>;
+
+    async fn get_wrap_ratios_for_tokens(
+        &self,
+        _token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        Ok(HashMap::new())
+    }
 }
 
 pub(crate) struct RaindexSwapDataSource<'a> {
@@ -205,6 +214,23 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 "unexpected calldata result state".into(),
             ))
         }
+    }
+
+    async fn get_wrap_ratios_for_tokens(
+        &self,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .collect();
+
+        read_wrap_ratio_values_for_addresses(&tokens, token_addresses).await
     }
 }
 

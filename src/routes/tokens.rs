@@ -1,18 +1,19 @@
 use crate::auth::AuthenticatedKey;
-use crate::erc4626::batch_share_ratios;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
 use crate::types::common::ValidatedAddress;
+use crate::wrap_ratio::{
+    build_wrap_ratio_response, find_wrap_ratio_item, is_st0x_token, read_wrap_ratios_batch,
+    unwrapped_address, WrapRatioBatchInput, WrapRatioMetadata, WrapRatioResponse,
+};
 use alloy::primitives::Address;
-use rain_erc::erc4626::{Erc4626BatchItem, Erc4626BatchResponse, Erc4626BatchVault};
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -22,23 +23,6 @@ pub struct TokenResponse {
     token: TokenCfg,
     name: Option<String>,
     isin: Option<String>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WrapRatioResponse {
-    #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
-    share_address: Address,
-    #[schema(value_type = String, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
-    asset_address: Address,
-    #[schema(example = "1.0")]
-    assets_per_share: String,
-    #[schema(example = 123)]
-    block_number: u64,
-    #[schema(nullable = true, example = 456)]
-    block_timestamp: Option<u64>,
-    #[schema(example = "1717351200")]
-    captured_at: String,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -55,22 +39,6 @@ pub struct WrapRatioErrorResponse {
 pub struct WrapRatioBatchResponse {
     data: Vec<WrapRatioResponse>,
     errors: Vec<WrapRatioErrorResponse>,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum WrapRatioLookupError {
-    #[error("missing registry extensions.unwrappedAddress")]
-    MissingUnwrappedAddress,
-    #[error("invalid registry extensions.unwrappedAddress: {0}")]
-    InvalidUnwrappedAddress(String),
-    #[error("registry unwrappedAddress does not match ERC4626 asset")]
-    AssetMismatch,
-    #[error("failed to read ERC4626 ratio: {0}")]
-    BatchItem(String),
-    #[error("ERC4626 batch response did not include requested token")]
-    MissingBatchItem,
-    #[error("ERC4626 batch response included duplicate requested token")]
-    DuplicateBatchItem,
 }
 
 impl From<TokenCfg> for TokenResponse {
@@ -93,47 +61,6 @@ impl From<TokenCfg> for TokenResponse {
     }
 }
 
-impl WrapRatioLookupError {
-    fn into_api_error(self) -> ApiError {
-        match self {
-            WrapRatioLookupError::MissingUnwrappedAddress => {
-                ApiError::Internal("token is missing unwrappedAddress".into())
-            }
-            WrapRatioLookupError::InvalidUnwrappedAddress(_) => {
-                ApiError::Internal("token has invalid unwrappedAddress".into())
-            }
-            WrapRatioLookupError::AssetMismatch => {
-                ApiError::Internal("token unwrappedAddress does not match ERC4626 asset".into())
-            }
-            WrapRatioLookupError::BatchItem(_) => {
-                ApiError::Internal("failed to read ERC4626 ratio".into())
-            }
-            WrapRatioLookupError::MissingBatchItem | WrapRatioLookupError::DuplicateBatchItem => {
-                ApiError::Internal("failed to read ERC4626 ratio".into())
-            }
-        }
-    }
-
-    fn batch_message(&self) -> String {
-        match self {
-            WrapRatioLookupError::MissingUnwrappedAddress => {
-                "missing registry unwrappedAddress".to_string()
-            }
-            WrapRatioLookupError::InvalidUnwrappedAddress(_) => {
-                "invalid registry unwrappedAddress".to_string()
-            }
-            WrapRatioLookupError::AssetMismatch => {
-                "registry unwrappedAddress does not match ERC4626 asset".to_string()
-            }
-            WrapRatioLookupError::BatchItem(_)
-            | WrapRatioLookupError::MissingBatchItem
-            | WrapRatioLookupError::DuplicateBatchItem => {
-                "failed to read ERC4626 ratio".to_string()
-            }
-        }
-    }
-}
-
 fn sanitize_network(
     network: &rain_orderbook_app_settings::network::NetworkCfg,
 ) -> rain_orderbook_app_settings::network::NetworkCfg {
@@ -151,178 +78,6 @@ fn extract_extension_string(
         Some(Value::Null) | None => None,
         Some(value) => Some(value.to_string()),
     }
-}
-
-fn is_st0x_token(token: &TokenCfg) -> bool {
-    token
-        .extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get("category"))
-        .and_then(Value::as_str)
-        == Some("ST0x")
-}
-
-fn unwrapped_address(token: &TokenCfg) -> Result<Address, WrapRatioLookupError> {
-    let value = token
-        .extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get("unwrappedAddress"))
-        .ok_or(WrapRatioLookupError::MissingUnwrappedAddress)?;
-
-    let Some(address) = value.as_str() else {
-        return Err(WrapRatioLookupError::InvalidUnwrappedAddress(
-            value.to_string(),
-        ));
-    };
-
-    address
-        .parse()
-        .map_err(|_| WrapRatioLookupError::InvalidUnwrappedAddress(address.to_string()))
-}
-
-fn assets_per_share_display(assets_display: String) -> String {
-    if assets_display == "1" {
-        "1.0".to_string()
-    } else {
-        assets_display
-    }
-}
-
-struct WrapRatioBatchInput<'a> {
-    token: &'a TokenCfg,
-    expected_asset_address: Address,
-}
-
-struct WrapRatioMetadata {
-    block_number: u64,
-    block_timestamp: Option<u64>,
-    captured_at: String,
-}
-
-impl WrapRatioMetadata {
-    fn from_batch_response(response: &Erc4626BatchResponse) -> Self {
-        Self {
-            block_number: response.block_number,
-            block_timestamp: Some(response.block_timestamp),
-            captured_at: response.captured_at.to_string(),
-        }
-    }
-}
-
-struct WrapRatioBatchGroupResponse {
-    input_indices: Vec<usize>,
-    response: Erc4626BatchResponse,
-}
-
-fn find_wrap_ratio_item(
-    items: &[Erc4626BatchItem],
-    share_address: Address,
-) -> Result<&Erc4626BatchItem, WrapRatioLookupError> {
-    let mut matches = items
-        .iter()
-        .filter(|item| item.vault_address == share_address);
-    let Some(item) = matches.next() else {
-        tracing::error!(
-            share_address = %share_address,
-            "ERC4626 batch response did not include requested token"
-        );
-        return Err(WrapRatioLookupError::MissingBatchItem);
-    };
-
-    if matches.next().is_some() {
-        tracing::error!(
-            share_address = %share_address,
-            "ERC4626 batch response included duplicate requested token"
-        );
-        return Err(WrapRatioLookupError::DuplicateBatchItem);
-    }
-
-    Ok(item)
-}
-
-fn build_wrap_ratio_response(
-    item: &Erc4626BatchItem,
-    expected_asset_address: Address,
-    metadata: &WrapRatioMetadata,
-) -> Result<WrapRatioResponse, WrapRatioLookupError> {
-    if !item.success {
-        return Err(WrapRatioLookupError::BatchItem(
-            item.error
-                .clone()
-                .unwrap_or_else(|| "failed to read ERC4626 ratio".to_string()),
-        ));
-    }
-
-    let Some(ratio) = item.data.as_ref() else {
-        return Err(WrapRatioLookupError::BatchItem(
-            "missing ERC4626 batch item data".to_string(),
-        ));
-    };
-
-    if ratio.asset_address != expected_asset_address {
-        tracing::error!(
-            share_address = %item.vault_address,
-            expected_asset_address = %expected_asset_address,
-            erc4626_asset_address = %ratio.asset_address,
-            "registry unwrappedAddress does not match ERC4626 asset"
-        );
-        return Err(WrapRatioLookupError::AssetMismatch);
-    }
-
-    Ok(WrapRatioResponse {
-        share_address: item.vault_address,
-        asset_address: expected_asset_address,
-        assets_per_share: assets_per_share_display(ratio.assets_display.clone()),
-        block_number: metadata.block_number,
-        block_timestamp: metadata.block_timestamp,
-        captured_at: metadata.captured_at.clone(),
-    })
-}
-
-async fn read_wrap_ratios_batch(
-    inputs: &[WrapRatioBatchInput<'_>],
-) -> Result<Vec<WrapRatioBatchGroupResponse>, ApiError> {
-    let mut inputs_by_chain: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for (index, input) in inputs.iter().enumerate() {
-        inputs_by_chain
-            .entry(input.token.network.chain_id)
-            .or_default()
-            .push(index);
-    }
-
-    let mut responses = Vec::with_capacity(inputs_by_chain.len());
-    for (chain_id, input_indices) in inputs_by_chain {
-        let Some(first_input_index) = input_indices.first() else {
-            continue;
-        };
-        let Some(first_input) = inputs.get(*first_input_index) else {
-            continue;
-        };
-
-        let vaults = input_indices
-            .iter()
-            .filter_map(|index| inputs.get(*index))
-            .map(|input| Erc4626BatchVault::new(input.token.address))
-            .collect();
-
-        let response = batch_share_ratios(&first_input.token.network.rpcs, vaults, None)
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    chain_id,
-                    error = %error,
-                    "failed to read ERC4626 batch ratios"
-                );
-                ApiError::Internal("failed to read ERC4626 ratios".into())
-            })?;
-
-        responses.push(WrapRatioBatchGroupResponse {
-            input_indices,
-            response,
-        });
-    }
-
-    Ok(responses)
 }
 
 fn token_lookup_error(error: RaindexError) -> ApiError {
@@ -584,7 +339,6 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_wrap_ratio_item, WrapRatioLookupError};
     use crate::test_helpers::{
         basic_auth_header, mock_raindex_registry_url_with_settings_and_tokens, seed_api_key,
         TestClientBuilder,
@@ -596,7 +350,6 @@ mod tests {
     };
     use alloy::{hex::encode_prefixed, sol_types::SolCall};
     use rain_erc::erc4626::{
-        Erc4626BatchItem,
         IERC20Metadata::decimalsCall as erc20DecimalsCall,
         IERC4626::{assetCall, convertToAssetsCall, decimalsCall as erc4626DecimalsCall},
     };
@@ -609,15 +362,6 @@ mod tests {
     const T_SECOND: Address = address!("4444444444444444444444444444444444444444");
     const WT_BAD: Address = address!("1111111111111111111111111111111111111111");
     const T_BAD: Address = address!("2222222222222222222222222222222222222222");
-
-    fn batch_item(vault_address: Address) -> Erc4626BatchItem {
-        Erc4626BatchItem {
-            vault_address,
-            success: false,
-            data: None,
-            error: Some("failed".to_string()),
-        }
-    }
 
     fn success_result<C: SolCall>(value: &C::Return) -> Multicall3Result {
         Multicall3Result {
@@ -1208,20 +952,6 @@ using-tokens-from:
 
         assert_eq!(errors[0]["shareAddress"], format!("{WT_BAD:#x}"));
         assert_eq!(errors[0]["message"], "failed to read ERC4626 ratio");
-    }
-
-    #[test]
-    fn test_find_wrap_ratio_item_rejects_missing_and_duplicate_items() {
-        let items = vec![batch_item(WT_BAD)];
-        let missing = find_wrap_ratio_item(&items, WT_MSTR).expect_err("missing item");
-        assert!(matches!(missing, WrapRatioLookupError::MissingBatchItem));
-
-        let items = vec![batch_item(WT_MSTR), batch_item(WT_MSTR)];
-        let duplicate = find_wrap_ratio_item(&items, WT_MSTR).expect_err("duplicate item");
-        assert!(matches!(
-            duplicate,
-            WrapRatioLookupError::DuplicateBatchItem
-        ));
     }
 
     #[rocket::async_test]

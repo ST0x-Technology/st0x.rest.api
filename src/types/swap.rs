@@ -3,6 +3,14 @@ use alloy::primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SwapQuoteDenomination {
+    #[default]
+    Wrapped,
+    Unwrapped,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteRequest {
@@ -12,6 +20,9 @@ pub struct SwapQuoteRequest {
     pub output_token: Address,
     #[schema(example = "0.5")]
     pub output_amount: String,
+    #[serde(default)]
+    #[schema(example = "wrapped", default = "wrapped")]
+    pub denomination: SwapQuoteDenomination,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -23,6 +34,8 @@ pub struct SwapQuoteResponse {
     pub output_token: Address,
     #[schema(example = "0.5")]
     pub output_amount: String,
+    #[schema(example = "wrapped")]
+    pub denomination: SwapQuoteDenomination,
     #[schema(example = "0.5")]
     pub estimated_output: String,
     #[schema(example = "1250.75")]

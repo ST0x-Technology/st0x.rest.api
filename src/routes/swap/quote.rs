@@ -3,12 +3,13 @@ use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
+use crate::types::swap::{SwapQuoteDenomination, SwapQuoteRequest, SwapQuoteResponse};
+use alloy::primitives::Address;
 use rain_math_float::Float;
 use rain_orderbook_common::take_orders::simulate_buy_over_candidates;
 use rocket::serde::json::Json;
 use rocket::State;
-use std::ops::Div;
+use std::ops::{Div, Mul};
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -22,6 +23,7 @@ use tracing::Instrument;
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "No liquidity found", body = ApiErrorResponse),
+        (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
@@ -94,17 +96,27 @@ async fn process_swap_quote(
         return Err(ApiError::NotFound("no valid quotes available".into()));
     }
 
-    let blended_ratio = sim.total_input.div(sim.total_output).map_err(|e| {
+    let (estimated_input, estimated_output) = normalize_quote_amounts(
+        ds,
+        req.denomination,
+        req.input_token,
+        req.output_token,
+        sim.total_input,
+        sim.total_output,
+    )
+    .await?;
+
+    let blended_ratio = estimated_input.div(estimated_output).map_err(|e| {
         tracing::error!(error = %e, "failed to compute blended ratio");
         ApiError::Internal("failed to compute ratio".into())
     })?;
 
-    let formatted_output = sim.total_output.format().map_err(|e| {
+    let formatted_output = estimated_output.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated output");
         ApiError::Internal("failed to format estimated output".into())
     })?;
 
-    let formatted_input = sim.total_input.format().map_err(|e| {
+    let formatted_input = estimated_input.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated input");
         ApiError::Internal("failed to format estimated input".into())
     })?;
@@ -118,9 +130,67 @@ async fn process_swap_quote(
         input_token: req.input_token,
         output_token: req.output_token,
         output_amount: req.output_amount,
+        denomination: req.denomination,
         estimated_output: formatted_output,
         estimated_input: formatted_input,
         estimated_io_ratio: formatted_ratio,
+    })
+}
+
+async fn normalize_quote_amounts(
+    ds: &dyn SwapDataSource,
+    denomination: SwapQuoteDenomination,
+    input_token: Address,
+    output_token: Address,
+    estimated_input: Float,
+    estimated_output: Float,
+) -> Result<(Float, Float), ApiError> {
+    match denomination {
+        SwapQuoteDenomination::Wrapped => Ok((estimated_input, estimated_output)),
+        SwapQuoteDenomination::Unwrapped => {
+            tracing::info!("normalizing swap quote response to unwrapped denomination");
+            let ratios = ds
+                .get_wrap_ratios_for_tokens(&[input_token, output_token])
+                .await?;
+
+            let converted_input = match ratios.get(&input_token) {
+                Some(ratio) => {
+                    tracing::info!(
+                        share_address = %ratio.share_address,
+                        assets_per_share = %ratio.assets_per_share,
+                        "normalizing estimated input to unwrapped denomination"
+                    );
+                    convert_wrapped_amount(estimated_input, &ratio.assets_per_share)?
+                }
+                None => estimated_input,
+            };
+
+            let converted_output = match ratios.get(&output_token) {
+                Some(ratio) => {
+                    tracing::info!(
+                        share_address = %ratio.share_address,
+                        assets_per_share = %ratio.assets_per_share,
+                        "normalizing estimated output to unwrapped denomination"
+                    );
+                    convert_wrapped_amount(estimated_output, &ratio.assets_per_share)?
+                }
+                None => estimated_output,
+            };
+
+            Ok((converted_input, converted_output))
+        }
+    }
+}
+
+fn convert_wrapped_amount(amount: Float, assets_per_share: &str) -> Result<Float, ApiError> {
+    let ratio = Float::parse(assets_per_share.to_string()).map_err(|e| {
+        tracing::error!(error = %e, "failed to parse wrapped token ratio");
+        ApiError::Internal("failed to read wrapped token ratio".into())
+    })?;
+
+    amount.mul(ratio).map_err(|e| {
+        tracing::error!(error = %e, "failed to normalize wrapped token amount");
+        ApiError::Internal("failed to normalize wrapped token amount".into())
     })
 }
 
@@ -129,8 +199,11 @@ mod tests {
     use super::*;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
+    use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::address;
+    use async_trait::async_trait;
     use rocket::http::{ContentType, Status};
+    use std::collections::HashMap;
 
     const USDC: alloy::primitives::Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: alloy::primitives::Address = address!("4200000000000000000000000000000000000006");
@@ -140,6 +213,91 @@ mod tests {
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
+            denomination: SwapQuoteDenomination::Wrapped,
+        }
+    }
+
+    fn unwrapped_quote_request(
+        input_token: alloy::primitives::Address,
+        output_token: alloy::primitives::Address,
+        output_amount: &str,
+    ) -> SwapQuoteRequest {
+        SwapQuoteRequest {
+            input_token,
+            output_token,
+            output_amount: output_amount.to_string(),
+            denomination: SwapQuoteDenomination::Unwrapped,
+        }
+    }
+
+    fn wrap_ratio(
+        share_address: alloy::primitives::Address,
+        assets_per_share: &str,
+    ) -> WrapRatioValue {
+        WrapRatioValue {
+            share_address,
+            assets_per_share: assets_per_share.to_string(),
+        }
+    }
+
+    struct MockQuoteDataSource {
+        base: MockSwapDataSource,
+        wrap_ratios: HashMap<alloy::primitives::Address, WrapRatioValue>,
+    }
+
+    #[async_trait]
+    impl SwapDataSource for MockQuoteDataSource {
+        async fn validate_supported_tokens(
+            &self,
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<(), ApiError> {
+            self.base
+                .validate_supported_tokens(input_token, output_token)
+                .await
+        }
+
+        async fn get_orders_for_pair(
+            &self,
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<Vec<rain_orderbook_common::raindex_client::orders::RaindexOrder>, ApiError>
+        {
+            self.base
+                .get_orders_for_pair(input_token, output_token)
+                .await
+        }
+
+        async fn build_candidates_for_pair(
+            &self,
+            orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+            self.base
+                .build_candidates_for_pair(orders, input_token, output_token)
+                .await
+        }
+
+        async fn get_calldata(
+            &self,
+            request: rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest,
+        ) -> Result<crate::types::swap::SwapCalldataResponse, ApiError> {
+            self.base.get_calldata(request).await
+        }
+
+        async fn get_wrap_ratios_for_tokens(
+            &self,
+            token_addresses: &[alloy::primitives::Address],
+        ) -> Result<HashMap<alloy::primitives::Address, WrapRatioValue>, ApiError> {
+            Ok(token_addresses
+                .iter()
+                .filter_map(|address| {
+                    self.wrap_ratios
+                        .get(address)
+                        .map(|ratio| (*address, ratio.clone()))
+                })
+                .collect())
         }
     }
 
@@ -156,6 +314,7 @@ mod tests {
         assert_eq!(result.input_token, USDC);
         assert_eq!(result.output_token, WETH);
         assert_eq!(result.output_amount, "100");
+        assert_eq!(result.denomination, SwapQuoteDenomination::Wrapped);
         assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "150");
         assert_eq!(result.estimated_io_ratio, "1.5");
@@ -208,6 +367,105 @@ mod tests {
 
         assert_eq!(result.estimated_io_ratio, "1.5");
         assert_eq!(result.estimated_input, "15");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_unwrapped_converts_input_amount_and_ratio() {
+        let wt_mstr = address!("Ff05e1BD696900DC6A52cA35cA61bB1024eDA8e2");
+        let ds = MockQuoteDataSource {
+            base: MockSwapDataSource {
+                supported_tokens: Ok(()),
+                orders: Ok(vec![mock_order()]),
+                candidates: vec![mock_candidate("1000", "1.5")],
+                calldata_result: Err(ApiError::Internal("unused".into())),
+            },
+            wrap_ratios: HashMap::from([(wt_mstr, wrap_ratio(wt_mstr, "2"))]),
+        };
+
+        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, WETH, "100"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "100");
+        assert_eq!(result.estimated_input, "300");
+        assert_eq!(result.estimated_io_ratio, "3");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_unwrapped_converts_output_amount_and_ratio() {
+        let wt_mstr = address!("Ff05e1BD696900DC6A52cA35cA61bB1024eDA8e2");
+        let ds = MockQuoteDataSource {
+            base: MockSwapDataSource {
+                supported_tokens: Ok(()),
+                orders: Ok(vec![mock_order()]),
+                candidates: vec![mock_candidate("1000", "1.5")],
+                calldata_result: Err(ApiError::Internal("unused".into())),
+            },
+            wrap_ratios: HashMap::from([(wt_mstr, wrap_ratio(wt_mstr, "2"))]),
+        };
+
+        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, wt_mstr, "100"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "200");
+        assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.estimated_io_ratio, "0.75");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_unwrapped_converts_both_sides() {
+        let wt_mstr = address!("Ff05e1BD696900DC6A52cA35cA61bB1024eDA8e2");
+        let wt_coin = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
+        let ds = MockQuoteDataSource {
+            base: MockSwapDataSource {
+                supported_tokens: Ok(()),
+                orders: Ok(vec![mock_order()]),
+                candidates: vec![mock_candidate("1000", "1.5")],
+                calldata_result: Err(ApiError::Internal("unused".into())),
+            },
+            wrap_ratios: HashMap::from([
+                (wt_mstr, wrap_ratio(wt_mstr, "2")),
+                (wt_coin, wrap_ratio(wt_coin, "3")),
+            ]),
+        };
+
+        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, wt_coin, "100"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "300");
+        assert_eq!(result.estimated_input, "300");
+        assert_eq!(result.estimated_io_ratio, "1");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_unwrapped_noop_for_non_wrapped_tokens() {
+        let ds = MockQuoteDataSource {
+            base: MockSwapDataSource {
+                supported_tokens: Ok(()),
+                orders: Ok(vec![mock_order()]),
+                candidates: vec![mock_candidate("1000", "1.5")],
+                calldata_result: Err(ApiError::Internal("unused".into())),
+            },
+            wrap_ratios: HashMap::new(),
+        };
+
+        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, WETH, "100"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.denomination, SwapQuoteDenomination::Unwrapped);
+        assert_eq!(result.output_amount, "100");
+        assert_eq!(result.estimated_output, "100");
+        assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.estimated_io_ratio, "1.5");
     }
 
     #[rocket::async_test]
@@ -299,5 +557,20 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_quote_422_for_invalid_denomination() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let response = client
+            .post("/v1/swap/quote")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new("Authorization", header))
+            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100","denomination":"invalid"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 }

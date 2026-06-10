@@ -1,6 +1,7 @@
 # Swap Flow
 
-Swapping is a two-step process: get a **quote** to preview pricing, then get **calldata** to build the on-chain transaction.
+Swapping is a two-step process: get a **quote** to preview pricing, then get
+**calldata** to build the on-chain transaction.
 
 ## Step 1: Get a Quote
 
@@ -17,15 +18,17 @@ curl -X POST https://api.st0x.io/v1/swap/quote \
   -d '{
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
-    "outputAmount": "1.0"
+    "outputAmount": "1.0",
+    "denomination": "wrapped"
   }'
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `inputToken` | string | Address of the token you are selling |
-| `outputToken` | string | Address of the token you want to receive |
-| `outputAmount` | string | Desired output amount (human-readable, e.g. `"1.0"` for 1 WETH) |
+| Field          | Type   | Description                                                                                                                                                                   |
+| -------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `inputToken`   | string | Address of the token you are selling                                                                                                                                          |
+| `outputToken`  | string | Address of the token you want to receive                                                                                                                                      |
+| `outputAmount` | string | Desired output amount (human-readable, e.g. `"1.0"` for 1 WETH)                                                                                                               |
+| `denomination` | string | Optional. `"wrapped"` (default) returns orderbook-denominated values. `"unwrapped"` returns normalized display values for wrapped ST0x/ERC4626 tokens after quote simulation. |
 
 ### Response
 
@@ -34,19 +37,37 @@ curl -X POST https://api.st0x.io/v1/swap/quote \
   "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "outputToken": "0x4200000000000000000000000000000000000006",
   "outputAmount": "1.0",
+  "denomination": "wrapped",
   "estimatedOutput": "1.0",
   "estimatedInput": "2500.0",
   "estimatedIoRatio": "2500.0"
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `estimatedOutput` | string | Expected output amount |
-| `estimatedInput` | string | Expected input amount required |
-| `estimatedIoRatio` | string | Input-to-output ratio |
+| Field              | Type   | Description                                                                       |
+| ------------------ | ------ | --------------------------------------------------------------------------------- |
+| `denomination`     | string | Denomination used for `estimatedOutput`, `estimatedInput`, and `estimatedIoRatio` |
+| `estimatedOutput`  | string | Expected output amount                                                            |
+| `estimatedInput`   | string | Expected input amount required                                                    |
+| `estimatedIoRatio` | string | Input-to-output ratio                                                             |
 
-The quote reflects current orderbook state. Prices may change between quoting and execution.
+The quote reflects current orderbook state. Prices may change between quoting
+and execution.
+
+When `denomination` is omitted or set to `"wrapped"`, quote values use the
+wrapped/orderbook token units required by the swap endpoints. When
+`denomination` is `"unwrapped"`, the API still simulates against the
+wrapped/orderbook `inputToken` and `outputToken` addresses, then normalizes only
+the displayed `estimatedInput`, `estimatedOutput`, and `estimatedIoRatio` for
+wrapped ST0x/ERC4626 tokens. `outputAmount` remains in `outputToken` units and
+is not pre-converted.
+
+Do not pass unwrapped-normalized quote values into other endpoints unless those
+endpoints explicitly support `denomination=unwrapped` and you call them that
+way. In particular, `/v1/swap/calldata` currently expects `outputAmount` and
+`maximumIoRatio` in wrapped/orderbook-denominated units, so using an
+unwrapped-normalized `estimatedIoRatio` as calldata slippage input will produce
+different calculations.
 
 ## Step 2: Get Calldata
 
@@ -69,21 +90,24 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
   }'
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `taker` | string | Your wallet address that will execute the transaction |
-| `inputToken` | string | Address of the token you are selling |
-| `outputToken` | string | Address of the token you want to receive |
-| `outputAmount` | string | Desired output amount (human-readable) |
-| `maximumIoRatio` | string | Maximum acceptable IO ratio (slippage protection) |
+| Field            | Type   | Description                                           |
+| ---------------- | ------ | ----------------------------------------------------- |
+| `taker`          | string | Your wallet address that will execute the transaction |
+| `inputToken`     | string | Address of the token you are selling                  |
+| `outputToken`    | string | Address of the token you want to receive              |
+| `outputAmount`   | string | Desired output amount (human-readable)                |
+| `maximumIoRatio` | string | Maximum acceptable IO ratio (slippage protection)     |
 
-Set `maximumIoRatio` slightly above the `estimatedIoRatio` from the quote to allow for price movement.
+Set `maximumIoRatio` slightly above the `estimatedIoRatio` from the quote to
+allow for price movement.
 
 ### Response
 
-The response always includes all fields, but the content depends on whether your `taker` address has sufficient token approvals.
+The response always includes all fields, but the content depends on whether your
+`taker` address has sufficient token approvals.
 
-**If approvals are needed**, `data` is empty and `approvals` contains the required transactions:
+**If approvals are needed**, `data` is empty and `approvals` contains the
+required transactions:
 
 ```json
 {
@@ -103,7 +127,8 @@ The response always includes all fields, but the content depends on whether your
 }
 ```
 
-**If approvals are already in place**, `approvals` is empty and `data` contains the swap calldata:
+**If approvals are already in place**, `approvals` is empty and `data` contains
+the swap calldata:
 
 ```json
 {
@@ -115,25 +140,28 @@ The response always includes all fields, but the content depends on whether your
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `to` | string | Contract address to send the transaction to |
-| `data` | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed |
-| `value` | string | Native token value to send (usually `"0x0"`) |
-| `estimatedInput` | string | Expected input amount |
-| `approvals` | array | Token approvals needed — if non-empty, approve first then call this endpoint again |
+| Field            | Type   | Description                                                                        |
+| ---------------- | ------ | ---------------------------------------------------------------------------------- |
+| `to`             | string | Contract address to send the transaction to                                        |
+| `data`           | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed            |
+| `value`          | string | Native token value to send (usually `"0x0"`)                                       |
+| `estimatedInput` | string | Expected input amount                                                              |
+| `approvals`      | array  | Token approvals needed — if non-empty, approve first then call this endpoint again |
 
 ## Step 3: Handle Approvals
 
 If the `approvals` array is **not empty**, send the approval transactions first:
 
-1. For each approval, send a transaction to the `token` address with `approvalData` as calldata
+1. For each approval, send a transaction to the `token` address with
+   `approvalData` as calldata
 2. Wait for confirmation
-3. **Call the calldata endpoint again** — with approvals in place, the response will now contain the swap calldata
+3. **Call the calldata endpoint again** — with approvals in place, the response
+   will now contain the swap calldata
 
 ## Step 4: Execute the Swap
 
-Once you receive a response with an empty `approvals` array, send the main transaction using `to`, `data`, and `value`.
+Once you receive a response with an empty `approvals` array, send the main
+transaction using `to`, `data`, and `value`.
 
 ## Complete Example
 
