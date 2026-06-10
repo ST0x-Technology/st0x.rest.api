@@ -4937,6 +4937,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rain-erc"
+version = "0.1.2"
+source = "git+https://github.com/rainlanguage/rain.erc?rev=755b0bf5cad18a2cc43a57be52298b6dadd96751#755b0bf5cad18a2cc43a57be52298b6dadd96751"
+dependencies = [
+ "alloy",
+ "getrandom 0.2.16",
+ "getrandom 0.3.3",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rain-error-decoding"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5045,7 +5057,7 @@ dependencies = [
  "inflate",
  "itertools 0.10.5",
  "once_cell",
- "rain-erc",
+ "rain-erc 0.1.1",
  "rain-metaboard-subgraph",
  "rain-metadata-bindings",
  "regex",
@@ -6976,6 +6988,7 @@ dependencies = [
  "clap",
  "futures",
  "moka",
+ "rain-erc 0.1.2",
  "rain-math-float",
  "raindex_app_settings",
  "raindex_bindings",
@@ -6997,6 +7010,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber 0.3.19",
  "tracing-test",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -8221,7 +8235,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

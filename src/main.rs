@@ -8,6 +8,7 @@ mod catchers;
 mod cli;
 mod config;
 mod db;
+mod erc4626;
 mod error;
 mod fairings;
 mod raindex;
@@ -78,6 +79,8 @@ enum StartupRegistryError {
         routes::health::get_health,
         routes::health::get_health_detailed,
         routes::tokens::get_tokens,
+        routes::tokens::get_wrap_ratios,
+        routes::tokens::get_wrap_ratio_by_address,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
         routes::order::post_order_dca,
