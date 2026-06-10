@@ -3,9 +3,13 @@ mod denomination;
 mod quote;
 
 use crate::cache::RouteResponseCaches;
+use crate::db::DbPool;
 use crate::error::ApiError;
 use crate::types::swap::{SwapCalldataResponse, SwapDenomination};
-use crate::wrap_ratio::{read_wrap_ratio_values_for_addresses, WrapRatioValue};
+use crate::wrap_ratio::{
+    persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
+    wrap_ratio_values_from_responses, WrapRatioValue,
+};
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::orders::{
@@ -57,6 +61,7 @@ pub(crate) trait SwapDataSource: Send + Sync {
 pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
+    pub pool: &'a DbPool,
 }
 
 fn swap_candidates_cache_key(
@@ -233,7 +238,9 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             .into_values()
             .collect();
 
-        read_wrap_ratio_values_for_addresses(&tokens, token_addresses).await
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
     }
 }
 

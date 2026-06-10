@@ -1,11 +1,13 @@
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::raindex::SharedRaindexProvider;
 use crate::types::common::ValidatedAddress;
 use crate::wrap_ratio::{
-    build_wrap_ratio_response, find_wrap_ratio_item, is_st0x_token, read_wrap_ratios_batch,
-    unwrapped_address, WrapRatioBatchInput, WrapRatioMetadata, WrapRatioResponse,
+    build_wrap_ratio_response, find_wrap_ratio_item, is_st0x_token,
+    persist_wrap_ratio_snapshots_best_effort, read_wrap_ratios_batch, unwrapped_address,
+    WrapRatioBatchInput, WrapRatioMetadata, WrapRatioResponse,
 };
 use alloy::primitives::Address;
 use rain_orderbook_app_settings::token::TokenCfg;
@@ -155,6 +157,7 @@ pub async fn get_wrap_ratios(
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
+    pool: &State<DbPool>,
 ) -> Result<Json<WrapRatioBatchResponse>, ApiError> {
     async move {
         tracing::info!("request received");
@@ -226,6 +229,8 @@ pub async fn get_wrap_ratios(
             }
         }
 
+        persist_wrap_ratio_snapshots_best_effort(pool.inner(), &data).await;
+
         tracing::info!(
             data_count = data.len(),
             error_count = errors.len(),
@@ -260,6 +265,7 @@ pub async fn get_wrap_ratio_by_address(
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
+    pool: &State<DbPool>,
     address: ValidatedAddress,
 ) -> Result<Json<WrapRatioResponse>, ApiError> {
     async move {
@@ -325,6 +331,9 @@ pub async fn get_wrap_ratio_by_address(
                 error.into_api_error()
             },
         )?;
+
+        persist_wrap_ratio_snapshots_best_effort(pool.inner(), std::slice::from_ref(&response))
+            .await;
 
         tracing::info!(share_address = %token.address, "returning wrapped token ratio");
         Ok(Json(response))
@@ -949,6 +958,25 @@ using-tokens-from:
         assert_eq!(data[0]["blockNumber"], 123);
         assert_eq!(data[0]["blockTimestamp"], 456);
         assert!(data[0]["capturedAt"].as_str().is_some());
+
+        let pool = client
+            .rocket()
+            .state::<crate::db::DbPool>()
+            .expect("pool in state");
+        let persisted = sqlx::query_as::<_, (String, String, String, i64, Option<i64>)>(
+            "SELECT share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp \
+             FROM wrapped_exchange_rate_snapshots \
+             WHERE share_token_address = ?",
+        )
+        .bind(format!("{WT_MSTR:#x}"))
+        .fetch_one(pool)
+        .await
+        .expect("read persisted snapshot");
+        assert_eq!(persisted.0, format!("{WT_MSTR:#x}"));
+        assert_eq!(persisted.1, format!("{T_MSTR:#x}"));
+        assert_eq!(persisted.2, "1.0");
+        assert_eq!(persisted.3, 123);
+        assert_eq!(persisted.4, Some(456));
 
         assert_eq!(errors[0]["shareAddress"], format!("{WT_BAD:#x}"));
         assert_eq!(errors[0]["message"], "failed to read ERC4626 ratio");

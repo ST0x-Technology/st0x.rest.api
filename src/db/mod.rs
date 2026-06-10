@@ -1,6 +1,7 @@
 mod migrate;
 mod pool;
 pub(crate) mod registry_history;
+pub(crate) mod wrapped_exchange_rate_history;
 
 pub type DbPool = sqlx::Pool<sqlx::Sqlite>;
 

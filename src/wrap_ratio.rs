@@ -1,3 +1,7 @@
+use crate::db::wrapped_exchange_rate_history::{
+    insert_wrapped_exchange_rate_snapshots, NewWrappedExchangeRateSnapshot,
+};
+use crate::db::DbPool;
 use crate::erc4626::batch_share_ratios;
 use crate::error::ApiError;
 use alloy::primitives::Address;
@@ -13,15 +17,15 @@ pub struct WrapRatioResponse {
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     pub(crate) share_address: Address,
     #[schema(value_type = String, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
-    asset_address: Address,
+    pub(crate) asset_address: Address,
     #[schema(example = "1.0")]
     pub(crate) assets_per_share: String,
     #[schema(example = 123)]
-    block_number: u64,
+    pub(crate) block_number: u64,
     #[schema(nullable = true, example = 456)]
-    block_timestamp: Option<u64>,
+    pub(crate) block_timestamp: Option<u64>,
     #[schema(example = "1717351200")]
-    captured_at: String,
+    pub(crate) captured_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -259,10 +263,10 @@ pub(crate) async fn read_wrap_ratios_batch(
     Ok(responses)
 }
 
-pub(crate) async fn read_wrap_ratio_values_for_addresses(
+pub(crate) async fn read_wrap_ratio_responses_for_addresses(
     tokens: &[TokenCfg],
     share_addresses: &[Address],
-) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+) -> Result<Vec<WrapRatioResponse>, ApiError> {
     let requested: HashSet<Address> = share_addresses.iter().copied().collect();
     let mut inputs = Vec::new();
 
@@ -284,7 +288,7 @@ pub(crate) async fn read_wrap_ratio_values_for_addresses(
         });
     }
 
-    let mut ratios = HashMap::new();
+    let mut responses = Vec::new();
     for group in read_wrap_ratios_batch(&inputs).await? {
         let metadata = WrapRatioMetadata::from_batch_response(&group.response);
 
@@ -314,17 +318,86 @@ pub(crate) async fn read_wrap_ratio_values_for_addresses(
                     error.into_api_error()
                 })?;
 
-            ratios.insert(
+            responses.push(row);
+        }
+    }
+
+    Ok(responses)
+}
+
+pub(crate) fn wrap_ratio_values_from_responses(
+    responses: Vec<WrapRatioResponse>,
+) -> HashMap<Address, WrapRatioValue> {
+    responses
+        .into_iter()
+        .map(|row| {
+            (
                 row.share_address,
                 WrapRatioValue {
                     share_address: row.share_address,
                     assets_per_share: row.assets_per_share,
                 },
-            );
+            )
+        })
+        .collect()
+}
+
+pub(crate) async fn persist_wrap_ratio_snapshots_best_effort(
+    pool: &DbPool,
+    responses: &[WrapRatioResponse],
+) {
+    if responses.is_empty() {
+        return;
+    }
+
+    let mut snapshots = Vec::with_capacity(responses.len());
+    for response in responses {
+        match wrap_ratio_snapshot_from_response(response) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => tracing::error!(
+                error = %error,
+                share_address = %response.share_address,
+                block_number = response.block_number,
+                block_timestamp = ?response.block_timestamp,
+                "failed to prepare wrapped exchange rate snapshot"
+            ),
         }
     }
 
-    Ok(ratios)
+    if snapshots.is_empty() {
+        return;
+    }
+
+    match insert_wrapped_exchange_rate_snapshots(pool, &snapshots).await {
+        Ok(inserted_count) => tracing::info!(
+            observed_count = responses.len(),
+            persisted_count = snapshots.len(),
+            inserted_count,
+            "persisted wrapped exchange rate snapshots"
+        ),
+        Err(error) => tracing::error!(
+            error = %error,
+            observed_count = responses.len(),
+            "failed to persist wrapped exchange rate snapshots"
+        ),
+    }
+}
+
+fn wrap_ratio_snapshot_from_response(
+    response: &WrapRatioResponse,
+) -> Result<NewWrappedExchangeRateSnapshot, std::num::TryFromIntError> {
+    Ok(NewWrappedExchangeRateSnapshot {
+        share_token_address: normalized_address(response.share_address),
+        asset_token_address: normalized_address(response.asset_address),
+        assets_per_share: response.assets_per_share.clone(),
+        block_number: i64::try_from(response.block_number)?,
+        block_timestamp: response.block_timestamp.map(i64::try_from).transpose()?,
+        captured_at: response.captured_at.clone(),
+    })
+}
+
+fn normalized_address(address: Address) -> String {
+    format!("{address:#x}").to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -494,5 +567,28 @@ mod tests {
         assert!(
             matches!(api_error, ApiError::Internal(message) if message == "token is missing unwrappedAddress")
         );
+    }
+
+    #[test]
+    fn test_wrap_ratio_snapshot_from_response_normalizes_addresses() {
+        let item = successful_batch_item(WT_MSTR, T_MSTR);
+        let response =
+            build_wrap_ratio_response(&item, T_MSTR, &metadata()).expect("ratio should build");
+
+        let snapshot =
+            wrap_ratio_snapshot_from_response(&response).expect("snapshot should convert");
+
+        assert_eq!(
+            snapshot.share_token_address,
+            "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
+        );
+        assert_eq!(
+            snapshot.asset_token_address,
+            "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe"
+        );
+        assert_eq!(snapshot.assets_per_share, "1.0");
+        assert_eq!(snapshot.block_number, 123);
+        assert_eq!(snapshot.block_timestamp, Some(456));
+        assert_eq!(snapshot.captured_at, "2026-06-02T13:00:00Z");
     }
 }
