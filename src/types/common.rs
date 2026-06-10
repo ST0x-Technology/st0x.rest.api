@@ -1,6 +1,17 @@
 use alloy::primitives::{Address, Bytes, FixedBytes};
+use rocket::form::FromFormField;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, FromFormField, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Denomination {
+    #[default]
+    Wrapped,
+    Unwrapped,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

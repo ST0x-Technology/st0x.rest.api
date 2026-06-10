@@ -4,8 +4,13 @@ mod get_by_tx;
 
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
-use crate::types::common::TokenRef;
+use crate::types::common::{Denomination, TokenRef};
 use crate::types::orders::{OrderSummary, OrdersListResponse, OrdersPagination};
+use crate::wrap_ratio::{
+    persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
+    wrap_ratio_values_from_responses, WrapRatioValue,
+};
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use futures::{future::join_all, stream, StreamExt};
 use rain_orderbook_common::raindex_client::order_quotes::{
@@ -15,6 +20,7 @@ use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrd
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
 pub(crate) const MAX_PAGE_SIZE: u16 = 50;
@@ -51,11 +57,19 @@ pub(crate) trait OrdersListDataSource: Send + Sync {
     async fn get_order_quotes_batch(&self, orders: &[RaindexOrder]) -> Vec<OrderQuoteResult> {
         fetch_order_quotes_grouped(self, orders).await
     }
+
+    async fn get_wrap_ratios_for_tokens(
+        &self,
+        _token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        Ok(HashMap::new())
+    }
 }
 
 pub(crate) struct RaindexOrdersListDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
+    pub pool: &'a crate::db::DbPool,
 }
 
 pub(crate) fn order_quote_cache_key(order: &RaindexOrder) -> String {
@@ -300,17 +314,58 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
             .map(|quotes| quotes.unwrap_or_default())
             .collect())
     }
+
+    async fn get_wrap_ratios_for_tokens(
+        &self,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .collect();
+
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
+    }
 }
 
 pub(crate) fn build_order_summary(
     order: &RaindexOrder,
     io_ratio: &str,
+    denomination: Denomination,
+    wrap_ratios: &HashMap<Address, WrapRatioValue>,
 ) -> Result<OrderSummary, ApiError> {
     let (input, output) = super::resolve_io_vaults(order)?;
 
     let input_token_info = input.token();
     let output_token_info = output.token();
     let created_at: u64 = order.timestamp_added().try_into().unwrap_or(0);
+
+    let output_vault_balance = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_amount_for_token(
+            output.formatted_balance(),
+            output_token_info.address(),
+            wrap_ratios,
+        )?
+    } else {
+        output.formatted_balance()
+    };
+    let io_ratio = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_io_ratio(
+            io_ratio.to_string(),
+            input_token_info.address(),
+            output_token_info.address(),
+            wrap_ratios,
+        )?
+    } else {
+        io_ratio.to_string()
+    };
 
     Ok(OrderSummary {
         order_hash: order.order_hash(),
@@ -326,8 +381,8 @@ pub(crate) fn build_order_summary(
             symbol: output_token_info.symbol().unwrap_or_default(),
             decimals: output_token_info.decimals(),
         },
-        output_vault_balance: output.formatted_balance(),
-        io_ratio: io_ratio.to_string(),
+        output_vault_balance,
+        io_ratio,
         created_at,
         orderbook_id: order.raindex(),
     })
@@ -376,6 +431,8 @@ pub(crate) fn build_orders_list_response(
     page: u32,
     page_size: u32,
     quote_results: Vec<OrderQuoteResult>,
+    denomination: Denomination,
+    wrap_ratios: &HashMap<Address, WrapRatioValue>,
 ) -> Result<OrdersListResponse, ApiError> {
     if quote_results.len() != orders.len() {
         tracing::error!(
@@ -389,13 +446,39 @@ pub(crate) fn build_orders_list_response(
     let mut summaries = Vec::with_capacity(orders.len());
     for (order, quotes_result) in orders.iter().zip(quote_results) {
         let io_ratio = quote_result_to_io_ratio(order, quotes_result);
-        summaries.push(build_order_summary(order, &io_ratio)?);
+        summaries.push(build_order_summary(
+            order,
+            &io_ratio,
+            denomination,
+            wrap_ratios,
+        )?);
     }
 
     Ok(OrdersListResponse {
         orders: summaries,
         pagination: build_pagination(total_count, page, page_size),
     })
+}
+
+pub(crate) async fn current_wrap_ratios_for_orders(
+    ds: &dyn OrdersListDataSource,
+    denomination: Denomination,
+    orders: &[RaindexOrder],
+) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+    if denomination == Denomination::Wrapped || orders.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut token_addresses = Vec::new();
+    for order in orders {
+        let (input, output) = super::resolve_io_vaults(order)?;
+        token_addresses.push(input.token().address());
+        token_addresses.push(output.token().address());
+    }
+    token_addresses.sort_unstable();
+    token_addresses.dedup();
+
+    ds.get_wrap_ratios_for_tokens(&token_addresses).await
 }
 
 pub use get_by_owner::*;
@@ -454,6 +537,8 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::*;
     use crate::routes::order::test_fixtures::{mock_quote, order_json};
+    use crate::wrap_ratio::WrapRatioValue;
+    use alloy::primitives::address;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -529,6 +614,13 @@ mod tests {
 
     fn order_hash_key(order: &RaindexOrder) -> String {
         format!("{:?}", order.order_hash())
+    }
+
+    fn wrap_ratio(share_address: Address, assets_per_share: &str) -> WrapRatioValue {
+        WrapRatioValue {
+            share_address,
+            assets_per_share: assets_per_share.to_string(),
+        }
     }
 
     #[rocket::async_test]
@@ -655,8 +747,35 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000101",
         )];
 
-        let result = build_orders_list_response(&orders, 1, 1, 20, vec![]);
+        let result = build_orders_list_response(
+            &orders,
+            1,
+            1,
+            20,
+            vec![],
+            Denomination::Wrapped,
+            &HashMap::new(),
+        );
 
         assert!(matches!(result, Err(ApiError::Internal(_))));
+    }
+
+    #[test]
+    fn test_build_order_summary_converts_unwrapped_output_values() {
+        let wrapped_output = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
+        let mut value = order_json();
+        value["outputs"][0]["formattedBalance"] = json!("2");
+        value["outputs"][0]["token"]["address"] = json!(format!("{wrapped_output:#x}"));
+        value["outputs"][0]["token"]["id"] = json!(format!("{wrapped_output:#x}"));
+        value["outputs"][0]["token"]["symbol"] = json!("wtMSTR");
+        let order: RaindexOrder =
+            serde_json::from_value(value).expect("deserialize wrapped-output order");
+        let ratios = HashMap::from([(wrapped_output, wrap_ratio(wrapped_output, "3"))]);
+
+        let summary =
+            build_order_summary(&order, "9", Denomination::Unwrapped, &ratios).expect("summary");
+
+        assert_eq!(summary.output_vault_balance, "6");
+        assert_eq!(summary.io_ratio, "3");
     }
 }

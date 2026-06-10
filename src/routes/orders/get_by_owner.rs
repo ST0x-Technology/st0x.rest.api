@@ -1,12 +1,13 @@
 use super::{
-    build_orders_list_response, OrdersListDataSource, RaindexOrdersListDataSource,
-    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    build_orders_list_response, current_wrap_ratios_for_orders, OrdersListDataSource,
+    RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::types::common::ValidatedAddress;
+use crate::types::common::{Denomination, ValidatedAddress};
 use crate::types::orders::{OrdersListResponse, OrdersPaginationParams};
 use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
@@ -19,6 +20,7 @@ pub(crate) async fn process_get_orders_by_owner(
     address: Address,
     page: Option<u16>,
     page_size: Option<u16>,
+    denomination: Denomination,
 ) -> Result<OrdersListResponse, ApiError> {
     let filters = GetOrdersFilters {
         owners: vec![address],
@@ -40,6 +42,7 @@ pub(crate) async fn process_get_orders_by_owner(
         "fetching batched quotes for orders by owner"
     );
     let quote_results = ds.get_order_quotes_batch(&orders).await;
+    let wrap_ratios = current_wrap_ratios_for_orders(ds, denomination, &orders).await?;
 
     build_orders_list_response(
         &orders,
@@ -47,6 +50,8 @@ pub(crate) async fn process_get_orders_by_owner(
         page_num.into(),
         effective_page_size.into(),
         quote_results,
+        denomination,
+        &wrap_ratios,
     )
 }
 
@@ -68,12 +73,14 @@ pub(crate) async fn process_get_orders_by_owner(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/owner/<address>?<params..>")]
 pub async fn get_orders_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: OrdersPaginationParams,
@@ -83,12 +90,15 @@ pub async fn get_orders_by_address(
         let addr = address.0;
         let page = params.page;
         let page_size = params.page_size;
+        let denomination = params.denomination.unwrap_or_default();
         let raindex = shared_raindex.read().await;
         let ds = RaindexOrdersListDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
+            pool: pool.inner(),
         };
-        let response = process_get_orders_by_owner(&ds, addr, page, page_size).await?;
+        let response =
+            process_get_orders_by_owner(&ds, addr, page, page_size, denomination).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -115,7 +125,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None)
+        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
             .await
             .unwrap();
 
@@ -139,7 +149,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None)
+        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
             .await
             .unwrap();
 
@@ -158,7 +168,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None)
+        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
             .await
             .unwrap();
 
@@ -175,7 +185,8 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None).await;
+        let result =
+            process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -189,7 +200,7 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None)
+        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
             .await
             .unwrap();
 

@@ -8,6 +8,7 @@ mod catchers;
 mod cli;
 mod config;
 mod db;
+mod denomination;
 mod erc4626;
 mod error;
 mod fairings;

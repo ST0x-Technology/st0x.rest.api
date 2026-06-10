@@ -1,4 +1,4 @@
-use crate::types::common::TokenRef;
+use crate::types::common::{Denomination, TokenRef};
 use alloy::primitives::{Address, Bytes, FixedBytes};
 use rocket::form::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,9 @@ pub struct OrdersPaginationParams {
     #[field(name = "pageSize")]
     #[param(example = 20)]
     pub page_size: Option<u16>,
+    #[field(name = "denomination")]
+    #[param(example = "wrapped")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromFormField, ToSchema)]
@@ -35,6 +38,9 @@ pub struct OrdersByTokenParams {
     #[field(name = "pageSize")]
     #[param(example = 20)]
     pub page_size: Option<u16>,
+    #[field(name = "denomination")]
+    #[param(example = "wrapped")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

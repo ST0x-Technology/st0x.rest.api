@@ -2,7 +2,10 @@
 
 Orders are persistent on-chain strategies that execute over time.
 
-The order endpoints return transaction calldata — the API does not execute transactions for you. You receive `to`, `data`, and `value` fields (plus any required token `approvals`) and submit those transactions on-chain yourself, the same pattern as the [Swap Flow](./swap-flow.md).
+The order endpoints return transaction calldata — the API does not execute
+transactions for you. You receive `to`, `data`, and `value` fields (plus any
+required token `approvals`) and submit those transactions on-chain yourself, the
+same pattern as the [Swap Flow](./swap-flow.md).
 
 ## Get DCA Order Calldata
 
@@ -10,7 +13,8 @@ The order endpoints return transaction calldata — the API does not execute tra
 POST /v1/order/dca
 ```
 
-Returns calldata to deploy a DCA order that periodically buys a token at a set interval, with price bounds.
+Returns calldata to deploy a DCA order that periodically buys a token at a set
+interval, with price bounds.
 
 ### Request
 
@@ -29,21 +33,22 @@ curl -X POST https://api.st0x.io/v1/order/dca \
   }'
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `inputToken` | string | Token to spend |
-| `outputToken` | string | Token to receive |
-| `budgetAmount` | string | Total budget in human-readable units (e.g. `"10000"` for 10,000 USDC) |
-| `period` | number | Time between executions |
-| `periodUnit` | string | `"days"`, `"hours"`, or `"minutes"` |
-| `startIo` | string | Starting IO ratio |
-| `floorIo` | string | Minimum acceptable IO ratio |
-| `inputVaultId` | string (optional) | Existing vault ID for input token |
-| `outputVaultId` | string (optional) | Existing vault ID for output token |
+| Field           | Type              | Description                                                           |
+| --------------- | ----------------- | --------------------------------------------------------------------- |
+| `inputToken`    | string            | Token to spend                                                        |
+| `outputToken`   | string            | Token to receive                                                      |
+| `budgetAmount`  | string            | Total budget in human-readable units (e.g. `"10000"` for 10,000 USDC) |
+| `period`        | number            | Time between executions                                               |
+| `periodUnit`    | string            | `"days"`, `"hours"`, or `"minutes"`                                   |
+| `startIo`       | string            | Starting IO ratio                                                     |
+| `floorIo`       | string            | Minimum acceptable IO ratio                                           |
+| `inputVaultId`  | string (optional) | Existing vault ID for input token                                     |
+| `outputVaultId` | string (optional) | Existing vault ID for output token                                    |
 
 ### Response
 
-The response always includes all fields. If approvals are needed, `data` is empty and `approvals` contains the required transactions:
+The response always includes all fields. If approvals are needed, `data` is
+empty and `approvals` contains the required transactions:
 
 ```json
 {
@@ -62,7 +67,9 @@ The response always includes all fields. If approvals are needed, `data` is empt
 }
 ```
 
-Send each approval transaction on-chain, then call the endpoint again. Once approvals are in place, `approvals` is empty and `data` contains the deployment calldata:
+Send each approval transaction on-chain, then call the endpoint again. Once
+approvals are in place, `approvals` is empty and `data` contains the deployment
+calldata:
 
 ```json
 {
@@ -87,6 +94,14 @@ Retrieve the full state of an order including vault balances and trade history.
 curl https://api.st0x.io/v1/order/0xabc123... \
   -H "Authorization: Basic <credentials>"
 ```
+
+| Parameter      | Type                     | Default   | Description                                                                                                               |
+| -------------- | ------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances, trade amounts, and IO ratios to unwrapped values |
+
+When `denomination=unwrapped`, order fields are normalized using the current
+wrapped exchange rate. Omit the parameter to keep the default wrapped-token
+response.
 
 ### Response
 
@@ -143,10 +158,19 @@ curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `page` | number | 1 | Page number |
-| `pageSize` | number | 20 | Results per page |
+| Parameter      | Type                     | Default   | Description                                                                                               |
+| -------------- | ------------------------ | --------- | --------------------------------------------------------------------------------------------------------- |
+| `page`         | number                   | 1         | Page number                                                                                               |
+| `pageSize`     | number                   | 20        | Results per page                                                                                          |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances and IO ratios to unwrapped values |
+
+Use `denomination=unwrapped` to view order balances and IO ratios normalized to
+the current unwrapped asset value:
+
+```bash
+curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10&denomination=unwrapped" \
+  -H "Authorization: Basic <credentials>"
+```
 
 ### Response
 
@@ -253,4 +277,5 @@ curl -X POST https://api.st0x.io/v1/order/cancel \
 }
 ```
 
-Execute each transaction in the `transactions` array sequentially. The `summary` shows what tokens you will receive back.
+Execute each transaction in the `transactions` array sequentially. The `summary`
+shows what tokens you will receive back.

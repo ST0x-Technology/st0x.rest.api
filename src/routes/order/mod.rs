@@ -5,7 +5,11 @@ mod get_order;
 
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
-use alloy::primitives::{Bytes, B256};
+use crate::wrap_ratio::{
+    persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
+    wrap_ratio_values_from_responses, WrapRatioValue,
+};
+use alloy::primitives::{Address, Bytes, B256};
 use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
 use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
@@ -15,6 +19,7 @@ use rain_orderbook_common::raindex_client::trades::{
 use rain_orderbook_common::raindex_client::types::TimeFilter;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
+use std::collections::HashMap;
 
 #[async_trait]
 pub(crate) trait OrderDataSource: Send + Sync {
@@ -25,11 +30,18 @@ pub(crate) trait OrderDataSource: Send + Sync {
     ) -> Result<Vec<RaindexOrderQuote>, ApiError>;
     async fn get_order_trades(&self, order: &RaindexOrder) -> Result<Vec<RaindexTrade>, ApiError>;
     async fn get_remove_calldata(&self, order: &RaindexOrder) -> Result<Bytes, ApiError>;
+    async fn get_wrap_ratios_for_tokens(
+        &self,
+        _token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        Ok(HashMap::new())
+    }
 }
 
 pub(crate) struct RaindexOrderDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
+    pub pool: Option<&'a crate::db::DbPool>,
 }
 
 #[async_trait]
@@ -100,6 +112,28 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
             tracing::error!(error = %e, "failed to get remove calldata");
             ApiError::Internal("failed to get remove calldata".into())
         })
+    }
+
+    async fn get_wrap_ratios_for_tokens(
+        &self,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let Some(pool) = self.pool else {
+            return Ok(HashMap::new());
+        };
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .collect();
+
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
     }
 }
 

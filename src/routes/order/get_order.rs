@@ -1,16 +1,21 @@
 use super::{OrderDataSource, RaindexOrderDataSource};
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::types::common::{TokenRef, ValidatedFixedBytes};
-use crate::types::order::{OrderDetail, OrderDetailsInfo, OrderTradeEntry, OrderType};
-use alloy::primitives::B256;
+use crate::types::common::{Denomination, TokenRef, ValidatedFixedBytes};
+use crate::types::order::{
+    OrderDetail, OrderDetailParams, OrderDetailsInfo, OrderTradeEntry, OrderType,
+};
+use crate::wrap_ratio::WrapRatioValue;
+use alloy::primitives::{Address, B256};
 use rain_orderbook_common::parsed_meta::ParsedMeta;
 use rain_orderbook_common::raindex_client::orders::RaindexOrder;
 use rain_orderbook_common::raindex_client::trades::RaindexTrade;
 use rocket::serde::json::Json;
 use rocket::State;
+use std::collections::HashMap;
 use tracing::Instrument;
 
 #[utoipa::path(
@@ -20,6 +25,7 @@ use tracing::Instrument;
     security(("basicAuth" = [])),
     params(
         ("order_hash" = String, Path, description = "The order hash"),
+        OrderDetailParams,
     ),
     responses(
         (status = 200, description = "Order details", body = OrderDetail),
@@ -29,31 +35,40 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/<order_hash>")]
+#[allow(clippy::too_many_arguments)]
+#[get("/<order_hash>?<params..>")]
 pub async fn get_order(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     order_hash: ValidatedFixedBytes,
+    params: OrderDetailParams,
 ) -> Result<Json<OrderDetail>, ApiError> {
     async move {
-        tracing::info!(order_hash = ?order_hash, "request received");
+        tracing::info!(order_hash = ?order_hash, params = ?params, "request received");
         let hash = order_hash.0;
+        let denomination = params.denomination.unwrap_or_default();
         let raindex = shared_raindex.read().await;
         let ds = RaindexOrderDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
+            pool: Some(pool.inner()),
         };
-        let detail = process_get_order(&ds, hash).await?;
+        let detail = process_get_order(&ds, hash, denomination).await?;
         Ok(Json(detail))
     }
     .instrument(span.0)
     .await
 }
 
-async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<OrderDetail, ApiError> {
+async fn process_get_order(
+    ds: &dyn OrderDataSource,
+    hash: B256,
+    denomination: Denomination,
+) -> Result<OrderDetail, ApiError> {
     let orders = ds.get_orders_by_hash(hash).await?;
     let order = orders
         .into_iter()
@@ -66,8 +81,17 @@ async fn process_get_order(ds: &dyn OrderDataSource, hash: B256) -> Result<Order
         .map(|d| d.formatted_ratio.clone())
         .unwrap_or_else(|| "-".into());
     let trades = ds.get_order_trades(&order).await?;
+    let wrap_ratios =
+        current_wrap_ratios_for_order_detail(ds, denomination, &order, &trades).await?;
     let order_type = determine_order_type(&order);
-    build_order_detail(&order, order_type, &io_ratio, &trades)
+    build_order_detail(
+        &order,
+        order_type,
+        &io_ratio,
+        &trades,
+        denomination,
+        &wrap_ratios,
+    )
 }
 
 fn determine_order_type(order: &RaindexOrder) -> OrderType {
@@ -90,22 +114,55 @@ fn build_order_detail(
     order_type: OrderType,
     io_ratio: &str,
     trades: &[RaindexTrade],
+    denomination: Denomination,
+    wrap_ratios: &HashMap<Address, WrapRatioValue>,
 ) -> Result<OrderDetail, ApiError> {
     let (input, output) = crate::routes::resolve_io_vaults(order)?;
 
     let input_token_info = input.token();
     let output_token_info = output.token();
 
-    let trade_entries: Vec<OrderTradeEntry> = trades.iter().map(map_trade).collect();
+    let trade_entries: Vec<OrderTradeEntry> = trades
+        .iter()
+        .map(|trade| map_trade(trade, denomination, wrap_ratios))
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     let created_at: u64 = order.timestamp_added().try_into().unwrap_or(0);
+    let input_vault_balance = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_amount_for_token(
+            input.formatted_balance(),
+            input_token_info.address(),
+            wrap_ratios,
+        )?
+    } else {
+        input.formatted_balance()
+    };
+    let output_vault_balance = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_amount_for_token(
+            output.formatted_balance(),
+            output_token_info.address(),
+            wrap_ratios,
+        )?
+    } else {
+        output.formatted_balance()
+    };
+    let converted_io_ratio = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_io_ratio(
+            io_ratio.to_string(),
+            input_token_info.address(),
+            output_token_info.address(),
+            wrap_ratios,
+        )?
+    } else {
+        io_ratio.to_string()
+    };
 
     Ok(OrderDetail {
         order_hash: order.order_hash(),
         owner: order.owner(),
         order_details: OrderDetailsInfo {
             type_: order_type,
-            io_ratio: io_ratio.to_string(),
+            io_ratio: converted_io_ratio.clone(),
         },
         input_token: TokenRef {
             address: input_token_info.address(),
@@ -119,26 +176,75 @@ fn build_order_detail(
         },
         input_vault_id: input.vault_id(),
         output_vault_id: output.vault_id(),
-        input_vault_balance: input.formatted_balance(),
-        output_vault_balance: output.formatted_balance(),
-        io_ratio: io_ratio.to_string(),
+        input_vault_balance,
+        output_vault_balance,
+        io_ratio: converted_io_ratio,
         created_at,
         orderbook_id: order.raindex(),
         trades: trade_entries,
     })
 }
 
-fn map_trade(trade: &RaindexTrade) -> OrderTradeEntry {
+fn map_trade(
+    trade: &RaindexTrade,
+    denomination: Denomination,
+    wrap_ratios: &HashMap<Address, WrapRatioValue>,
+) -> Result<OrderTradeEntry, ApiError> {
     let timestamp: u64 = trade.timestamp().try_into().unwrap_or(0);
     let tx = trade.transaction();
-    OrderTradeEntry {
+    let input_vc = trade.input_vault_balance_change();
+    let output_vc = trade.output_vault_balance_change();
+    let input_token = input_vc.token().address();
+    let output_token = output_vc.token().address();
+    let input_amount = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_amount_for_token(
+            input_vc.formatted_amount(),
+            input_token,
+            wrap_ratios,
+        )?
+    } else {
+        input_vc.formatted_amount()
+    };
+    let output_amount = if denomination == Denomination::Unwrapped {
+        crate::denomination::convert_wrapped_amount_for_token(
+            output_vc.formatted_amount(),
+            output_token,
+            wrap_ratios,
+        )?
+    } else {
+        output_vc.formatted_amount()
+    };
+
+    Ok(OrderTradeEntry {
         id: trade.id().to_string(),
         tx_hash: tx.id(),
-        input_amount: trade.input_vault_balance_change().formatted_amount(),
-        output_amount: trade.output_vault_balance_change().formatted_amount(),
+        input_amount,
+        output_amount,
         timestamp,
         sender: tx.from(),
+    })
+}
+
+async fn current_wrap_ratios_for_order_detail(
+    ds: &dyn OrderDataSource,
+    denomination: Denomination,
+    order: &RaindexOrder,
+    trades: &[RaindexTrade],
+) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+    if denomination == Denomination::Wrapped {
+        return Ok(HashMap::new());
     }
+
+    let (input, output) = crate::routes::resolve_io_vaults(order)?;
+    let mut token_addresses = vec![input.token().address(), output.token().address()];
+    for trade in trades {
+        token_addresses.push(trade.input_vault_balance_change().token().address());
+        token_addresses.push(trade.output_vault_balance_change().token().address());
+    }
+    token_addresses.sort_unstable();
+    token_addresses.dedup();
+
+    ds.get_wrap_ratios_for_tokens(&token_addresses).await
 }
 
 #[cfg(test)]
@@ -147,8 +253,11 @@ mod tests {
     use crate::error::ApiError;
     use crate::routes::order::test_fixtures::*;
     use crate::test_helpers::TestClientBuilder;
+    use crate::wrap_ratio::WrapRatioValue;
+    use alloy::primitives::address;
     use alloy::primitives::{Address, Bytes};
     use rocket::http::Status;
+    use std::collections::HashMap;
 
     #[rocket::async_test]
     async fn test_process_get_order_success() {
@@ -158,7 +267,9 @@ mod tests {
             quotes: Ok(vec![mock_quote("1.5")]),
             calldata: Ok(Bytes::new()),
         };
-        let detail = process_get_order(&ds, test_hash()).await.unwrap();
+        let detail = process_get_order(&ds, test_hash(), Denomination::Wrapped)
+            .await
+            .unwrap();
 
         assert_eq!(detail.order_hash, test_hash());
         assert_eq!(
@@ -189,7 +300,7 @@ mod tests {
             quotes: Ok(vec![]),
             calldata: Ok(Bytes::new()),
         };
-        let result = process_get_order(&ds, test_hash()).await;
+        let result = process_get_order(&ds, test_hash(), Denomination::Wrapped).await;
         assert!(matches!(result, Err(ApiError::NotFound(_))));
     }
 
@@ -201,7 +312,9 @@ mod tests {
             quotes: Ok(vec![mock_quote("2.0")]),
             calldata: Ok(Bytes::new()),
         };
-        let detail = process_get_order(&ds, test_hash()).await.unwrap();
+        let detail = process_get_order(&ds, test_hash(), Denomination::Wrapped)
+            .await
+            .unwrap();
         assert!(detail.trades.is_empty());
         assert_eq!(detail.io_ratio, "2.0");
     }
@@ -214,7 +327,9 @@ mod tests {
             quotes: Ok(vec![mock_failed_quote()]),
             calldata: Ok(Bytes::new()),
         };
-        let detail = process_get_order(&ds, test_hash()).await.unwrap();
+        let detail = process_get_order(&ds, test_hash(), Denomination::Wrapped)
+            .await
+            .unwrap();
         assert_eq!(detail.io_ratio, "-");
         assert_eq!(detail.order_details.io_ratio, "-");
     }
@@ -227,7 +342,7 @@ mod tests {
             quotes: Ok(vec![]),
             calldata: Ok(Bytes::new()),
         };
-        let result = process_get_order(&ds, test_hash()).await;
+        let result = process_get_order(&ds, test_hash(), Denomination::Wrapped).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -239,7 +354,7 @@ mod tests {
             quotes: Err(ApiError::Internal("failed to query order quotes".into())),
             calldata: Ok(Bytes::new()),
         };
-        let result = process_get_order(&ds, test_hash()).await;
+        let result = process_get_order(&ds, test_hash(), Denomination::Wrapped).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -251,7 +366,7 @@ mod tests {
             quotes: Ok(vec![mock_quote("1.5")]),
             calldata: Ok(Bytes::new()),
         };
-        let result = process_get_order(&ds, test_hash()).await;
+        let result = process_get_order(&ds, test_hash(), Denomination::Wrapped).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -266,12 +381,39 @@ mod tests {
         let hash = "0x000000000000000000000000000000000000000000000000000000000000beef"
             .parse()
             .unwrap();
-        let detail = process_get_order(&ds, hash).await.unwrap();
+        let detail = process_get_order(&ds, hash, Denomination::Wrapped)
+            .await
+            .unwrap();
 
         assert_eq!(detail.input_token.symbol, "wtMSTR");
         assert_eq!(detail.output_token.symbol, "wtMSTR");
         assert_eq!(detail.input_vault_balance, "0");
         assert_eq!(detail.output_vault_balance, "0");
+    }
+
+    #[test]
+    fn test_map_trade_converts_unwrapped_amounts() {
+        let wrapped_output = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
+        let mut value = trade_json();
+        value["outputVaultBalanceChange"]["token"]["address"] =
+            serde_json::json!(format!("{wrapped_output:#x}"));
+        value["outputVaultBalanceChange"]["token"]["id"] =
+            serde_json::json!(format!("{wrapped_output:#x}"));
+        value["outputVaultBalanceChange"]["token"]["symbol"] = serde_json::json!("wtMSTR");
+        let trade: RaindexTrade =
+            serde_json::from_value(value).expect("deserialize wrapped-output trade");
+        let ratios = HashMap::from([(
+            wrapped_output,
+            WrapRatioValue {
+                share_address: wrapped_output,
+                assets_per_share: "2".to_string(),
+            },
+        )]);
+
+        let entry = map_trade(&trade, Denomination::Unwrapped, &ratios).expect("map trade");
+
+        assert_eq!(entry.input_amount, "0.500000");
+        assert_eq!(entry.output_amount, "-0.5");
     }
 
     #[rocket::async_test]

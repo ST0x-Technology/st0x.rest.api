@@ -1,7 +1,8 @@
-use crate::types::common::{Approval, TokenRef};
+use crate::types::common::{Approval, Denomination, TokenRef};
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use rocket::form::FromForm;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -105,6 +106,15 @@ pub struct CancelSummary {
 pub struct CancelOrderResponse {
     pub transactions: Vec<CancelTransaction>,
     pub summary: CancelSummary,
+}
+
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderDetailParams {
+    #[field(name = "denomination")]
+    #[param(example = "wrapped")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]

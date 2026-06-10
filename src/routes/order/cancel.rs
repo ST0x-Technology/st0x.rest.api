@@ -43,6 +43,7 @@ pub async fn post_order_cancel(
         let ds = RaindexOrderDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
+            pool: None,
         };
         let response = process_cancel_order(&ds, hash).await?;
         Ok(Json(response))
