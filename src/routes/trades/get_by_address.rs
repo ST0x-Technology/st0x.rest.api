@@ -2,6 +2,7 @@ use super::{
     build_trades_list_response, trades_pagination_params, RaindexTradesDataSource, TradesDataSource,
 };
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedAddress;
@@ -34,6 +35,7 @@ pub async fn get_trades_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
@@ -43,6 +45,7 @@ pub async fn get_trades_by_address(
         let raindex = shared_raindex.read().await;
         let ds = RaindexTradesDataSource {
             client: raindex.client(),
+            pool: pool.inner(),
         };
         process_get_trades_by_address(&ds, address.0, params).await
     }
@@ -55,6 +58,7 @@ pub(super) async fn process_get_trades_by_address(
     owner: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    let denomination = params.denomination.unwrap_or_default();
     let (page, page_size, sdk_page, sdk_page_size, time_filter) = trades_pagination_params(params)?;
 
     let result = ds
@@ -68,7 +72,7 @@ pub(super) async fn process_get_trades_by_address(
         )
         .await?;
 
-    build_trades_list_response(result, page, page_size)
+    build_trades_list_response(ds, result, page, page_size, denomination).await
 }
 
 #[cfg(test)]
@@ -150,6 +154,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_address(
             &ds,
@@ -184,6 +189,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_address(
             &ds,
@@ -210,6 +216,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_address(
             &ds,

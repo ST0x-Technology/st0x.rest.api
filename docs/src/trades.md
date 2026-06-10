@@ -17,12 +17,20 @@ curl "https://api.st0x.io/v1/trades/0xYourAddress?page=1&pageSize=20" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `page` | number | 1 | Page number |
-| `pageSize` | number | 20 | Results per page |
-| `startTime` | number | - | Filter: only trades after this Unix timestamp |
-| `endTime` | number | - | Filter: only trades before this Unix timestamp |
+| Parameter      | Type                     | Default   | Description                                                                                                                  |
+| -------------- | ------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `page`         | number                   | 1         | Page number                                                                                                                  |
+| `pageSize`     | number                   | 20        | Results per page                                                                                                             |
+| `startTime`    | number                   | -         | Filter: only trades after this Unix timestamp                                                                                |
+| `endTime`      | number                   | -         | Filter: only trades before this Unix timestamp                                                                               |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize observed wrapped token amounts and IO ratios to their unwrapped asset value |
+
+When `denomination=unwrapped`, amount and IO ratio fields are normalized from
+the wrapped token value using the current wrapped exchange rate. This is a
+current-rate normalized view, not a historically exact reconstruction of the
+rate at the trade block. Do not combine unwrapped-normalized trade values with
+wrapped-denomination values from endpoints that were called without
+`denomination=unwrapped`; the calculations will differ.
 
 ### Response
 
@@ -65,14 +73,19 @@ curl "https://api.st0x.io/v1/trades/0xYourAddress?startTime=1708000000&endTime=1
 GET /v1/trades/tx/{tx_hash}
 ```
 
-Detailed breakdown of all trades within a specific transaction, including per-trade request/result and aggregate totals.
+Detailed breakdown of all trades within a specific transaction, including
+per-trade request/result and aggregate totals.
 
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/trades/tx/0xTxHash... \
+curl "https://api.st0x.io/v1/trades/tx/0xTxHash...?denomination=unwrapped" \
   -H "Authorization: Basic <credentials>"
 ```
+
+| Parameter      | Type                     | Default   | Description                                                                                                                           |
+| -------------- | ------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize observed wrapped token amounts, IO ratios, and totals to their unwrapped asset value |
 
 ### Response
 
@@ -108,3 +121,19 @@ curl https://api.st0x.io/v1/trades/tx/0xTxHash... \
 ```
 
 The `totals` field aggregates across all trades in the transaction.
+
+Historical-rate conversion for older trades will be handled separately once the
+exchange-rate history is incorporated into the trade response path.
+
+## Other Trade Queries
+
+The same denomination behavior is supported by the other trade endpoints:
+
+```text
+GET /v1/trades/token/{address}?denomination=unwrapped
+GET /v1/trades/taker/{address}?denomination=unwrapped
+POST /v1/trades/query
+```
+
+For `POST /v1/trades/query`, include `"denomination": "unwrapped"` in the JSON
+body with `orderHashes`, `startTime`, and `endTime`.

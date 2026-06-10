@@ -1,4 +1,4 @@
-use crate::types::common::TokenRef;
+use crate::types::common::{Denomination, TokenRef};
 use alloy::primitives::{Address, FixedBytes, B256};
 use rocket::form::FromForm;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,18 @@ pub struct TradesPaginationParams {
     #[field(name = "endTime")]
     #[param(example = 1718539200)]
     pub end_time: Option<u64>,
+    #[field(name = "denomination")]
+    #[param(example = "wrapped")]
+    pub denomination: Option<Denomination>,
+}
+
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct TradesByTxParams {
+    #[field(name = "denomination")]
+    #[param(example = "wrapped")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -75,6 +87,8 @@ pub struct TradesByOrderHashesRequest {
     pub start_time: Option<u64>,
     #[schema(example = 1718539200)]
     pub end_time: Option<u64>,
+    #[schema(example = "wrapped")]
+    pub denomination: Option<Denomination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

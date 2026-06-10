@@ -1,7 +1,11 @@
-use super::{map_trade_for_list, RaindexTradesDataSource, TradesDataSource};
+use super::{
+    current_wrap_ratios_for_trades, map_trade_for_list, RaindexTradesDataSource, TradesDataSource,
+};
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::types::common::Denomination;
 use crate::types::trades::{
     TradesByOrderHashEntry, TradesByOrderHashesRequest, TradesByOrderHashesResponse,
 };
@@ -32,6 +36,7 @@ pub async fn get_trades_by_order_hashes(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     request: Json<TradesByOrderHashesRequest>,
 ) -> Result<Json<TradesByOrderHashesResponse>, ApiError> {
@@ -47,7 +52,10 @@ pub async fn get_trades_by_order_hashes(
             let raindex = shared_raindex.read().await;
             raindex.client().clone()
         };
-        let ds = RaindexTradesDataSource { client: &client };
+        let ds = RaindexTradesDataSource {
+            client: &client,
+            pool: pool.inner(),
+        };
         process_get_trades_by_order_hashes(&ds, request).await
     }
     .instrument(span.0)
@@ -63,6 +71,7 @@ pub(super) async fn process_get_trades_by_order_hashes(
         start: request.start_time,
         end: request.end_time,
     };
+    let denomination = request.denomination.unwrap_or_default();
 
     tracing::info!(
         order_hashes_count = order_hashes.len(),
@@ -72,7 +81,7 @@ pub(super) async fn process_get_trades_by_order_hashes(
         .get_trades_by_order_hashes(order_hashes, time_filter)
         .await?;
 
-    build_trades_by_order_hashes_response(result)
+    build_trades_by_order_hashes_response(ds, result, denomination).await
 }
 
 fn parse_order_hashes(order_hashes: &[String]) -> Result<Vec<B256>, ApiError> {
@@ -87,9 +96,17 @@ fn parse_order_hashes(order_hashes: &[String]) -> Result<Vec<B256>, ApiError> {
         .collect()
 }
 
-fn build_trades_by_order_hashes_response(
+async fn build_trades_by_order_hashes_response(
+    ds: &dyn TradesDataSource,
     result: RaindexTradesByOrderHashResult,
+    denomination: Denomination,
 ) -> Result<Json<TradesByOrderHashesResponse>, ApiError> {
+    let all_trades = result
+        .trades_by_order_hash()
+        .iter()
+        .flat_map(|entry| entry.trades().iter().cloned())
+        .collect::<Vec<_>>();
+    let trade_wrap_ratios = current_wrap_ratios_for_trades(ds, denomination, &all_trades).await?;
     let trades_by_order_hash = result
         .trades_by_order_hash()
         .iter()
@@ -97,7 +114,7 @@ fn build_trades_by_order_hashes_response(
             let trades = entry
                 .trades()
                 .iter()
-                .map(map_trade_for_list)
+                .map(|trade| map_trade_for_list(trade, denomination, &trade_wrap_ratios))
                 .collect::<Result<Vec<_>, ApiError>>()?;
             Ok(TradesByOrderHashEntry {
                 order_hash: entry.order_hash(),
@@ -225,6 +242,7 @@ mod tests {
             order_hashes: vec![hash_a().to_string(), hash_b().to_string()],
             start_time: Some(1700000000),
             end_time: Some(1700002000),
+            denomination: None,
         };
         let result = process_get_trades_by_order_hashes(&ds, request)
             .await
@@ -259,6 +277,7 @@ mod tests {
             order_hashes: vec![],
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_order_hashes(&ds, request)
             .await
@@ -286,6 +305,7 @@ mod tests {
             order_hashes: vec!["not-a-hash".to_string()],
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_order_hashes(&ds, request).await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
@@ -301,6 +321,7 @@ mod tests {
             order_hashes: vec![hash_a().to_string()],
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_order_hashes(&ds, request).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));

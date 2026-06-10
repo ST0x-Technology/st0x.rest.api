@@ -16,12 +16,12 @@ pub(crate) fn convert_wrapped_amount_for_token(
         return Ok(amount);
     };
 
-    let amount = parse_float(amount, "amount")?;
+    let amount = parse_decimal_float(amount, "amount")?;
     let converted = amount.mul(parse_ratio(ratio)?).map_err(|e| {
         tracing::error!(error = %e, "failed to convert wrapped amount");
         ApiError::Internal("failed to convert wrapped amount".into())
     })?;
-    format_float(converted, "amount")
+    format_decimal_float(converted, "amount")
 }
 
 pub(crate) fn convert_wrapped_io_ratio(
@@ -34,7 +34,7 @@ pub(crate) fn convert_wrapped_io_ratio(
         return Ok(io_ratio);
     }
 
-    let io_ratio = parse_float(io_ratio, "io_ratio")?;
+    let io_ratio = parse_decimal_float(io_ratio, "io_ratio")?;
     let input_assets_per_share = ratio_for_token(input_token, ratios)?;
     let output_assets_per_share = ratio_for_token(output_token, ratios)?;
 
@@ -46,7 +46,7 @@ pub(crate) fn convert_wrapped_io_ratio(
             ApiError::Internal("failed to convert wrapped IO ratio".into())
         })?;
 
-    format_float(converted, "io_ratio")
+    format_decimal_float(converted, "io_ratio")
 }
 
 fn ratio_for_token(token: Address, ratios: &WrapRatioMap) -> Result<Float, ApiError> {
@@ -71,14 +71,14 @@ fn parse_ratio(ratio: &WrapRatioValue) -> Result<Float, ApiError> {
     })
 }
 
-fn parse_float(value: String, label: &str) -> Result<Float, ApiError> {
+pub(crate) fn parse_decimal_float(value: String, label: &str) -> Result<Float, ApiError> {
     Float::parse(value).map_err(|e| {
         tracing::error!(error = %e, label, "failed to parse denomination value");
         ApiError::Internal(format!("failed to parse {label}"))
     })
 }
 
-fn format_float(value: Float, label: &str) -> Result<String, ApiError> {
+pub(crate) fn format_decimal_float(value: Float, label: &str) -> Result<String, ApiError> {
     value.format().map_err(|e| {
         tracing::error!(error = %e, label, "failed to format denomination value");
         ApiError::Internal(format!("failed to format {label}"))

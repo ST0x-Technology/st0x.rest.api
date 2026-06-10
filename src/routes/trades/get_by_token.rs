@@ -3,6 +3,7 @@ use super::{
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedAddress;
@@ -30,12 +31,14 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/token/<address>?<params..>")]
 pub async fn get_trades_by_token(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
@@ -47,6 +50,7 @@ pub async fn get_trades_by_token(
             let raindex = shared_raindex.read().await;
             let ds = RaindexTradesDataSource {
                 client: raindex.client(),
+                pool: pool.inner(),
             };
             return process_get_trades_by_token(&ds, addr, params).await;
         }
@@ -59,6 +63,7 @@ pub async fn get_trades_by_token(
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexTradesDataSource {
                     client: raindex.client(),
+                    pool: pool.inner(),
                 };
                 process_get_trades_by_token(&ds, addr, params)
                     .await
@@ -78,7 +83,7 @@ pub(super) fn trades_cache_key(
     params: &TradesPaginationParams,
 ) -> String {
     format!(
-        "{route}/{}/{}/{}/{}/{}",
+        "{route}/{}/{}/{}/{}/{}/{:?}",
         address.to_string().to_ascii_lowercase(),
         params.page.unwrap_or(1),
         params.page_size.unwrap_or(20),
@@ -89,7 +94,8 @@ pub(super) fn trades_cache_key(
         params
             .end_time
             .map(|value| value.to_string())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        params.denomination.unwrap_or_default()
     )
 }
 
@@ -98,6 +104,7 @@ pub(super) async fn process_get_trades_by_token(
     token: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    let denomination = params.denomination.unwrap_or_default();
     let (page, page_size, sdk_page, sdk_page_size, time_filter) = trades_pagination_params(params)?;
 
     tracing::info!(token = ?token, page, page_size, "querying trades by token");
@@ -105,7 +112,7 @@ pub(super) async fn process_get_trades_by_token(
         .get_trades_for_token(token, sdk_page, sdk_page_size, time_filter)
         .await?;
 
-    build_trades_list_response(result, page, page_size)
+    build_trades_list_response(ds, result, page, page_size, denomination).await
 }
 
 #[cfg(test)]
@@ -189,6 +196,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_token(
             &ds,
@@ -224,12 +232,14 @@ mod tests {
             page_size: None,
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let explicit_params = TradesPaginationParams {
             page: Some(1),
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: Some(crate::types::common::Denomination::Wrapped),
         };
 
         assert_eq!(
@@ -248,6 +258,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_token(
             &ds,
@@ -274,6 +285,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_token(
             &ds,

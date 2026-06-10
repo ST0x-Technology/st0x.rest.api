@@ -3,6 +3,7 @@ use super::{
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
+use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedAddress;
@@ -30,12 +31,14 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 #[get("/taker/<address>?<params..>")]
 pub async fn get_trades_by_taker(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
+    pool: &State<DbPool>,
     span: TracingSpan,
     address: ValidatedAddress,
     params: TradesPaginationParams,
@@ -48,7 +51,10 @@ pub async fn get_trades_by_taker(
                 let raindex = shared_raindex.read().await;
                 raindex.client().clone()
             };
-            let ds = RaindexTradesDataSource { client: &client };
+            let ds = RaindexTradesDataSource {
+                client: &client,
+                pool: pool.inner(),
+            };
             return process_get_trades_by_taker(&ds, addr, params).await;
         }
 
@@ -61,7 +67,10 @@ pub async fn get_trades_by_taker(
                     let raindex = shared_raindex.read().await;
                     raindex.client().clone()
                 };
-                let ds = RaindexTradesDataSource { client: &client };
+                let ds = RaindexTradesDataSource {
+                    client: &client,
+                    pool: pool.inner(),
+                };
                 process_get_trades_by_taker(&ds, addr, params)
                     .await
                     .map(Json::into_inner)
@@ -79,6 +88,7 @@ pub(super) async fn process_get_trades_by_taker(
     taker: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    let denomination = params.denomination.unwrap_or_default();
     let (page, page_size, sdk_page, sdk_page_size, time_filter) = trades_pagination_params(params)?;
 
     tracing::info!(taker = ?taker, page, page_size, "querying trades by taker");
@@ -86,7 +96,7 @@ pub(super) async fn process_get_trades_by_taker(
         .get_trades_for_taker(taker, sdk_page, sdk_page_size, time_filter)
         .await?;
 
-    build_trades_list_response(result, page, page_size)
+    build_trades_list_response(ds, result, page, page_size, denomination).await
 }
 
 #[cfg(test)]
@@ -189,6 +199,7 @@ mod tests {
             page_size: Some(10),
             start_time: Some(1700000000),
             end_time: Some(1700002000),
+            denomination: None,
         };
         let result = process_get_trades_by_taker(&ds, taker, params)
             .await
@@ -229,6 +240,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_taker(
             &ds,
@@ -256,6 +268,7 @@ mod tests {
             page_size: Some(20),
             start_time: None,
             end_time: None,
+            denomination: None,
         };
         let result = process_get_trades_by_taker(
             &ds,
