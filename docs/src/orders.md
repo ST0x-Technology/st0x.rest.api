@@ -146,7 +146,7 @@ response.
 ## List Orders by Owner
 
 ```
-GET /v1/orders/{address}
+GET /v1/orders/owner/{address}
 ```
 
 Paginated list of orders for a wallet address.
@@ -154,21 +154,22 @@ Paginated list of orders for a wallet address.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10" \
+curl "https://api.st0x.io/v1/orders/owner/0xOwnerAddress?state=active&page=1&pageSize=10" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter      | Type                     | Default   | Description                                                                                               |
-| -------------- | ------------------------ | --------- | --------------------------------------------------------------------------------------------------------- |
-| `page`         | number                   | 1         | Page number                                                                                               |
-| `pageSize`     | number                   | 20        | Results per page                                                                                          |
-| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances and IO ratios to unwrapped values |
+| Parameter      | Type                           | Default   | Description                                                                                               |
+| -------------- | ------------------------------ | --------- | --------------------------------------------------------------------------------------------------------- |
+| `state`        | `active`, `inactive`, or `all` | `active`  | Filter by current order state                                                                             |
+| `page`         | number                         | 1         | Page number                                                                                               |
+| `pageSize`     | number                         | 20        | Results per page                                                                                          |
+| `denomination` | `wrapped` or `unwrapped`       | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances and IO ratios to unwrapped values |
 
 Use `denomination=unwrapped` to view order balances and IO ratios normalized to
 the current unwrapped asset value:
 
 ```bash
-curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10&denomination=unwrapped" \
+curl "https://api.st0x.io/v1/orders/owner/0xOwnerAddress?state=active&page=1&pageSize=10&denomination=unwrapped" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -180,6 +181,11 @@ curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10&denominati
     {
       "orderHash": "0xabc123...",
       "owner": "0xOwnerAddress",
+      "chainId": 8453,
+      "orderBytes": "0x...",
+      "active": true,
+      "removedAt": null,
+      "orderType": "limit",
       "inputToken": { "address": "0x...", "symbol": "USDC", "decimals": 6 },
       "outputToken": { "address": "0x...", "symbol": "WETH", "decimals": 18 },
       "outputVaultBalance": "0.5",
@@ -201,6 +207,37 @@ curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10&denominati
 
 `maxOutput` is the quote-derived executable output amount for the listed order.
 It is `null` when quote data is unavailable.
+
+`orderType` is one of `limit`, `dca`, `dynamic-spread`, or `custom`.
+
+When `state=inactive`, orders are returned without live quote data: `ioRatio` is
+`"-"`, `maxOutput` is `null`, and `outputVaultBalance` is `"0"`. `chainId`,
+`orderBytes`, token refs, `orderType`, `active`, and `removedAt` remain
+populated when available.
+
+## List Orders by Token
+
+```
+GET /v1/orders/token/{address}
+```
+
+Paginated list of orders for a token address.
+
+### Request
+
+```bash
+curl "https://api.st0x.io/v1/orders/token/0xTokenAddress?state=all&side=output&page=1&pageSize=10" \
+  -H "Authorization: Basic <credentials>"
+```
+
+| Parameter  | Type                           | Default  | Description                          |
+| ---------- | ------------------------------ | -------- | ------------------------------------ |
+| `state`    | `active`, `inactive`, or `all` | `active` | Filter by current order state        |
+| `side`     | `input` or `output`            | all      | Match token as an input/output token |
+| `page`     | number                         | 1        | Page number                          |
+| `pageSize` | number                         | 20       | Results per page                     |
+
+The response shape is the same as list orders by owner.
 
 ## List Orders by Transaction
 

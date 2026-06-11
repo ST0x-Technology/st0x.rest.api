@@ -1,6 +1,7 @@
 use super::{
-    build_orders_list_response, current_wrap_ratios_for_orders, OrdersListDataSource,
-    RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    active_filter_for_state, build_orders_list_response, current_wrap_ratios_for_orders,
+    get_order_quotes_for_summaries, OrdersListDataSource, RaindexOrdersListDataSource,
+    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
@@ -8,7 +9,7 @@ use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{Denomination, ValidatedAddress};
-use crate::types::orders::{OrdersListResponse, OrdersPaginationParams};
+use crate::types::orders::{OrderState, OrdersListResponse, OrdersPaginationParams};
 use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rocket::serde::json::Json;
@@ -18,14 +19,16 @@ use tracing::Instrument;
 pub(crate) async fn process_get_orders_by_owner(
     ds: &dyn OrdersListDataSource,
     address: Address,
+    state: Option<OrderState>,
     page: Option<u16>,
     page_size: Option<u16>,
     denomination: Denomination,
 ) -> Result<OrdersListResponse, ApiError> {
+    let active_filter = active_filter_for_state(state);
     let filters = GetOrdersFilters {
         owners: vec![address],
-        active: Some(true),
-        has_positive_output_vault_balance: Some(true),
+        active: active_filter,
+        has_positive_output_vault_balance: (active_filter == Some(true)).then_some(true),
         ..Default::default()
     };
 
@@ -41,7 +44,7 @@ pub(crate) async fn process_get_orders_by_owner(
         quoted_orders = orders.len(),
         "fetching batched quotes for orders by owner"
     );
-    let quote_results = ds.get_order_quotes_batch(&orders).await;
+    let quote_results = get_order_quotes_for_summaries(ds, &orders).await;
     let wrap_ratios = current_wrap_ratios_for_orders(ds, denomination, &orders).await?;
 
     build_orders_list_response(
@@ -88,6 +91,7 @@ pub async fn get_orders_by_address(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
+        let state = params.state;
         let page = params.page;
         let page_size = params.page_size;
         let denomination = params.denomination.unwrap_or_default();
@@ -98,7 +102,7 @@ pub async fn get_orders_by_address(
             pool: pool.inner(),
         };
         let response =
-            process_get_orders_by_owner(&ds, addr, page, page_size, denomination).await?;
+            process_get_orders_by_owner(&ds, addr, state, page, page_size, denomination).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -111,8 +115,11 @@ mod tests {
     use crate::routes::order::test_fixtures::{
         mock_order, mock_order_with_shared_vaults, mock_quote,
     };
-    use crate::routes::orders::test_fixtures::MockOrdersListDataSource;
+    use crate::routes::orders::test_fixtures::{
+        MockOrdersListDataSource, RecordingOrdersListDataSource,
+    };
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
+    use crate::types::orders::OrderSummaryOrderType;
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -125,14 +132,19 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
-            .await
-            .unwrap();
+        let result =
+            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "USDC");
         assert_eq!(result.orders[0].output_token.symbol, "WETH");
+        assert_eq!(result.orders[0].chain_id, 8453);
         assert_eq!(result.orders[0].order_bytes.as_ref(), &[1]);
+        assert!(result.orders[0].active);
+        assert_eq!(result.orders[0].removed_at, None);
+        assert_eq!(result.orders[0].order_type, OrderSummaryOrderType::Custom);
         assert_eq!(result.orders[0].io_ratio, "1.5");
         assert_eq!(result.orders[0].max_output.as_deref(), Some("1"));
         assert_eq!(result.pagination.total_orders, 1);
@@ -150,9 +162,10 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
-            .await
-            .unwrap();
+        let result =
+            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert!(result.orders.is_empty());
         assert_eq!(result.pagination.total_orders, 0);
@@ -169,9 +182,10 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
-            .await
-            .unwrap();
+        let result =
+            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert_eq!(result.orders[0].io_ratio, "-");
         assert_eq!(result.orders[0].max_output, None);
@@ -188,7 +202,7 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped).await;
+            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -202,14 +216,64 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_owner(&ds, addr, None, None, Denomination::Wrapped)
-            .await
-            .unwrap();
+        let result =
+            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "wtMSTR");
         assert_eq!(result.orders[0].output_token.symbol, "wtMSTR");
+        assert_eq!(result.orders[0].chain_id, 8453);
         assert_eq!(result.orders[0].io_ratio, "200.0");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_inactive_state_sets_active_false_filter() {
+        let ds = RecordingOrdersListDataSource::default();
+        let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            .parse()
+            .unwrap();
+
+        let result = process_get_orders_by_owner(
+            &ds,
+            addr,
+            Some(OrderState::Inactive),
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let filters = ds.filters.lock().expect("lock filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].active, Some(false));
+        assert_eq!(filters[0].has_positive_output_vault_balance, None);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_all_state_omits_active_filter() {
+        let ds = RecordingOrdersListDataSource::default();
+        let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            .parse()
+            .unwrap();
+
+        let result = process_get_orders_by_owner(
+            &ds,
+            addr,
+            Some(OrderState::All),
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let filters = ds.filters.lock().expect("lock filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].active, None);
+        assert_eq!(filters[0].has_positive_output_vault_balance, None);
     }
 
     #[rocket::async_test]

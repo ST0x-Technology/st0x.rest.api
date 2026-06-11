@@ -8,6 +8,8 @@ use utoipa::{IntoParams, ToSchema};
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersPaginationParams {
+    #[field(name = "state")]
+    pub state: Option<OrderState>,
     #[field(name = "page")]
     #[param(example = 1)]
     pub page: Option<u16>,
@@ -22,14 +24,38 @@ pub struct OrdersPaginationParams {
 #[derive(Debug, Clone, Serialize, Deserialize, FromFormField, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderSide {
+    #[field(value = "input")]
     Input,
+    #[field(value = "output")]
     Output,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, FromFormField, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderState {
+    #[field(value = "active")]
+    Active,
+    #[field(value = "inactive")]
+    Inactive,
+    #[field(value = "all")]
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrderSummaryOrderType {
+    Limit,
+    Dca,
+    DynamicSpread,
+    Custom,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersByTokenParams {
+    #[field(name = "state")]
+    pub state: Option<OrderState>,
     #[field(name = "side")]
     pub side: Option<OrderSide>,
     #[field(name = "page")]
@@ -50,8 +76,16 @@ pub struct OrderSummary {
     pub order_hash: FixedBytes<32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub owner: Address,
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0x01")]
     pub order_bytes: Bytes,
+    #[schema(example = true)]
+    pub active: bool,
+    #[schema(example = 1718452900)]
+    pub removed_at: Option<u64>,
+    #[schema(example = "limit")]
+    pub order_type: OrderSummaryOrderType,
     pub input_token: TokenRef,
     pub output_token: TokenRef,
     #[schema(example = "500000")]

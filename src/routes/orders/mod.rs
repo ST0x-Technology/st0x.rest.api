@@ -5,7 +5,9 @@ mod get_by_tx;
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
 use crate::types::common::{Denomination, TokenRef};
-use crate::types::orders::{OrderSummary, OrdersListResponse, OrdersPagination};
+use crate::types::orders::{
+    OrderState, OrderSummary, OrderSummaryOrderType, OrdersListResponse, OrdersPagination,
+};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
     wrap_ratio_values_from_responses, WrapRatioValue,
@@ -85,6 +87,79 @@ pub(crate) fn order_quote_cache_key(order: &RaindexOrder) -> String {
         order.raindex(),
         order.order_hash()
     )
+}
+
+pub(crate) fn active_filter_for_state(state: Option<OrderState>) -> Option<bool> {
+    match state.unwrap_or(OrderState::Active) {
+        OrderState::Active => Some(true),
+        OrderState::Inactive => Some(false),
+        OrderState::All => None,
+    }
+}
+
+pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType {
+    let source = order.rainlang().or_else(|| order.dotrain_source());
+    let Some(source) = source else {
+        return OrderSummaryOrderType::Custom;
+    };
+
+    if source.contains("other-vwaio") {
+        return OrderSummaryOrderType::DynamicSpread;
+    }
+
+    let handle_io = handle_io_section(&source);
+    let has_dca_markers = handle_io.as_deref().is_some_and(|section| {
+        section.contains("min-amount:")
+            || section.contains("linear-growth")
+            || section.contains("amount-epochs")
+            || section.contains("halflife")
+    });
+    if has_dca_markers {
+        return OrderSummaryOrderType::Dca;
+    }
+
+    if handle_io.as_deref().is_some_and(is_empty_handle_io_section) {
+        return OrderSummaryOrderType::Limit;
+    }
+
+    OrderSummaryOrderType::Custom
+}
+
+fn handle_io_section(source: &str) -> Option<String> {
+    let mut section = Vec::new();
+    let mut in_handle_io = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let is_section_header =
+            trimmed.starts_with("/*") || trimmed.starts_with('#') || trimmed.starts_with("//");
+
+        if in_handle_io && is_section_header && !trimmed.contains("handle-io") {
+            break;
+        }
+
+        if in_handle_io {
+            section.push(line);
+            continue;
+        }
+
+        if trimmed.contains("handle-io") {
+            in_handle_io = true;
+            let after_marker = trimmed
+                .split_once("*/")
+                .map(|(_, after)| after.trim())
+                .filter(|after| !after.is_empty());
+            if let Some(after_marker) = after_marker {
+                section.push(after_marker);
+            }
+        }
+    }
+
+    in_handle_io.then(|| section.join("\n"))
+}
+
+fn is_empty_handle_io_section(section: &str) -> bool {
+    matches!(section.trim(), ":" | ":;")
 }
 
 fn group_orders_by_chain(orders: &[RaindexOrder]) -> GroupedOrders {
@@ -387,7 +462,13 @@ pub(crate) fn build_order_summary(
     Ok(OrderSummary {
         order_hash: order.order_hash(),
         owner: order.owner(),
+        chain_id: order.chain_id(),
         order_bytes: order.order_bytes(),
+        active: order.active(),
+        removed_at: order
+            .timestamp_removed()
+            .and_then(|timestamp| timestamp.try_into().ok()),
+        order_type: classify_order_type(order),
         input_token: TokenRef {
             address: input_token_info.address(),
             symbol: input_token_info.symbol().unwrap_or_default(),
@@ -398,7 +479,11 @@ pub(crate) fn build_order_summary(
             symbol: output_token_info.symbol().unwrap_or_default(),
             decimals: output_token_info.decimals(),
         },
-        output_vault_balance,
+        output_vault_balance: if order.active() {
+            output_vault_balance
+        } else {
+            "0".into()
+        },
         max_output,
         io_ratio,
         created_at,
@@ -432,6 +517,42 @@ pub(crate) fn quote_result_to_summary(
             }
         }
     }
+}
+
+pub(crate) async fn get_order_quotes_for_summaries(
+    ds: &dyn OrdersListDataSource,
+    orders: &[RaindexOrder],
+) -> Vec<OrderQuoteResult> {
+    let mut quote_results: Vec<Option<OrderQuoteResult>> =
+        (0..orders.len()).map(|_| None).collect();
+    let active_orders: Vec<(usize, RaindexOrder)> = orders
+        .iter()
+        .enumerate()
+        .filter_map(|(index, order)| {
+            if order.active() {
+                Some((index, order.clone()))
+            } else {
+                quote_results[index] = Some(Ok(Vec::new()));
+                None
+            }
+        })
+        .collect();
+
+    if !active_orders.is_empty() {
+        let active_order_values: Vec<RaindexOrder> = active_orders
+            .iter()
+            .map(|(_, order)| order.clone())
+            .collect();
+        let active_quote_results = ds.get_order_quotes_batch(&active_order_values).await;
+        for ((index, _), quote_result) in active_orders.into_iter().zip(active_quote_results) {
+            quote_results[index] = Some(quote_result);
+        }
+    }
+
+    quote_results
+        .into_iter()
+        .map(|quote_result| quote_result.unwrap_or_else(|| Ok(Vec::new())))
+        .collect()
 }
 
 pub(crate) fn build_pagination(total_count: u32, page: u32, page_size: u32) -> OrdersPagination {
@@ -526,11 +647,17 @@ pub(crate) mod test_fixtures {
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
     use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
+    use std::sync::Mutex;
 
     pub struct MockOrdersListDataSource {
         pub orders: Result<Vec<RaindexOrder>, ApiError>,
         pub total_count: u32,
         pub quotes: Result<Vec<RaindexOrderQuote>, ApiError>,
+    }
+
+    #[derive(Default)]
+    pub struct RecordingOrdersListDataSource {
+        pub filters: Mutex<Vec<GetOrdersFilters>>,
     }
 
     #[async_trait]
@@ -555,6 +682,26 @@ pub(crate) mod test_fixtures {
                 Ok(quotes) => Ok(quotes.clone()),
                 Err(_) => Err(ApiError::Internal("failed to query order quotes".into())),
             }
+        }
+    }
+
+    #[async_trait]
+    impl OrdersListDataSource for RecordingOrdersListDataSource {
+        async fn get_orders_list(
+            &self,
+            filters: GetOrdersFilters,
+            _page: Option<u16>,
+            _page_size: Option<u16>,
+        ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
+            self.filters.lock().expect("lock filters").push(filters);
+            Ok((vec![], 0))
+        }
+
+        async fn get_order_quotes(
+            &self,
+            _order: &RaindexOrder,
+        ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
+            unreachable!("recording datasource returns no orders")
         }
     }
 }
@@ -628,6 +775,20 @@ mod tests {
         serde_json::from_value(value).expect("deserialize chain-specific mock order")
     }
 
+    fn mock_order_with_source(source: Option<&str>) -> RaindexOrder {
+        let mut value = order_json();
+        value["rainlang"] = source.map_or(serde_json::Value::Null, |source| json!(source));
+        serde_json::from_value(value).expect("deserialize mock order with source")
+    }
+
+    fn mock_inactive_order(order_hash: &str, removed_at: u64) -> RaindexOrder {
+        let mut value = order_json();
+        value["active"] = json!(false);
+        value["orderHash"] = json!(order_hash);
+        value["timestampRemoved"] = json!(format!("0x{removed_at:x}"));
+        serde_json::from_value(value).expect("deserialize inactive mock order")
+    }
+
     fn quote_ratio(result: &OrderQuoteResult) -> String {
         result
             .as_ref()
@@ -647,6 +808,162 @@ mod tests {
             share_address,
             assets_per_share: assets_per_share.to_string(),
         }
+    }
+
+    #[test]
+    fn test_active_filter_for_state_defaults_to_active() {
+        assert_eq!(active_filter_for_state(None), Some(true));
+        assert_eq!(
+            active_filter_for_state(Some(OrderState::Active)),
+            Some(true)
+        );
+        assert_eq!(
+            active_filter_for_state(Some(OrderState::Inactive)),
+            Some(false)
+        );
+        assert_eq!(active_filter_for_state(Some(OrderState::All)), None);
+    }
+
+    #[test]
+    fn test_classify_order_type_no_source_is_custom() {
+        let order = mock_order_with_source(None);
+        assert_eq!(classify_order_type(&order), OrderSummaryOrderType::Custom);
+    }
+
+    #[test]
+    fn test_classify_order_type_dynamic_spread() {
+        let order = mock_order_with_source(Some("using-words-from 0xabc\n_: other-vwaio();"));
+        assert_eq!(
+            classify_order_type(&order),
+            OrderSummaryOrderType::DynamicSpread
+        );
+    }
+
+    #[test]
+    fn test_classify_order_type_dca_from_handle_io_min_amount() {
+        let order = mock_order_with_source(Some(
+            r#"/* 0. calculate-io */
+_: 1;
+
+/* 1. handle-io */
+min-amount: 1;
+:;"#,
+        ));
+        assert_eq!(classify_order_type(&order), OrderSummaryOrderType::Dca);
+    }
+
+    #[test]
+    fn test_classify_order_type_dca_from_source_markers() {
+        for marker in ["linear-growth", "amount-epochs", "halflife"] {
+            let order = mock_order_with_source(Some(&format!(
+                r#"/* 0. calculate-io */
+_: 1;
+
+/* 1. handle-io */
+_: {marker}();
+:;"#
+            )));
+            assert_eq!(classify_order_type(&order), OrderSummaryOrderType::Dca);
+        }
+    }
+
+    #[test]
+    fn test_classify_order_type_ignores_dca_markers_outside_handle_io() {
+        let order = mock_order_with_source(Some(
+            r#"/* 0. calculate-io */
+// linear-growth appears in an unrelated comment.
+_: 1;
+
+/* 1. handle-io */
+:;"#,
+        ));
+
+        assert_eq!(classify_order_type(&order), OrderSummaryOrderType::Limit);
+    }
+
+    #[test]
+    fn test_classify_order_type_limit_from_simple_handle_io() {
+        for handle_io in [":;", ":"] {
+            let order = mock_order_with_source(Some(&format!(
+                r#"/* 0. calculate-io */
+_: 1;
+
+/* 1. handle-io */
+{handle_io}"#
+            )));
+            assert_eq!(classify_order_type(&order), OrderSummaryOrderType::Limit);
+        }
+    }
+
+    #[test]
+    fn test_classify_order_type_custom_fallback() {
+        let order = mock_order_with_source(Some(
+            r#"/* 0. calculate-io */
+_: 1;
+
+/* 1. handle-io */
+_: custom-handle-io();"#,
+        ));
+        assert_eq!(classify_order_type(&order), OrderSummaryOrderType::Custom);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_order_quotes_for_summaries_skips_inactive_orders() {
+        let active_order = mock_order_for_chain(
+            1,
+            "0x0000000000000000000000000000000000000000000000000000000000000101",
+        );
+        let inactive_order = mock_inactive_order(
+            "0x0000000000000000000000000000000000000000000000000000000000000102",
+            1_718_452_900,
+        );
+        let batch_calls = Arc::new(Mutex::new(Vec::new()));
+        let single_calls = Arc::new(Mutex::new(Vec::new()));
+        let ds = BatchingTestDataSource {
+            per_order_quotes: HashMap::new(),
+            batched_quotes: HashMap::from([(1, Ok(vec![vec![mock_quote("1.7")]]))]),
+            batch_calls: Arc::clone(&batch_calls),
+            single_calls: Arc::clone(&single_calls),
+        };
+
+        let results =
+            get_order_quotes_for_summaries(&ds, &[active_order.clone(), inactive_order]).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(quote_ratio(&results[0]), "1.7");
+        assert!(results[1].as_ref().expect("inactive result").is_empty());
+        assert_eq!(
+            batch_calls.lock().expect("lock batch calls").as_slice(),
+            &[(1, 1)]
+        );
+        assert!(single_calls.lock().expect("lock single calls").is_empty());
+    }
+
+    #[test]
+    fn test_build_orders_list_response_uses_non_live_fields_for_inactive_order() {
+        let order = mock_inactive_order(
+            "0x0000000000000000000000000000000000000000000000000000000000000201",
+            1_718_452_900,
+        );
+        let response = build_orders_list_response(
+            &[order],
+            1,
+            1,
+            20,
+            vec![Ok(Vec::new())],
+            Denomination::Wrapped,
+            &HashMap::new(),
+        )
+        .expect("build inactive response");
+
+        let summary = &response.orders[0];
+        assert!(!summary.active);
+        assert_eq!(summary.removed_at, Some(1_718_452_900));
+        assert_eq!(summary.io_ratio, "-");
+        assert_eq!(summary.max_output, None);
+        assert_eq!(summary.output_vault_balance, "0");
+        assert_eq!(summary.order_type, OrderSummaryOrderType::Custom);
+        assert_eq!(summary.order_bytes.as_ref(), &[1]);
     }
 
     #[rocket::async_test]

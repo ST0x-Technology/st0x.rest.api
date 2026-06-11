@@ -1,6 +1,7 @@
 use super::{
-    build_orders_list_response, current_wrap_ratios_for_orders, OrdersListDataSource,
-    RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    active_filter_for_state, build_orders_list_response, current_wrap_ratios_for_orders,
+    get_order_quotes_for_summaries, OrdersListDataSource, RaindexOrdersListDataSource,
+    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
@@ -8,7 +9,7 @@ use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{Denomination, ValidatedAddress};
-use crate::types::orders::{OrderSide, OrdersByTokenParams, OrdersListResponse};
+use crate::types::orders::{OrderSide, OrderState, OrdersByTokenParams, OrdersListResponse};
 use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::orders::GetOrdersFilters;
 use rain_orderbook_common::raindex_client::orders::GetOrdersTokenFilter;
@@ -19,6 +20,7 @@ use tracing::Instrument;
 pub(crate) async fn process_get_orders_by_token(
     ds: &dyn OrdersListDataSource,
     address: Address,
+    state: Option<OrderState>,
     side: Option<OrderSide>,
     page: Option<u16>,
     page_size: Option<u16>,
@@ -39,10 +41,11 @@ pub(crate) async fn process_get_orders_by_token(
         },
     };
 
+    let active_filter = active_filter_for_state(state);
     let filters = GetOrdersFilters {
-        active: Some(true),
+        active: active_filter,
         tokens: Some(token_filter),
-        has_positive_output_vault_balance: Some(true),
+        has_positive_output_vault_balance: (active_filter == Some(true)).then_some(true),
         ..Default::default()
     };
 
@@ -58,7 +61,7 @@ pub(crate) async fn process_get_orders_by_token(
         quoted_orders = orders.len(),
         "fetching batched quotes for orders by token"
     );
-    let quote_results = ds.get_order_quotes_batch(&orders).await;
+    let quote_results = get_order_quotes_for_summaries(ds, &orders).await;
     let wrap_ratios = current_wrap_ratios_for_orders(ds, denomination, &orders).await?;
 
     build_orders_list_response(
@@ -105,6 +108,7 @@ pub async fn get_orders_by_token(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
+        let state = params.state;
         let side = params.side;
         let page = params.page;
         let page_size = params.page_size;
@@ -117,12 +121,13 @@ pub async fn get_orders_by_token(
                 pool: pool.inner(),
             };
             let response =
-                process_get_orders_by_token(&ds, addr, side, page, page_size, denomination).await?;
+                process_get_orders_by_token(&ds, addr, state, side, page, page_size, denomination)
+                    .await?;
             return Ok(Json(response));
         }
 
         let cache_key =
-            orders_by_token_cache_key(addr, side.as_ref(), page, page_size, denomination);
+            orders_by_token_cache_key(addr, state, side.as_ref(), page, page_size, denomination);
         let response = app_state
             .response_caches
             .orders_by_token
@@ -133,7 +138,8 @@ pub async fn get_orders_by_token(
                     caches: &app_state.response_caches,
                     pool: pool.inner(),
                 };
-                process_get_orders_by_token(&ds, addr, side, page, page_size, denomination).await
+                process_get_orders_by_token(&ds, addr, state, side, page, page_size, denomination)
+                    .await
             })
             .await
             .map_err(|e| (*e).clone())?;
@@ -145,11 +151,17 @@ pub async fn get_orders_by_token(
 
 fn orders_by_token_cache_key(
     address: Address,
+    state: Option<OrderState>,
     side: Option<&OrderSide>,
     page: Option<u16>,
     page_size: Option<u16>,
     denomination: Denomination,
 ) -> String {
+    let state = match state.unwrap_or(OrderState::Active) {
+        OrderState::Active => "active",
+        OrderState::Inactive => "inactive",
+        OrderState::All => "all",
+    };
     let side = match side {
         Some(OrderSide::Input) => "input",
         Some(OrderSide::Output) => "output",
@@ -160,7 +172,7 @@ fn orders_by_token_cache_key(
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
     format!(
-        "orders/token/{}/{side}/{page}/{page_size}/{denomination:?}",
+        "orders/token/{}/{state}/{side}/{page}/{page_size}/{denomination:?}",
         address.to_string().to_ascii_lowercase()
     )
 }
@@ -171,8 +183,11 @@ mod tests {
     use crate::routes::order::test_fixtures::{
         mock_order, mock_order_with_shared_vaults, mock_quote,
     };
-    use crate::routes::orders::test_fixtures::MockOrdersListDataSource;
+    use crate::routes::orders::test_fixtures::{
+        MockOrdersListDataSource, RecordingOrdersListDataSource,
+    };
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
+    use crate::types::orders::OrderSummaryOrderType;
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -186,14 +201,18 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "USDC");
         assert_eq!(result.orders[0].output_token.symbol, "WETH");
+        assert_eq!(result.orders[0].chain_id, 8453);
         assert_eq!(result.orders[0].order_bytes.as_ref(), &[1]);
+        assert!(result.orders[0].active);
+        assert_eq!(result.orders[0].removed_at, None);
+        assert_eq!(result.orders[0].order_type, OrderSummaryOrderType::Custom);
         assert_eq!(result.orders[0].io_ratio, "1.5");
         assert_eq!(result.orders[0].max_output.as_deref(), Some("1"));
         assert_eq!(result.pagination.total_orders, 1);
@@ -214,6 +233,7 @@ mod tests {
         let result = process_get_orders_by_token(
             &ds,
             addr,
+            None,
             Some(OrderSide::Input),
             None,
             None,
@@ -238,7 +258,7 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
@@ -257,7 +277,8 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, Denomination::Wrapped).await;
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
+                .await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -272,13 +293,64 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "wtMSTR");
         assert_eq!(result.orders[0].output_token.symbol, "wtMSTR");
+        assert_eq!(result.orders[0].chain_id, 8453);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_token_inactive_state_sets_active_false_filter() {
+        let ds = RecordingOrdersListDataSource::default();
+        let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            .parse()
+            .unwrap();
+
+        let result = process_get_orders_by_token(
+            &ds,
+            addr,
+            Some(OrderState::Inactive),
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let filters = ds.filters.lock().expect("lock filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].active, Some(false));
+        assert_eq!(filters[0].has_positive_output_vault_balance, None);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_token_all_state_omits_active_filter() {
+        let ds = RecordingOrdersListDataSource::default();
+        let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            .parse()
+            .unwrap();
+
+        let result = process_get_orders_by_token(
+            &ds,
+            addr,
+            Some(OrderState::All),
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let filters = ds.filters.lock().expect("lock filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].active, None);
+        assert_eq!(filters[0].has_positive_output_vault_balance, None);
     }
 
     #[rocket::async_test]
@@ -317,12 +389,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            orders_by_token_cache_key(lower, None, None, None, Denomination::Wrapped),
+            orders_by_token_cache_key(lower, None, None, None, None, Denomination::Wrapped),
             orders_by_token_cache_key(
                 mixed,
                 None,
+                None,
                 Some(1),
                 Some(DEFAULT_PAGE_SIZE as u16),
+                Denomination::Wrapped
+            )
+        );
+        assert_ne!(
+            orders_by_token_cache_key(
+                lower,
+                Some(OrderState::Inactive),
+                None,
+                None,
+                None,
+                Denomination::Wrapped
+            ),
+            orders_by_token_cache_key(
+                lower,
+                Some(OrderState::All),
+                None,
+                None,
+                None,
                 Denomination::Wrapped
             )
         );
