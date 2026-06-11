@@ -56,6 +56,8 @@ pub struct OrderSummary {
     pub output_token: TokenRef,
     #[schema(example = "500000")]
     pub output_vault_balance: String,
+    #[schema(example = "500000")]
+    pub max_output: Option<String>,
     #[schema(example = "0.0005")]
     pub io_ratio: String,
     #[schema(example = 1718452800)]

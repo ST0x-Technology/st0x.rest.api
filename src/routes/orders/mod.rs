@@ -31,6 +31,12 @@ type OrderQuoteBatchResult = Result<Vec<Vec<RaindexOrderQuote>>, ApiError>;
 type IndexedOrder = (usize, RaindexOrder);
 type GroupedOrders = BTreeMap<u32, Vec<IndexedOrder>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderQuoteSummary {
+    pub io_ratio: String,
+    pub max_output: Option<String>,
+}
+
 #[async_trait]
 pub(crate) trait OrdersListDataSource: Send + Sync {
     async fn get_orders_list(
@@ -338,6 +344,7 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
 pub(crate) fn build_order_summary(
     order: &RaindexOrder,
     io_ratio: &str,
+    max_output: Option<String>,
     denomination: Denomination,
     wrap_ratios: &HashMap<Address, WrapRatioValue>,
 ) -> Result<OrderSummary, ApiError> {
@@ -366,6 +373,16 @@ pub(crate) fn build_order_summary(
     } else {
         io_ratio.to_string()
     };
+    let max_output = match (denomination, max_output) {
+        (Denomination::Unwrapped, Some(max_output)) => {
+            Some(crate::denomination::convert_wrapped_amount_for_token(
+                max_output,
+                output_token_info.address(),
+                wrap_ratios,
+            )?)
+        }
+        (_, max_output) => max_output,
+    };
 
     Ok(OrderSummary {
         order_hash: order.order_hash(),
@@ -382,29 +399,37 @@ pub(crate) fn build_order_summary(
             decimals: output_token_info.decimals(),
         },
         output_vault_balance,
+        max_output,
         io_ratio,
         created_at,
         orderbook_id: order.raindex(),
     })
 }
 
-pub(crate) fn quote_result_to_io_ratio(
+pub(crate) fn quote_result_to_summary(
     order: &RaindexOrder,
     quotes_result: OrderQuoteResult,
-) -> String {
+) -> OrderQuoteSummary {
     match quotes_result {
-        Ok(quotes) => quotes
-            .first()
-            .and_then(|quote| quote.data.as_ref())
-            .map(|quote| quote.formatted_ratio.clone())
-            .unwrap_or_else(|| "-".into()),
+        Ok(quotes) => {
+            let quote_data = quotes.first().and_then(|quote| quote.data.as_ref());
+            OrderQuoteSummary {
+                io_ratio: quote_data
+                    .map(|quote| quote.formatted_ratio.clone())
+                    .unwrap_or_else(|| "-".into()),
+                max_output: quote_data.map(|quote| quote.formatted_max_output.clone()),
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 order_hash = ?order.order_hash(),
                 error = ?err,
-                "quote fetch failed; using fallback io_ratio"
+                "quote fetch failed; using fallback io_ratio and null max_output"
             );
-            "-".into()
+            OrderQuoteSummary {
+                io_ratio: "-".into(),
+                max_output: None,
+            }
         }
     }
 }
@@ -445,10 +470,11 @@ pub(crate) fn build_orders_list_response(
 
     let mut summaries = Vec::with_capacity(orders.len());
     for (order, quotes_result) in orders.iter().zip(quote_results) {
-        let io_ratio = quote_result_to_io_ratio(order, quotes_result);
+        let quote_summary = quote_result_to_summary(order, quotes_result);
         summaries.push(build_order_summary(
             order,
-            &io_ratio,
+            &quote_summary.io_ratio,
+            quote_summary.max_output,
             denomination,
             wrap_ratios,
         )?);
@@ -536,7 +562,7 @@ pub(crate) mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::order::test_fixtures::{mock_quote, order_json};
+    use crate::routes::order::test_fixtures::{mock_failed_quote, mock_quote, order_json};
     use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::address;
     use serde_json::json;
@@ -772,10 +798,61 @@ mod tests {
             serde_json::from_value(value).expect("deserialize wrapped-output order");
         let ratios = HashMap::from([(wrapped_output, wrap_ratio(wrapped_output, "3"))]);
 
-        let summary =
-            build_order_summary(&order, "9", Denomination::Unwrapped, &ratios).expect("summary");
+        let summary = build_order_summary(
+            &order,
+            "9",
+            Some("4".into()),
+            Denomination::Unwrapped,
+            &ratios,
+        )
+        .expect("summary");
 
         assert_eq!(summary.output_vault_balance, "6");
+        assert_eq!(summary.max_output, Some("12".into()));
         assert_eq!(summary.io_ratio, "3");
+    }
+
+    #[test]
+    fn test_quote_result_to_summary_extracts_ratio_and_max_output() {
+        let order = mock_order_for_chain(
+            1,
+            "0x0000000000000000000000000000000000000000000000000000000000000102",
+        );
+
+        let summary = quote_result_to_summary(&order, Ok(vec![mock_quote("1.25")]));
+
+        assert_eq!(
+            summary,
+            OrderQuoteSummary {
+                io_ratio: "1.25".into(),
+                max_output: Some("1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_quote_result_to_summary_uses_null_max_output_for_missing_data() {
+        let order = mock_order_for_chain(
+            1,
+            "0x0000000000000000000000000000000000000000000000000000000000000103",
+        );
+
+        let empty_summary = quote_result_to_summary(&order, Ok(vec![]));
+        assert_eq!(
+            empty_summary,
+            OrderQuoteSummary {
+                io_ratio: "-".into(),
+                max_output: None,
+            }
+        );
+
+        let failed_summary = quote_result_to_summary(&order, Ok(vec![mock_failed_quote()]));
+        assert_eq!(
+            failed_summary,
+            OrderQuoteSummary {
+                io_ratio: "-".into(),
+                max_output: None,
+            }
+        );
     }
 }

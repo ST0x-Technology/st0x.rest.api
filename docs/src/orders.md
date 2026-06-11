@@ -183,6 +183,7 @@ curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10&denominati
       "inputToken": { "address": "0x...", "symbol": "USDC", "decimals": 6 },
       "outputToken": { "address": "0x...", "symbol": "WETH", "decimals": 18 },
       "outputVaultBalance": "0.5",
+      "maxOutput": "0.25",
       "ioRatio": "2500.0",
       "createdAt": 1708000000,
       "orderbookId": "0xOrderbookAddress"
@@ -197,6 +198,9 @@ curl "https://api.st0x.io/v1/orders/0xOwnerAddress?page=1&pageSize=10&denominati
   }
 }
 ```
+
+`maxOutput` is the quote-derived executable output amount for the listed order.
+It is `null` when quote data is unavailable.
 
 ## List Orders by Transaction
 
