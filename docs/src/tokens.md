@@ -98,3 +98,87 @@ The batch endpoint returns successful ratios in `data` and per-token failures in
 | `blockNumber`    | number         | Block number used for the ERC4626 batch read                                                          |
 | `blockTimestamp` | number or null | Block timestamp when available from the RPC                                                           |
 | `capturedAt`     | string         | Unix timestamp when the SDK captured the batch response                                               |
+
+## Token Proofs
+
+```
+GET /v1/tokens/{address}/proofs
+```
+
+Returns the raw proof data for a supported ST0x token. `{address}` can be the
+current wrapped token address, the token's `extensions.unwrappedAddress`, or its
+`extensions.legacyAddress` when one is present. The response always normalizes
+`address` to the current wrapped token address from the registry.
+
+The API returns raw hex strings from the configured subgraphs. It does not strip
+Rain metadata prefixes, decode CBOR, or parse schema hashes.
+
+### Request
+
+```bash
+curl https://api.st0x.io/v1/tokens/0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2/proofs \
+  -H "Authorization: Basic <credentials>"
+```
+
+### Response
+
+```json
+{
+  "address": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
+  "metadata": [
+    {
+      "id": "0xmeta-id",
+      "meta": "0x...",
+      "sender": "0xsender",
+      "subject": "0x000000000000000000000000ff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
+      "metaHash": "0xhash"
+    }
+  ],
+  "schemas": [
+    {
+      "id": "vault-info-id",
+      "information": "0x...",
+      "timestamp": 1717351200
+    }
+  ],
+  "receipts": [
+    {
+      "id": "receipt-info-id",
+      "receiptId": "1",
+      "txHash": "0xtxhash",
+      "type": "deposit",
+      "information": "0x...",
+      "timestamp": 1717351200
+    }
+  ]
+}
+```
+
+### Fields
+
+| Field         | Type   | Description                                                                  |
+| ------------- | ------ | ---------------------------------------------------------------------------- |
+| `address`     | string | Current wrapped ST0x token address from the registry                         |
+| `metadata`    | array  | Raw `metaV1S` rows for the wrapped token subject from the metaboard subgraph |
+| `schemas`     | array  | Raw `receiptVaultInformations` rows from the SFT subgraph                    |
+| `receipts`    | array  | Flattened deposit and withdraw receipt information rows                      |
+| `type`        | string | Receipt event type: `deposit` or `withdraw`                                  |
+| `information` | string | Raw hex information field from the subgraph                                  |
+| `timestamp`   | number | Subgraph timestamp parsed as a number                                        |
+
+### Not Found Responses
+
+The endpoint returns `404` when:
+
+- The address is not a supported ST0x token, unwrapped address, or legacy
+  address.
+- The SFT subgraph has no vault for the normalized wrapped token address.
+
+When the vault exists, empty subgraph collections are returned as empty arrays.
+
+### Registry Configuration
+
+Proofs use the Raindex YAML loaded from the active Dotrain registry at API
+startup. The API expects the SFT subgraph key to be `sft-{network}` under
+`subgraphs`, for example `subgraphs.sft-base`. The metadata source uses the
+network key under `metaboards`, for example `metaboards.base`.

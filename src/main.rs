@@ -83,6 +83,7 @@ enum StartupRegistryError {
         routes::tokens::get_tokens,
         routes::tokens::get_wrap_ratios,
         routes::tokens::get_wrap_ratio_by_address,
+        routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
         routes::order::post_order_dca,
@@ -429,6 +430,7 @@ async fn main() {
 mod tests {
     use crate::test_helpers::{basic_auth_header, client, mock_raindex_registry_url, seed_api_key};
     use rocket::http::{Header, Status};
+    use utoipa::OpenApi;
 
     #[rocket::async_test]
     async fn test_health_endpoint() {
@@ -438,6 +440,33 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         assert_eq!(body["status"], "ok");
+    }
+
+    #[test]
+    fn test_openapi_includes_token_proofs_schema() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+        let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+
+        assert_eq!(proofs_path["tags"][0], "Tokens");
+        assert_eq!(
+            proofs_path["parameters"][0]["description"],
+            "Wrapped, unwrapped, or legacy ST0x token address"
+        );
+        assert_eq!(
+            proofs_path["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TokenProofsResponse"
+        );
+        assert_eq!(
+            proofs_path["responses"]["404"]["description"],
+            "Wrapped ST0x token or SFT vault not found"
+        );
+
+        let schemas = &openapi["components"]["schemas"];
+        assert!(schemas["TokenProofsResponse"]["properties"]["metadata"].is_object());
+        assert!(schemas["TokenProofMetadata"]["properties"]["metaHash"].is_object());
+        assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
+        assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
+        assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
     }
 
     fn test_config(

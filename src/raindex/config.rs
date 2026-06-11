@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use rain_orderbook_app_settings::yaml::raindex::RaindexYaml;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_js_api::registry::DotrainRegistry;
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub(crate) struct RaindexProvider {
     client: RaindexClient,
+    raindex_yaml: RaindexYaml,
     db_path: Option<PathBuf>,
 }
 
@@ -40,9 +42,13 @@ impl RaindexProvider {
                     .get_raindex_client(db.clone())
                     .await
                     .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
+                let raindex_yaml = registry
+                    .get_raindex_yaml()
+                    .map_err(|e| RaindexProviderError::RegistryLoad(e.to_string()))?;
 
                 Ok(RaindexProvider {
                     client,
+                    raindex_yaml,
                     db_path: db,
                 })
             });
@@ -55,6 +61,10 @@ impl RaindexProvider {
 
     pub(crate) fn client(&self) -> &RaindexClient {
         &self.client
+    }
+
+    pub(crate) fn raindex_yaml(&self) -> &RaindexYaml {
+        &self.raindex_yaml
     }
 
     pub(crate) fn db_path(&self) -> Option<PathBuf> {

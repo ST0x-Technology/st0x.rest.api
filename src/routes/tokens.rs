@@ -14,8 +14,8 @@ use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -41,6 +41,54 @@ pub struct WrapRatioErrorResponse {
 pub struct WrapRatioBatchResponse {
     data: Vec<WrapRatioResponse>,
     errors: Vec<WrapRatioErrorResponse>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenProofsResponse {
+    #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
+    address: Address,
+    metadata: Vec<TokenProofMetadata>,
+    schemas: Vec<TokenProofSchema>,
+    receipts: Vec<TokenProofReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenProofMetadata {
+    id: String,
+    meta: String,
+    sender: String,
+    subject: String,
+    #[schema(example = "0x1234")]
+    meta_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct TokenProofSchema {
+    id: String,
+    information: String,
+    timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct TokenProofReceipt {
+    id: String,
+    #[serde(rename = "receiptId")]
+    receipt_id: String,
+    #[serde(rename = "txHash")]
+    tx_hash: String,
+    #[serde(rename = "type")]
+    receipt_type: TokenProofReceiptType,
+    information: String,
+    timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenProofReceiptType {
+    Deposit,
+    Withdraw,
 }
 
 impl From<TokenCfg> for TokenResponse {
@@ -98,6 +146,337 @@ async fn registry_tokens(
         .into_values()
         .collect();
     Ok(tokens)
+}
+
+fn extension_address(token: &TokenCfg, key: &str) -> Option<Address> {
+    token
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(key))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Address>().ok())
+}
+
+fn matches_token_proof_address(token: &TokenCfg, address: Address) -> bool {
+    token.address == address
+        || extension_address(token, "unwrappedAddress") == Some(address)
+        || extension_address(token, "legacyAddress") == Some(address)
+}
+
+fn resolve_proof_subgraph_urls(
+    yaml: &rain_orderbook_app_settings::yaml::raindex::RaindexYaml,
+    network_key: &str,
+) -> Result<(String, String), ApiError> {
+    let sft_subgraph = resolve_sft_subgraph_url(yaml, network_key)?;
+    let metaboard = yaml.get_metaboard(network_key).map_err(|error| {
+        tracing::error!(
+            network_key,
+            error = %error,
+            "failed to resolve metadata subgraph"
+        );
+        ApiError::Internal("metadata subgraph is not configured".into())
+    })?;
+    tracing::info!(
+        network_key,
+        metaboard_key = network_key,
+        "resolved metadata subgraph"
+    );
+
+    Ok((sft_subgraph, metaboard.url.to_string()))
+}
+
+fn resolve_sft_subgraph_url(
+    yaml: &rain_orderbook_app_settings::yaml::raindex::RaindexYaml,
+    network_key: &str,
+) -> Result<String, ApiError> {
+    // Convention: the SFT subgraph is configured separately from the raindex
+    // subgraph as `subgraphs.sft-{network}` (for example, `sft-base`).
+    let key = format!("sft-{network_key}");
+    if let Ok(subgraph) = yaml.get_subgraph(&key) {
+        tracing::info!(network_key, sft_subgraph_key = %key, "resolved SFT subgraph");
+        return Ok(subgraph.url.to_string());
+    }
+
+    tracing::error!(network_key, sft_subgraph_key = %key, "failed to resolve SFT subgraph");
+    Err(ApiError::Internal("SFT subgraph is not configured".into()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TimestampValue {
+    Number(u64),
+    String(String),
+}
+
+impl TimestampValue {
+    fn parse(&self) -> Result<u64, ApiError> {
+        match self {
+            TimestampValue::Number(value) => Ok(*value),
+            TimestampValue::String(value) => value.parse::<u64>().map_err(|error| {
+                tracing::error!(value, error = %error, "invalid timestamp from subgraph");
+                ApiError::Internal("invalid timestamp from subgraph".into())
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlResponse<T> {
+    data: Option<T>,
+    errors: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SftProofsData {
+    #[serde(default)]
+    offchain_asset_receipt_vaults: Vec<SftVault>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SftVault {
+    #[serde(default)]
+    receipt_vault_informations: Vec<SftReceiptVaultInformation>,
+    #[serde(default)]
+    deposits: Vec<SftReceiptEvent>,
+    #[serde(default)]
+    withdraws: Vec<SftReceiptEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SftReceiptVaultInformation {
+    id: String,
+    information: String,
+    timestamp: TimestampValue,
+}
+
+#[derive(Debug, Deserialize)]
+struct SftReceiptEvent {
+    timestamp: TimestampValue,
+    transaction: Option<SftTransaction>,
+    receipt: Option<SftReceipt>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SftTransaction {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SftReceipt {
+    receipt_id: String,
+    #[serde(default)]
+    receipt_informations: Vec<SftReceiptInformation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SftReceiptInformation {
+    id: String,
+    information: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataProofsData {
+    #[serde(default)]
+    meta_v1_s: Vec<TokenProofMetadata>,
+}
+
+async fn post_graphql<T: for<'de> Deserialize<'de>>(
+    url: &str,
+    query: &str,
+    variables: Value,
+) -> Result<T, ApiError> {
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "query": query,
+            "variables": variables,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::error!(url, error = %error, "failed to query subgraph");
+            ApiError::Internal("failed to query subgraph".into())
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        tracing::error!(
+            url,
+            status = status.as_u16(),
+            "subgraph returned error status"
+        );
+        return Err(ApiError::Internal("subgraph returned error status".into()));
+    }
+
+    let body = response
+        .json::<GraphqlResponse<T>>()
+        .await
+        .map_err(|error| {
+            tracing::error!(url, error = %error, "failed to decode subgraph response");
+            ApiError::Internal("failed to decode subgraph response".into())
+        })?;
+
+    if let Some(errors) = body.errors {
+        tracing::error!(url, errors = %errors, "subgraph returned GraphQL errors");
+        return Err(ApiError::Internal(
+            "subgraph returned GraphQL errors".into(),
+        ));
+    }
+
+    body.data.ok_or_else(|| {
+        tracing::error!(url, "subgraph response missing data");
+        ApiError::Internal("subgraph response missing data".into())
+    })
+}
+
+fn build_token_proofs_response(
+    address: Address,
+    sft: SftProofsData,
+    metadata: MetadataProofsData,
+) -> Result<TokenProofsResponse, ApiError> {
+    let Some(vault) = sft.offchain_asset_receipt_vaults.first() else {
+        tracing::warn!(address = %address, "SFT vault not found for token");
+        return Err(ApiError::NotFound("SFT vault not found for token".into()));
+    };
+
+    let schemas = vault
+        .receipt_vault_informations
+        .iter()
+        .map(|schema| {
+            Ok(TokenProofSchema {
+                id: schema.id.clone(),
+                information: schema.information.clone(),
+                timestamp: schema.timestamp.parse()?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    let mut receipts = flatten_receipt_events(&vault.deposits, TokenProofReceiptType::Deposit)?;
+    receipts.extend(flatten_receipt_events(
+        &vault.withdraws,
+        TokenProofReceiptType::Withdraw,
+    )?);
+
+    Ok(TokenProofsResponse {
+        address,
+        metadata: metadata.meta_v1_s,
+        schemas,
+        receipts,
+    })
+}
+
+fn flatten_receipt_events(
+    events: &[SftReceiptEvent],
+    receipt_type: TokenProofReceiptType,
+) -> Result<Vec<TokenProofReceipt>, ApiError> {
+    let mut rows = Vec::new();
+
+    for event in events {
+        let timestamp = event.timestamp.parse()?;
+        let Some(transaction) = event.transaction.as_ref() else {
+            tracing::error!("receipt event missing transaction");
+            return Err(ApiError::Internal(
+                "receipt event missing transaction".into(),
+            ));
+        };
+        let Some(receipt) = event.receipt.as_ref() else {
+            tracing::error!("receipt event missing receipt");
+            return Err(ApiError::Internal("receipt event missing receipt".into()));
+        };
+
+        for information in &receipt.receipt_informations {
+            rows.push(TokenProofReceipt {
+                id: information.id.clone(),
+                receipt_id: receipt.receipt_id.clone(),
+                tx_hash: transaction.id.clone(),
+                receipt_type: receipt_type.clone(),
+                information: information.information.clone(),
+                timestamp,
+            });
+        }
+    }
+
+    Ok(rows)
+}
+
+async fn read_token_proofs(
+    address: Address,
+    sft_subgraph_url: &str,
+    metadata_subgraph_url: &str,
+) -> Result<TokenProofsResponse, ApiError> {
+    const SFT_QUERY: &str = r#"
+query TokenProofs($address: String!) {
+  offchainAssetReceiptVaults(where: { wrappedTokenContractAddress: $address }) {
+    id
+    address
+    receiptVaultInformations(orderBy: timestamp, orderDirection: desc) {
+      id
+      information
+      timestamp
+    }
+    deposits {
+      id
+      timestamp
+      transaction { id }
+      receipt {
+        id
+        receiptId
+        receiptInformations { information id }
+      }
+    }
+    withdraws {
+      id
+      timestamp
+      transaction { id }
+      receipt {
+        id
+        receiptId
+        receiptInformations { information id }
+      }
+    }
+  }
+}
+"#;
+    const METADATA_QUERY: &str = r#"
+query TokenMetadata($subject: String!) {
+  metaV1S(
+    where: { subject: $subject },
+    orderBy: transaction__timestamp,
+    orderDirection: desc
+  ) {
+    id
+    meta
+    sender
+    subject
+    metaHash
+  }
+}
+"#;
+
+    let address_lower = format!("{address:#x}");
+    let subject = format!(
+        "0x000000000000000000000000{}",
+        address_lower.trim_start_matches("0x")
+    );
+
+    let (sft, metadata) = tokio::try_join!(
+        post_graphql::<SftProofsData>(
+            sft_subgraph_url,
+            SFT_QUERY,
+            json!({ "address": address_lower }),
+        ),
+        post_graphql::<MetadataProofsData>(
+            metadata_subgraph_url,
+            METADATA_QUERY,
+            json!({ "subject": subject }),
+        ),
+    )?;
+
+    build_token_proofs_response(address, sft, metadata)
 }
 
 #[utoipa::path(
@@ -342,8 +721,78 @@ pub async fn get_wrap_ratio_by_address(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/tokens/{address}/proofs",
+    tag = "Tokens",
+    security(("basicAuth" = [])),
+    params(
+        ("address" = String, Path, description = "Wrapped, unwrapped, or legacy ST0x token address")
+    ),
+    responses(
+        (status = 200, description = "Raw ST0x proof metadata, schemas, and receipts", body = TokenProofsResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 404, description = "Wrapped ST0x token or SFT vault not found", body = ApiErrorResponse),
+        (status = 422, description = "Invalid token address", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    )
+)]
+#[get("/<address>/proofs", rank = 10)]
+pub async fn get_token_proofs(
+    _global: GlobalRateLimit,
+    _key: AuthenticatedKey,
+    span: TracingSpan,
+    shared_raindex: &State<SharedRaindexProvider>,
+    address: ValidatedAddress,
+) -> Result<Json<TokenProofsResponse>, ApiError> {
+    async move {
+        tracing::info!(address = %address.0, "request received");
+
+        let tokens = registry_tokens(shared_raindex).await?;
+        let Some(token) = tokens
+            .iter()
+            .find(|token| is_st0x_token(token) && matches_token_proof_address(token, address.0))
+        else {
+            tracing::warn!(address = %address.0, "wrapped ST0x token not found");
+            return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
+        };
+
+        let (sft_subgraph_url, metadata_subgraph_url) = {
+            let raindex = shared_raindex.read().await;
+            resolve_proof_subgraph_urls(raindex.raindex_yaml(), &token.network.key)?
+        };
+
+        tracing::info!(
+            requested_address = %address.0,
+            wrapped_address = %token.address,
+            network_key = %token.network.key,
+            "querying token proofs"
+        );
+
+        let response =
+            read_token_proofs(token.address, &sft_subgraph_url, &metadata_subgraph_url).await?;
+
+        tracing::info!(
+            wrapped_address = %token.address,
+            metadata_count = response.metadata.len(),
+            schema_count = response.schemas.len(),
+            receipt_count = response.receipts.len(),
+            "returning token proofs"
+        );
+        Ok(Json(response))
+    }
+    .instrument(span.0)
+    .await
+}
+
 pub fn routes() -> Vec<Route> {
-    rocket::routes![get_tokens, get_wrap_ratios, get_wrap_ratio_by_address]
+    rocket::routes![
+        get_tokens,
+        get_wrap_ratios,
+        get_wrap_ratio_by_address,
+        get_token_proofs
+    ]
 }
 
 #[cfg(test)]
@@ -364,6 +813,7 @@ mod tests {
     };
     use rocket::http::{Header, Status};
     use serde_json::json;
+    use std::sync::{Arc as StdArc, Mutex};
 
     const WT_MSTR: Address = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
     const T_MSTR: Address = address!("013b782f402d61aa1004cca95b9f5bb402c9d5fe");
@@ -371,6 +821,7 @@ mod tests {
     const T_SECOND: Address = address!("4444444444444444444444444444444444444444");
     const WT_BAD: Address = address!("1111111111111111111111111111111111111111");
     const T_BAD: Address = address!("2222222222222222222222222222222222222222");
+    const WT_LEGACY: Address = address!("5555555555555555555555555555555555555555");
 
     fn success_result<C: SolCall>(value: &C::Return) -> Multicall3Result {
         Multicall3Result {
@@ -702,6 +1153,226 @@ using-tokens-from:
             .await
     }
 
+    async fn mock_proofs_subgraphs(
+        sft_body: serde_json::Value,
+        metadata_body: serde_json::Value,
+    ) -> (String, String) {
+        let (sft_url, metadata_url, _) =
+            mock_proofs_subgraphs_with_requests(sft_body, metadata_body).await;
+        (sft_url, metadata_url)
+    }
+
+    async fn mock_proofs_subgraphs_with_requests(
+        sft_body: serde_json::Value,
+        metadata_body: serde_json::Value,
+    ) -> (String, String, StdArc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock proofs subgraph");
+        let addr = listener.local_addr().expect("mock proofs subgraph address");
+        let requests = StdArc::new(Mutex::new(Vec::new()));
+        let recorded_requests = requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+
+                let sft_body = sft_body.clone();
+                let metadata_body = metadata_body.clone();
+                let requests = recorded_requests.clone();
+
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                        .await
+                        .unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    requests
+                        .lock()
+                        .expect("mock proofs request lock")
+                        .push(request.clone());
+                    let body = if request.contains("/metadata") {
+                        metadata_body
+                    } else {
+                        sft_body
+                    }
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            format!("http://{addr}/sft"),
+            format!("http://{addr}/metadata"),
+            requests,
+        )
+    }
+
+    async fn proofs_client(
+        sft_url: &str,
+        metadata_url: &str,
+    ) -> rocket::local::asynchronous::Client {
+        let settings = format!(
+            r#"version: 6
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+subgraphs:
+  base: https://example.com/raindex-subgraph
+  sft-base: {sft_url}
+metaboards:
+  base: {metadata_url}
+raindexes:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+using-tokens-from:
+  - __TOKENS_URL__
+"#
+        );
+        let remote_tokens = format!(
+            r#"{{
+  "name": "ST0x Proof Token List",
+  "timestamp": "2026-06-02T00:00:00.000Z",
+  "version": {{
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  }},
+  "tokens": [
+    {{
+      "chainId": 8453,
+      "address": "{WT_MSTR:#x}",
+      "decimals": 18,
+      "name": "Wrapped MicroStrategy ST0x",
+      "symbol": "wtMSTR",
+      "extensions": {{
+        "category": "ST0x",
+        "unwrappedAddress": "{T_MSTR:#x}",
+        "legacyAddress": "{WT_LEGACY:#x}"
+      }}
+    }},
+    {{
+      "chainId": 8453,
+      "address": "0x4200000000000000000000000000000000000006",
+      "decimals": 18,
+      "name": "Wrapped Ether",
+      "symbol": "WETH"
+    }}
+  ]
+}}"#
+        );
+        let registry_url =
+            mock_raindex_registry_url_with_settings_and_tokens(&settings, &remote_tokens).await;
+        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
+            .await
+            .expect("load raindex config");
+        TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await
+    }
+
+    async fn authorized_get<'a>(
+        client: &'a rocket::local::asynchronous::Client,
+        path: String,
+    ) -> rocket::local::asynchronous::LocalResponse<'a> {
+        let (key_id, secret) = seed_api_key(client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        client
+            .get(path)
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await
+    }
+
+    fn proofs_sft_body() -> serde_json::Value {
+        json!({
+            "data": {
+                "offchainAssetReceiptVaults": [{
+                    "id": "vault-1",
+                    "address": "0xvault",
+                    "receiptVaultInformations": [{
+                        "id": "schema-1",
+                        "information": "0xRAWSCHEMA",
+                        "timestamp": "101"
+                    }],
+                    "deposits": [{
+                        "id": "deposit-1",
+                        "timestamp": "201",
+                        "transaction": { "id": "0xdeposit" },
+                        "receipt": {
+                            "id": "receipt-1",
+                            "receiptId": "7",
+                            "receiptInformations": [
+                                { "id": "deposit-info-1", "information": "0xRAWDEPOSIT1" },
+                                { "id": "deposit-info-2", "information": "0xRAWDEPOSIT2" }
+                            ]
+                        }
+                    }],
+                    "withdraws": [{
+                        "id": "withdraw-1",
+                        "timestamp": 202,
+                        "transaction": { "id": "0xwithdraw" },
+                        "receipt": {
+                            "id": "receipt-2",
+                            "receiptId": "8",
+                            "receiptInformations": [
+                                { "id": "withdraw-info-1", "information": "0xRAWWITHDRAW" }
+                            ]
+                        }
+                    }]
+                }]
+            }
+        })
+    }
+
+    fn proofs_metadata_body() -> serde_json::Value {
+        json!({
+            "data": {
+                "metaV1S": [{
+                    "id": "meta-1",
+                    "meta": "0xRAWMETA",
+                    "sender": "0xsender",
+                    "subject": format!(
+                        "0x000000000000000000000000{}",
+                        format!("{WT_MSTR:#x}").trim_start_matches("0x")
+                    ),
+                    "metaHash": "0xmetahash"
+                }]
+            }
+        })
+    }
+
+    fn graphql_request_for_path(requests: &[String], path: &str) -> serde_json::Value {
+        let request = requests
+            .iter()
+            .find(|request| request.contains(path))
+            .expect("mock GraphQL request for path");
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("mock GraphQL request body");
+        serde_json::from_str(body).expect("mock GraphQL request body is json")
+    }
+
     #[rocket::async_test]
     async fn test_get_tokens_returns_token_list() {
         let client = TestClientBuilder::new().build().await;
@@ -927,6 +1598,154 @@ using-tokens-from:
             first["isin"],
             serde_json::Value::String("US1725731079".to_string())
         );
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_rejects_invalid_address() {
+        let (sft_url, metadata_url) =
+            mock_proofs_subgraphs(proofs_sft_body(), proofs_metadata_body()).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        let response =
+            authorized_get(&client, "/v1/tokens/not-an-address/proofs".to_string()).await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_returns_not_found_for_unsupported_token() {
+        let (sft_url, metadata_url) =
+            mock_proofs_subgraphs(proofs_sft_body(), proofs_metadata_body()).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        let response = authorized_get(
+            &client,
+            "/v1/tokens/0x4200000000000000000000000000000000000006/proofs".to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), Status::NotFound);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_resolves_wrapped_unwrapped_and_legacy_addresses() {
+        let (sft_url, metadata_url) =
+            mock_proofs_subgraphs(proofs_sft_body(), proofs_metadata_body()).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        for address in [WT_MSTR, T_MSTR, WT_LEGACY] {
+            let response = authorized_get(&client, format!("/v1/tokens/{address:#x}/proofs")).await;
+            assert_eq!(response.status(), Status::Ok);
+
+            let body: serde_json::Value =
+                serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+            assert_eq!(body["address"], format!("{WT_MSTR:#x}"));
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_queries_subgraphs_with_normalized_wrapped_address() {
+        let (sft_url, metadata_url, requests) =
+            mock_proofs_subgraphs_with_requests(proofs_sft_body(), proofs_metadata_body()).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        let response = authorized_get(&client, format!("/v1/tokens/{T_MSTR:#x}/proofs")).await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let recorded = requests.lock().expect("mock requests").clone();
+        let sft_request = graphql_request_for_path(&recorded, "/sft");
+        let metadata_request = graphql_request_for_path(&recorded, "/metadata");
+        let wrapped_address = format!("{WT_MSTR:#x}");
+        let metadata_subject = format!(
+            "0x000000000000000000000000{}",
+            wrapped_address.trim_start_matches("0x")
+        );
+
+        assert_eq!(sft_request["variables"]["address"], wrapped_address);
+        assert_eq!(metadata_request["variables"]["subject"], metadata_subject);
+        assert!(sft_request["query"]
+            .as_str()
+            .expect("SFT query string")
+            .contains("wrappedTokenContractAddress: $address"));
+        assert!(metadata_request["query"]
+            .as_str()
+            .expect("metadata query string")
+            .contains("subject: $subject"));
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_returns_raw_metadata_schemas_and_flattened_receipts() {
+        let (sft_url, metadata_url) =
+            mock_proofs_subgraphs(proofs_sft_body(), proofs_metadata_body()).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        let response = authorized_get(&client, format!("/v1/tokens/{WT_MSTR:#x}/proofs")).await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["address"], format!("{WT_MSTR:#x}"));
+        assert_eq!(body["metadata"][0]["meta"], "0xRAWMETA");
+        assert_eq!(body["metadata"][0]["metaHash"], "0xmetahash");
+        assert_eq!(body["schemas"][0]["id"], "schema-1");
+        assert_eq!(body["schemas"][0]["information"], "0xRAWSCHEMA");
+        assert_eq!(body["schemas"][0]["timestamp"], 101);
+
+        let receipts = body["receipts"].as_array().expect("receipts is an array");
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts.iter().any(|row| row["id"] == "deposit-info-1"
+            && row["receiptId"] == "7"
+            && row["txHash"] == "0xdeposit"
+            && row["type"] == "deposit"
+            && row["information"] == "0xRAWDEPOSIT1"
+            && row["timestamp"] == 201));
+        assert!(receipts.iter().any(|row| row["id"] == "deposit-info-2"
+            && row["type"] == "deposit"
+            && row["information"] == "0xRAWDEPOSIT2"));
+        assert!(receipts.iter().any(|row| row["id"] == "withdraw-info-1"
+            && row["receiptId"] == "8"
+            && row["txHash"] == "0xwithdraw"
+            && row["type"] == "withdraw"
+            && row["information"] == "0xRAWWITHDRAW"
+            && row["timestamp"] == 202));
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_returns_empty_collections_when_vault_has_no_rows() {
+        let sft_body = json!({
+            "data": {
+                "offchainAssetReceiptVaults": [{
+                    "id": "vault-1",
+                    "address": "0xvault",
+                    "receiptVaultInformations": [],
+                    "deposits": [],
+                    "withdraws": []
+                }]
+            }
+        });
+        let metadata_body = json!({ "data": { "metaV1S": [] } });
+        let (sft_url, metadata_url) = mock_proofs_subgraphs(sft_body, metadata_body).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        let response = authorized_get(&client, format!("/v1/tokens/{WT_MSTR:#x}/proofs")).await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["metadata"].as_array().unwrap().len(), 0);
+        assert_eq!(body["schemas"].as_array().unwrap().len(), 0);
+        assert_eq!(body["receipts"].as_array().unwrap().len(), 0);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_proofs_returns_not_found_when_sft_vault_is_missing() {
+        let sft_body = json!({ "data": { "offchainAssetReceiptVaults": [] } });
+        let (sft_url, metadata_url) = mock_proofs_subgraphs(sft_body, proofs_metadata_body()).await;
+        let client = proofs_client(&sft_url, &metadata_url).await;
+
+        let response = authorized_get(&client, format!("/v1/tokens/{WT_MSTR:#x}/proofs")).await;
+
+        assert_eq!(response.status(), Status::NotFound);
     }
 
     #[rocket::async_test]
