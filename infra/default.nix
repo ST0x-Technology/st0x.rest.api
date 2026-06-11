@@ -1,8 +1,17 @@
-{ pkgs, ragenix, rainix, system }:
+{
+  pkgs,
+  ragenix,
+  rainix,
+  system,
+}:
 
 let
-  buildInputs =
-    [ pkgs.terraform pkgs.rage pkgs.jq ragenix.packages.${system}.default ];
+  buildInputs = [
+    pkgs.terraform
+    pkgs.rage
+    pkgs.jq
+    ragenix.packages.${system}.default
+  ];
 
   tfState = "infra/terraform.tfstate";
   tfVars = "infra/terraform.tfvars";
@@ -33,9 +42,7 @@ let
 
   encryptState = ''
     if [ -f ${tfState} ]; then
-      nix eval --raw --file ${
-        ../keys.nix
-      } roles.ssh --apply 'builtins.concatStringsSep "\n"' \
+      nix eval --raw --file ${../keys.nix} roles.ssh --apply 'builtins.concatStringsSep "\n"' \
         | rage -e -R /dev/stdin -o ${tfState}.age ${tfState}
     fi
   '';
@@ -96,9 +103,7 @@ let
   '';
 
   encryptVars = ''
-    nix eval --raw --file ${
-      ../keys.nix
-    } roles.infra --apply 'builtins.concatStringsSep "\n"' \
+    nix eval --raw --file ${../keys.nix} roles.infra --apply 'builtins.concatStringsSep "\n"' \
       | rage -e -R /dev/stdin -o ${tfVars}.age ${tfVars}
   '';
 
@@ -119,6 +124,7 @@ let
     import_if_needed() {
       local addr="$1"
       local id="$2"
+      local allow_missing="''${3:-false}"
       local output
 
       if output=$(terraform -chdir=infra import \
@@ -133,13 +139,19 @@ let
         return 0
       fi
 
+      if [ "$allow_missing" = "true" ] && echo "$output" | grep -qiE \
+        '404|could not be found|Cannot import non-existent remote object'; then
+        echo "Import skipped for $addr: remote resource $id is missing; Terraform will create it"
+        return 0
+      fi
+
       echo "$output" >&2
       return 1
     }
 
     terraform -chdir=infra init
     import_if_needed '${previewVolumeAddr}' '${previewVolumeId}'
-    import_if_needed '${previewDropletAddr}' '${previewDropletId}'
+    import_if_needed '${previewDropletAddr}' '${previewDropletId}' true
     import_if_needed '${previewReservedIpAddr}' '${previewReservedIp}'
 
     if [ "''${RECREATE_PREVIEW_HOST:-false}" = "true" ]; then
@@ -154,8 +166,15 @@ let
     terraform -chdir=infra apply tfplan
   '';
 
-in {
-  inherit buildInputs parseIdentity resolveIp tfRekey tfPreviewProvision;
+in
+{
+  inherit
+    buildInputs
+    parseIdentity
+    resolveIp
+    tfRekey
+    tfPreviewProvision
+    ;
 
   tfInit = rainix.mkTask.${system} {
     name = "tf-init";

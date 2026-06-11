@@ -64,6 +64,11 @@ jobs:
             echo "DO_TOKEN secret is required for preview infrastructure deploys" >&2
             exit 1
           fi
+          export TF_VAR_preview_bootstrap_ssh_public_key="$(ssh-keygen -y -f ~/.ssh/id_ed25519)"
+          if [ -z "$TF_VAR_preview_bootstrap_ssh_public_key" ]; then
+            echo "Unable to derive preview bootstrap public key from SSH_KEY" >&2
+            exit 1
+          fi
           nix run .#tfPreviewProvision
       - name: Commit encrypted Terraform state
         run: |
