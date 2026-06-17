@@ -1,4 +1,8 @@
 use crate::auth::AuthenticatedKey;
+use crate::db::wrapped_exchange_rate_history::{
+    count_wrapped_exchange_rate_snapshots_for_share,
+    list_wrapped_exchange_rate_snapshots_for_share, WrappedExchangeRateSnapshot,
+};
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -12,12 +16,14 @@ use crate::wrap_ratio::{
 use alloy::primitives::Address;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
+use rocket::form::FromForm;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::Instrument;
+use utoipa::IntoParams;
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
@@ -41,6 +47,60 @@ pub struct WrapRatioErrorResponse {
 pub struct WrapRatioBatchResponse {
     data: Vec<WrapRatioResponse>,
     errors: Vec<WrapRatioErrorResponse>,
+}
+
+#[derive(Debug, Clone, FromForm, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct WrapRatioHistoryParams {
+    #[field(name = "page")]
+    #[param(example = 1)]
+    page: Option<u32>,
+    #[field(name = "pageSize")]
+    #[param(example = 20)]
+    page_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrapRatioHistoryResponse {
+    #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
+    share_address: Address,
+    #[schema(value_type = String, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
+    asset_address: Address,
+    events: Vec<WrapRatioHistorySnapshotEvent>,
+    pagination: WrapRatioHistoryPagination,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrapRatioHistorySnapshotEvent {
+    #[serde(rename = "type")]
+    #[schema(example = "snapshot")]
+    event_type: String,
+    #[schema(example = 123)]
+    block_number: u64,
+    #[schema(nullable = true, example = 456)]
+    block_timestamp: Option<u64>,
+    #[schema(example = "1.0027")]
+    assets_per_share: String,
+    #[schema(example = "1781506371")]
+    captured_at: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WrapRatioHistoryPagination {
+    #[schema(example = 1)]
+    page: u32,
+    #[schema(example = 20)]
+    page_size: u32,
+    #[schema(example = 42)]
+    total_events: u64,
+    #[schema(example = 3)]
+    total_pages: u64,
+    #[schema(example = true)]
+    has_more: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -146,6 +206,67 @@ async fn registry_tokens(
         .into_values()
         .collect();
     Ok(tokens)
+}
+
+fn normalize_address(address: Address) -> String {
+    format!("{address:#x}").to_ascii_lowercase()
+}
+
+fn wrap_ratio_history_pagination_params(
+    params: WrapRatioHistoryParams,
+) -> Result<(u32, u32, u32), ApiError> {
+    let page = params.page.unwrap_or(1);
+    if page == 0 {
+        return Err(ApiError::BadRequest("page must be greater than 0".into()));
+    }
+
+    let page_size = params.page_size.unwrap_or(20).min(100);
+    if page_size == 0 {
+        return Err(ApiError::BadRequest(
+            "pageSize must be greater than 0".into(),
+        ));
+    }
+
+    let offset = page
+        .checked_sub(1)
+        .and_then(|page_index| page_index.checked_mul(page_size))
+        .ok_or_else(|| ApiError::BadRequest("pagination offset value too large".into()))?;
+
+    Ok((page, page_size, offset))
+}
+
+fn build_wrap_ratio_history_pagination(
+    total_events: u64,
+    page: u32,
+    page_size: u32,
+) -> WrapRatioHistoryPagination {
+    let total_pages = total_events.div_ceil(page_size as u64);
+    WrapRatioHistoryPagination {
+        page,
+        page_size,
+        total_events,
+        total_pages,
+        has_more: (page as u64) < total_pages,
+    }
+}
+
+fn wrap_ratio_history_event_from_snapshot(
+    snapshot: WrappedExchangeRateSnapshot,
+) -> Result<WrapRatioHistorySnapshotEvent, ApiError> {
+    Ok(WrapRatioHistorySnapshotEvent {
+        event_type: "snapshot".to_string(),
+        block_number: snapshot
+            .block_number
+            .try_into()
+            .map_err(|_| ApiError::Internal("block number overflow".into()))?,
+        block_timestamp: snapshot
+            .block_timestamp
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| ApiError::Internal("block timestamp overflow".into()))?,
+        assets_per_share: snapshot.assets_per_share,
+        captured_at: snapshot.captured_at,
+    })
 }
 
 fn extension_address(token: &TokenCfg, key: &str) -> Option<Address> {
@@ -723,6 +844,110 @@ pub async fn get_wrap_ratio_by_address(
 
 #[utoipa::path(
     get,
+    path = "/v1/tokens/wrap-ratio/{address}/history",
+    tag = "Tokens",
+    security(("basicAuth" = [])),
+    params(
+        ("address" = String, Path, description = "Wrapped token / ERC4626 vault address"),
+        WrapRatioHistoryParams
+    ),
+    responses(
+        (status = 200, description = "Wrapped token ratio snapshot history", body = WrapRatioHistoryResponse),
+        (status = 400, description = "Invalid pagination parameters", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 404, description = "Wrapped ST0x token not found", body = ApiErrorResponse),
+        (status = 422, description = "Invalid wrapped token address", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    )
+)]
+#[get("/wrap-ratio/<address>/history?<params..>")]
+pub async fn get_wrap_ratio_history_by_address(
+    _global: GlobalRateLimit,
+    _key: AuthenticatedKey,
+    span: TracingSpan,
+    shared_raindex: &State<SharedRaindexProvider>,
+    pool: &State<DbPool>,
+    address: ValidatedAddress,
+    params: WrapRatioHistoryParams,
+) -> Result<Json<WrapRatioHistoryResponse>, ApiError> {
+    async move {
+        tracing::info!(share_address = %address.0, "request received");
+
+        let tokens = registry_tokens(shared_raindex).await?;
+        let Some(token) = tokens
+            .iter()
+            .find(|token| token.address == address.0 && is_st0x_token(token))
+        else {
+            tracing::warn!(share_address = %address.0, "wrapped ST0x token not found");
+            return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
+        };
+
+        let asset_address = unwrapped_address(token).map_err(|error| {
+            tracing::error!(
+                share_address = %token.address,
+                error = %error,
+                "failed to read wrapped token ratio history"
+            );
+            error.into_api_error()
+        })?;
+
+        let (page, page_size, offset) = wrap_ratio_history_pagination_params(params)?;
+        let share_token_address = normalize_address(token.address);
+        let total_events =
+            count_wrapped_exchange_rate_snapshots_for_share(pool.inner(), &share_token_address)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        share_address = %token.address,
+                        error = %error,
+                        "failed to count wrapped token ratio history"
+                    );
+                    ApiError::Internal("failed to query wrapped token ratio history".into())
+                })?;
+        let snapshots = list_wrapped_exchange_rate_snapshots_for_share(
+            pool.inner(),
+            &share_token_address,
+            page_size,
+            offset,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                share_address = %token.address,
+                error = %error,
+                "failed to list wrapped token ratio history"
+            );
+            ApiError::Internal("failed to query wrapped token ratio history".into())
+        })?;
+
+        let events = snapshots
+            .into_iter()
+            .map(wrap_ratio_history_event_from_snapshot)
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let pagination = build_wrap_ratio_history_pagination(total_events, page, page_size);
+
+        tracing::info!(
+            share_address = %token.address,
+            event_count = events.len(),
+            total_events,
+            page,
+            page_size,
+            "returning wrapped token ratio history"
+        );
+        Ok(Json(WrapRatioHistoryResponse {
+            share_address: token.address,
+            asset_address,
+            events,
+            pagination,
+        }))
+    }
+    .instrument(span.0)
+    .await
+}
+
+#[utoipa::path(
+    get,
     path = "/v1/tokens/{address}/proofs",
     tag = "Tokens",
     security(("basicAuth" = [])),
@@ -791,12 +1016,16 @@ pub fn routes() -> Vec<Route> {
         get_tokens,
         get_wrap_ratios,
         get_wrap_ratio_by_address,
+        get_wrap_ratio_history_by_address,
         get_token_proofs
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::db::wrapped_exchange_rate_history::{
+        insert_wrapped_exchange_rate_snapshots, NewWrappedExchangeRateSnapshot,
+    };
     use crate::test_helpers::{
         basic_auth_header, mock_raindex_registry_url_with_settings_and_tokens, seed_api_key,
         TestClientBuilder,
@@ -845,6 +1074,37 @@ mod tests {
             ],
         };
         encode_prefixed(aggregateCall::abi_encode_returns(&ret))
+    }
+
+    fn history_snapshot(
+        share_token_address: Address,
+        asset_token_address: Address,
+        assets_per_share: &str,
+        block_number: i64,
+        block_timestamp: Option<i64>,
+        captured_at: &str,
+    ) -> NewWrappedExchangeRateSnapshot {
+        NewWrappedExchangeRateSnapshot {
+            share_token_address: format!("{share_token_address:#x}"),
+            asset_token_address: format!("{asset_token_address:#x}"),
+            assets_per_share: assets_per_share.to_string(),
+            block_number,
+            block_timestamp,
+            captured_at: captured_at.to_string(),
+        }
+    }
+
+    async fn seed_history_snapshots(
+        client: &rocket::local::asynchronous::Client,
+        snapshots: &[NewWrappedExchangeRateSnapshot],
+    ) {
+        let pool = client
+            .rocket()
+            .state::<crate::db::DbPool>()
+            .expect("pool in state");
+        insert_wrapped_exchange_rate_snapshots(pool, snapshots)
+            .await
+            .expect("insert history snapshots");
     }
 
     async fn mock_erc4626_batch_rpc(
@@ -1873,6 +2133,180 @@ using-tokens-from:
         assert_eq!(body["blockNumber"], 123);
         assert_eq!(body["blockTimestamp"], 456);
         assert!(body["capturedAt"].as_str().is_some());
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratio_history_by_address_returns_snapshot_events() {
+        let rpc_url =
+            mock_erc4626_batch_rpc(WT_MSTR, T_MSTR, 18, 18, U256::from(10).pow(U256::from(18)))
+                .await;
+        let client = wrap_ratio_client(&rpc_url).await;
+        seed_history_snapshots(
+            &client,
+            &[
+                history_snapshot(WT_MSTR, T_MSTR, "1.0", 100, Some(1100), "1781506300"),
+                history_snapshot(WT_MSTR, T_MSTR, "1.1", 101, Some(1101), "1781506301"),
+                history_snapshot(WT_MSTR, T_MSTR, "1.2", 102, Some(1102), "1781506302"),
+                history_snapshot(WT_SECOND, T_SECOND, "9.9", 103, Some(1103), "1781506303"),
+            ],
+        )
+        .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get(format!(
+                "/v1/tokens/wrap-ratio/{WT_MSTR:#x}/history?page=1&pageSize=2"
+            ))
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["shareAddress"], format!("{WT_MSTR:#x}"));
+        assert_eq!(body["assetAddress"], format!("{T_MSTR:#x}"));
+
+        let events = body["events"].as_array().expect("events is an array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "snapshot");
+        assert_eq!(events[0]["blockNumber"], 102);
+        assert_eq!(events[0]["blockTimestamp"], 1102);
+        assert_eq!(events[0]["assetsPerShare"], "1.2");
+        assert_eq!(events[0]["capturedAt"], "1781506302");
+        assert_eq!(events[1]["type"], "snapshot");
+        assert_eq!(events[1]["blockNumber"], 101);
+
+        assert_eq!(body["pagination"]["page"], 1);
+        assert_eq!(body["pagination"]["pageSize"], 2);
+        assert_eq!(body["pagination"]["totalEvents"], 3);
+        assert_eq!(body["pagination"]["totalPages"], 2);
+        assert_eq!(body["pagination"]["hasMore"], true);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratio_history_by_address_returns_empty_history_for_valid_token() {
+        let rpc_url =
+            mock_erc4626_batch_rpc(WT_MSTR, T_MSTR, 18, 18, U256::from(10).pow(U256::from(18)))
+                .await;
+        let client = wrap_ratio_client(&rpc_url).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get(format!("/v1/tokens/wrap-ratio/{WT_MSTR:#x}/history"))
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["shareAddress"], format!("{WT_MSTR:#x}"));
+        assert_eq!(body["assetAddress"], format!("{T_MSTR:#x}"));
+        assert!(body["events"]
+            .as_array()
+            .expect("events is an array")
+            .is_empty());
+        assert_eq!(body["pagination"]["page"], 1);
+        assert_eq!(body["pagination"]["pageSize"], 20);
+        assert_eq!(body["pagination"]["totalEvents"], 0);
+        assert_eq!(body["pagination"]["totalPages"], 0);
+        assert_eq!(body["pagination"]["hasMore"], false);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratio_history_by_address_paginates_and_caps_page_size() {
+        let rpc_url =
+            mock_erc4626_batch_rpc(WT_MSTR, T_MSTR, 18, 18, U256::from(10).pow(U256::from(18)))
+                .await;
+        let client = wrap_ratio_client(&rpc_url).await;
+        seed_history_snapshots(
+            &client,
+            &[
+                history_snapshot(WT_MSTR, T_MSTR, "1.0", 100, Some(1100), "1781506300"),
+                history_snapshot(WT_MSTR, T_MSTR, "1.1", 101, Some(1101), "1781506301"),
+                history_snapshot(WT_MSTR, T_MSTR, "1.2", 102, Some(1102), "1781506302"),
+            ],
+        )
+        .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get(format!(
+                "/v1/tokens/wrap-ratio/{WT_MSTR:#x}/history?page=2&pageSize=2"
+            ))
+            .header(Header::new("Authorization", header.clone()))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let events = body["events"].as_array().expect("events is an array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["blockNumber"], 100);
+        assert_eq!(body["pagination"]["page"], 2);
+        assert_eq!(body["pagination"]["pageSize"], 2);
+        assert_eq!(body["pagination"]["totalEvents"], 3);
+        assert_eq!(body["pagination"]["totalPages"], 2);
+        assert_eq!(body["pagination"]["hasMore"], false);
+
+        let capped_response = client
+            .get(format!(
+                "/v1/tokens/wrap-ratio/{WT_MSTR:#x}/history?pageSize=500"
+            ))
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(capped_response.status(), Status::Ok);
+        let capped_body: serde_json::Value =
+            serde_json::from_str(&capped_response.into_string().await.unwrap()).unwrap();
+        assert_eq!(capped_body["pagination"]["pageSize"], 100);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratio_history_by_address_rejects_symbol_lookup() {
+        let rpc_url =
+            mock_erc4626_batch_rpc(WT_MSTR, T_MSTR, 18, 18, U256::from(10).pow(U256::from(18)))
+                .await;
+        let client = wrap_ratio_client(&rpc_url).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/v1/tokens/wrap-ratio/wtMSTR/history")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratio_history_by_address_returns_not_found_for_unsupported_address() {
+        let rpc_url =
+            mock_erc4626_batch_rpc(WT_MSTR, T_MSTR, 18, 18, U256::from(10).pow(U256::from(18)))
+                .await;
+        let client = wrap_ratio_client(&rpc_url).await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        for path in [
+            "/v1/tokens/wrap-ratio/0x4200000000000000000000000000000000000006/history".to_string(),
+            "/v1/tokens/wrap-ratio/0x9999999999999999999999999999999999999999/history".to_string(),
+        ] {
+            let response = client
+                .get(path)
+                .header(Header::new("Authorization", header.clone()))
+                .dispatch()
+                .await;
+
+            assert_eq!(response.status(), Status::NotFound);
+        }
     }
 
     #[rocket::async_test]

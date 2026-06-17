@@ -83,6 +83,7 @@ enum StartupRegistryError {
         routes::tokens::get_tokens,
         routes::tokens::get_wrap_ratios,
         routes::tokens::get_wrap_ratio_by_address,
+        routes::tokens::get_wrap_ratio_history_by_address,
         routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,

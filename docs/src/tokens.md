@@ -56,6 +56,7 @@ Use the `address` field when specifying tokens in swap and order requests.
 ```
 GET /v1/tokens/wrap-ratio
 GET /v1/tokens/wrap-ratio/{address}
+GET /v1/tokens/wrap-ratio/{address}/history
 ```
 
 Returns ERC4626 wrapped-token ratios for registry tokens where
@@ -98,6 +99,41 @@ The batch endpoint returns successful ratios in `data` and per-token failures in
 | `blockNumber`    | number         | Block number used for the ERC4626 batch read                                                          |
 | `blockTimestamp` | number or null | Block timestamp when available from the RPC                                                           |
 | `capturedAt`     | string         | Unix timestamp when the SDK captured the batch response                                               |
+
+### History Response
+
+The history endpoint returns paginated snapshot rows previously captured in the
+API database. It does not return donation or rebase events.
+
+Query parameters:
+
+| Field      | Type   | Default | Description                    |
+| ---------- | ------ | ------- | ------------------------------ |
+| `page`     | number | `1`     | 1-based page number            |
+| `pageSize` | number | `20`    | Rows per page, capped at `100` |
+
+```json
+{
+  "shareAddress": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
+  "assetAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
+  "events": [
+    {
+      "type": "snapshot",
+      "blockNumber": 123456789,
+      "blockTimestamp": 1717351200,
+      "assetsPerShare": "1.0027",
+      "capturedAt": "1717351201"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "pageSize": 20,
+    "totalEvents": 42,
+    "totalPages": 3,
+    "hasMore": true
+  }
+}
+```
 
 ## Token Proofs
 

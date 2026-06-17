@@ -10,6 +10,16 @@ pub(crate) struct NewWrappedExchangeRateSnapshot {
     pub captured_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(crate) struct WrappedExchangeRateSnapshot {
+    pub share_token_address: String,
+    pub asset_token_address: String,
+    pub assets_per_share: String,
+    pub block_number: i64,
+    pub block_timestamp: Option<i64>,
+    pub captured_at: String,
+}
+
 pub(crate) async fn insert_wrapped_exchange_rate_snapshots(
     pool: &DbPool,
     snapshots: &[NewWrappedExchangeRateSnapshot],
@@ -36,6 +46,42 @@ pub(crate) async fn insert_wrapped_exchange_rate_snapshots(
 
     tx.commit().await?;
     Ok(rows_affected)
+}
+
+pub(crate) async fn count_wrapped_exchange_rate_snapshots_for_share(
+    pool: &DbPool,
+    share_token_address: &str,
+) -> Result<u64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) \
+         FROM wrapped_exchange_rate_snapshots \
+         WHERE share_token_address = ?",
+    )
+    .bind(share_token_address)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+pub(crate) async fn list_wrapped_exchange_rate_snapshots_for_share(
+    pool: &DbPool,
+    share_token_address: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<WrappedExchangeRateSnapshot>, sqlx::Error> {
+    sqlx::query_as::<_, WrappedExchangeRateSnapshot>(
+        "SELECT share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp, captured_at \
+         FROM wrapped_exchange_rate_snapshots \
+         WHERE share_token_address = ? \
+         ORDER BY block_number DESC, captured_at DESC \
+         LIMIT ? OFFSET ?",
+    )
+    .bind(share_token_address)
+    .bind(i64::from(limit))
+    .bind(i64::from(offset))
+    .fetch_all(pool)
+    .await
 }
 
 #[cfg(test)]
@@ -163,6 +209,32 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].assets_per_share, "1.2");
         assert_eq!(rows[1].assets_per_share, "1.1");
+    }
+
+    #[tokio::test]
+    async fn counts_and_lists_snapshots_for_share_with_pagination() {
+        let pool = test_pool().await;
+        let snapshots = vec![
+            snapshot("0xshare", "0xasset", "1.0", 100, "2026-06-04T10:00:00Z"),
+            snapshot("0xshare", "0xasset", "1.1", 101, "2026-06-04T10:01:00Z"),
+            snapshot("0xshare", "0xasset", "1.2", 102, "2026-06-04T10:02:00Z"),
+            snapshot("0xother", "0xasset", "9.9", 103, "2026-06-04T10:03:00Z"),
+        ];
+        insert_wrapped_exchange_rate_snapshots(&pool, &snapshots)
+            .await
+            .expect("insert snapshots");
+
+        let count = count_wrapped_exchange_rate_snapshots_for_share(&pool, "0xshare")
+            .await
+            .expect("count snapshots");
+        assert_eq!(count, 3);
+
+        let rows = list_wrapped_exchange_rate_snapshots_for_share(&pool, "0xshare", 2, 1)
+            .await
+            .expect("list snapshots");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].block_number, 101);
+        assert_eq!(rows[1].block_number, 100);
     }
 
     async fn list_snapshots_for_share(
