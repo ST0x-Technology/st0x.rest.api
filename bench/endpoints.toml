@@ -1,0 +1,106 @@
+# Endpoints benchmarked by bench/run.sh.
+# Placeholders ({token_in}, {token_out}, {order_hash}, {owner}, {tx_hash})
+# are filled in by bench/discover.sh.
+
+[[endpoint]]
+name = "health"
+method = "GET"
+path = "/health"
+auth = "none"
+
+[[endpoint]]
+name = "health-detailed"
+method = "GET"
+path = "/health/detailed"
+auth = "none"
+
+[[endpoint]]
+name = "tokens"
+method = "GET"
+path = "/v1/tokens"
+auth = "basic"
+
+[[endpoint]]
+name = "registry"
+method = "GET"
+path = "/registry"
+auth = "basic"
+
+[[endpoint]]
+name = "registry-history"
+method = "GET"
+path = "/registry/history"
+auth = "basic"
+
+[[endpoint]]
+name = "swap-quote"
+method = "POST"
+path = "/v1/swap/quote"
+auth = "basic"
+body = '{"input_token":"{token_in}","output_token":"{token_out}","output_amount":"1000000000000000000"}'
+discover = ["token_in", "token_out"]
+
+[[endpoint]]
+name = "swap-calldata"
+method = "POST"
+path = "/v1/swap/calldata"
+auth = "basic"
+body = '{"taker":"{owner}","input_token":"{token_in}","output_token":"{token_out}","output_amount":"1000000000000000000","maximum_io_ratio":"1000000000000000000000"}'
+discover = ["owner", "token_in", "token_out"]
+
+[[endpoint]]
+name = "order-by-hash"
+method = "GET"
+path = "/v1/order/{order_hash}"
+auth = "basic"
+discover = ["order_hash"]
+
+[[endpoint]]
+name = "orders-by-owner"
+method = "GET"
+path = "/v1/orders/{owner}?page=1&page_size=20"
+auth = "basic"
+discover = ["owner"]
+
+[[endpoint]]
+name = "orders-by-token"
+method = "GET"
+path = "/v1/orders/token/{token_in}?page=1&page_size=20"
+auth = "basic"
+discover = ["token_in"]
+
+[[endpoint]]
+name = "trades-by-tx"
+method = "GET"
+path = "/v1/trades/tx/{tx_hash}"
+auth = "basic"
+discover = ["tx_hash"]
+
+[[endpoint]]
+name = "trades-by-token"
+method = "GET"
+path = "/v1/trades/token/{token_in}?page=1&page_size=20"
+auth = "basic"
+discover = ["token_in"]
+
+[[endpoint]]
+name = "trades-by-owner"
+method = "GET"
+path = "/v1/trades/{owner}?page=1&page_size=20"
+auth = "basic"
+discover = ["owner"]
+
+[[endpoint]]
+name = "trades-by-taker"
+method = "GET"
+path = "/v1/trades/taker/{owner}?page=1&page_size=20"
+auth = "basic"
+discover = ["owner"]
+
+[[endpoint]]
+name = "trades-batch"
+method = "POST"
+path = "/v1/trades/batch"
+auth = "basic"
+body = '{"order_hashes":["{order_hash}"]}'
+discover = ["order_hash"]
