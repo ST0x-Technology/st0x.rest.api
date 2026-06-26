@@ -20,34 +20,62 @@ curl https://api.st0x.io/v1/tokens \
 ### Response
 
 ```json
-{
-  "tokens": [
-    {
-      "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      "symbol": "USDC",
-      "name": "USD Coin",
-      "ISIN": "US0000000001",
-      "decimals": 6
+[
+  {
+    "key": "usdc",
+    "network": {
+      "key": "base",
+      "rpcs": [],
+      "chainId": 8453,
+      "label": "Base",
+      "networkId": null,
+      "currency": "ETH"
     },
-    {
-      "address": "0x4200000000000000000000000000000000000006",
-      "symbol": "WETH",
-      "name": "Wrapped Ether",
-      "decimals": 18
-    }
-  ]
-}
+    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "decimals": 6,
+    "label": "USD Coin",
+    "symbol": "USDC",
+    "logo-uri": null,
+    "extensions": {
+      "isin": "US0000000001"
+    },
+    "name": "USD Coin",
+    "isin": "US0000000001"
+  },
+  {
+    "key": "weth",
+    "network": {
+      "key": "base",
+      "rpcs": [],
+      "chainId": 8453,
+      "label": "Base",
+      "networkId": null,
+      "currency": "ETH"
+    },
+    "address": "0x4200000000000000000000000000000000000006",
+    "decimals": 18,
+    "label": "Wrapped Ether",
+    "symbol": "WETH",
+    "logo-uri": null,
+    "extensions": null,
+    "name": "Wrapped Ether",
+    "isin": null
+  }
+]
 ```
 
 ### Fields
 
-| Field      | Type              | Description                                  |
-| ---------- | ----------------- | -------------------------------------------- |
-| `address`  | string            | Token contract address on Base               |
-| `symbol`   | string            | Token ticker symbol                          |
-| `name`     | string            | Full token name                              |
-| `ISIN`     | string (optional) | ISIN identifier, omitted when not applicable |
-| `decimals` | number            | Token decimal places                         |
+| Field | Type | Description |
+|-------|------|-------------|
+| `key` | string | Token key from the registry settings |
+| `address` | string | Token contract address on Base |
+| `symbol` | string | Token ticker symbol |
+| `name` | string | Full token name |
+| `isin` | string or null | ISIN identifier, when available |
+| `decimals` | number | Token decimal places |
+| `network` | object | Token network metadata with RPC URLs removed |
+| `extensions` | object or null | Additional token metadata, when available |
 
 Use the `address` field when specifying tokens in swap and order requests.
 

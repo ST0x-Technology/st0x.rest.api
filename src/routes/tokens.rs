@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::Instrument;
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 
 const SFT_PAGE_SIZE: usize = 1000;
 const DEFAULT_ACTIVITY_LIMIT: u32 = 5;
@@ -246,6 +246,51 @@ pub struct TokenProofReceipt {
 pub enum TokenProofReceiptType {
     Deposit,
     Withdraw,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct TokenNetworkResponseSchema {
+    /// Network identifier from the registry settings.
+    key: String,
+    /// RPC URLs are intentionally stripped from public token responses.
+    rpcs: Vec<String>,
+    /// EVM chain ID.
+    chain_id: u32,
+    /// Human-readable network label, when configured.
+    label: Option<String>,
+    /// Optional network ID from the registry settings.
+    network_id: Option<u32>,
+    /// Native currency symbol.
+    currency: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+struct TokenResponseSchema {
+    /// Token key from the registry settings.
+    key: String,
+    /// Sanitized network metadata for the token.
+    network: TokenNetworkResponseSchema,
+    /// Token contract address.
+    address: String,
+    /// Token decimals, when known.
+    decimals: Option<u8>,
+    /// Human-readable token label.
+    label: Option<String>,
+    /// Token symbol.
+    symbol: Option<String>,
+    /// Token logo URI, when available.
+    logo_uri: Option<String>,
+    /// Token list metadata extensions, when available.
+    #[schema(value_type = Object)]
+    extensions: Option<Value>,
+    /// Convenience display name derived from the token label.
+    name: Option<String>,
+    /// ISIN identifier from token extensions, when available.
+    isin: Option<String>,
 }
 
 impl From<TokenCfg> for TokenResponse {
@@ -1291,7 +1336,34 @@ fn activity_limit(params: &TokenDetailsQueryParams) -> u32 {
     tag = "Tokens",
     security(("basicAuth" = [])),
     responses(
-        (status = 200, description = "List of supported tokens", body = Vec<serde_json::Value>),
+        (
+            status = 200,
+            description = "List of supported tokens",
+            body = Vec<TokenResponseSchema>,
+            example = json!([
+                {
+                    "key": "usdc",
+                    "network": {
+                        "key": "base",
+                        "rpcs": [],
+                        "chainId": 8453,
+                        "label": "Base",
+                        "networkId": null,
+                        "currency": "ETH"
+                    },
+                    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    "decimals": 6,
+                    "label": "USD Coin",
+                    "symbol": "USDC",
+                    "logo-uri": null,
+                    "extensions": {
+                        "isin": "US0000000001"
+                    },
+                    "name": "USD Coin",
+                    "isin": "US0000000001"
+                }
+            ])
+        ),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
