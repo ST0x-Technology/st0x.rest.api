@@ -87,6 +87,7 @@ enum StartupRegistryError {
         routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
+        routes::swap::post_swap_calldata_v2,
         routes::order::post_order_dca,
         routes::order::post_order_solver,
         routes::order::get_order,
@@ -173,6 +174,7 @@ pub(crate) fn rocket(
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
+        .mount("/v2/swap", routes::swap::routes_v2())
         .mount("/v1/order", routes::order::routes())
         .mount("/v1/orders", routes::orders::routes())
         .mount("/v1/vaults", routes::vaults::routes())
@@ -451,6 +453,7 @@ mod tests {
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
         let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+        let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
         assert_eq!(
@@ -472,6 +475,15 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
+        assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SwapCalldataV2Request"
+        );
+        assert_eq!(
+            schemas["SwapCalldataMode"]["enum"],
+            serde_json::json!(["buyUpTo", "spendExact", "spendUpTo"])
+        );
     }
 
     fn test_config(
