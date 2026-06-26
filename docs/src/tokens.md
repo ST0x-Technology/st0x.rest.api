@@ -135,6 +135,111 @@ Query parameters:
 }
 ```
 
+## Token Details
+
+```
+GET /v1/tokens/details
+GET /v1/tokens/{address}/details
+```
+
+Returns ST0x token supply, holder, transfer, and bridging activity data from the
+configured SFT subgraph. `{address}` can be the current wrapped token address,
+the token's `extensions.unwrappedAddress`, or its `extensions.legacyAddress`
+when one is present. The response always normalizes `address` to the current
+wrapped token address from the registry.
+
+The batch endpoint returns successful rows in `data` and per-token failures in
+`errors`. One failed token does not fail the whole response.
+
+### Batch Response
+
+```json
+{
+  "data": [
+    {
+      "address": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
+      "receiptContractAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
+      "name": "Wrapped MicroStrategy Incorporated ST0x",
+      "symbol": "wtMSTR",
+      "decimals": 18,
+      "totalSupply": "158018734232097441658",
+      "holderCount": 3,
+      "transferCount": 1002,
+      "bridgedSupply": "260000000000000000000",
+      "depositVolume": "300000000000000000000",
+      "withdrawVolume": "40000000000000000000",
+      "activityVolume": "340000000000000000000"
+    }
+  ],
+  "errors": [
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "message": "SFT vault not found for token"
+    }
+  ]
+}
+```
+
+### Detail Response
+
+```json
+{
+  "address": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
+  "receiptContractAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
+  "name": "Wrapped MicroStrategy Incorporated ST0x",
+  "symbol": "wtMSTR",
+  "decimals": 18,
+  "totalSupply": "158018734232097441658",
+  "holderCount": 3,
+  "transferCount": 1002,
+  "bridgedSupply": "260000000000000000000",
+  "depositVolume": "300000000000000000000",
+  "withdrawVolume": "40000000000000000000",
+  "activityVolume": "340000000000000000000",
+  "sftVaultAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
+  "deployTimestamp": 1717351200,
+  "deployer": "0x1c66d6708914c40239d54919320b4c48cae3d1a9",
+  "admin": "0x1c66d6708914c40239d54919320b4c48cae3d1a9",
+  "activity": {
+    "deposits": [
+      {
+        "id": "DepositWithReceipt-0x...",
+        "txHash": "0xtxhash",
+        "caller": "0x1c66d6708914c40239d54919320b4c48cae3d1a9",
+        "amount": "1000000000000000000",
+        "timestamp": 1717351200,
+        "receiptId": "1"
+      }
+    ],
+    "withdraws": []
+  }
+}
+```
+
+### Query Parameters
+
+| Field           | Type   | Default | Description                                              |
+| --------------- | ------ | ------- | -------------------------------------------------------- |
+| `activityLimit` | number | `5`     | Recent deposit/withdraw rows per activity type, max `50` |
+
+### Fields
+
+| Field            | Type   | Description                                                           |
+| ---------------- | ------ | --------------------------------------------------------------------- |
+| `address`        | string | Current wrapped ST0x token address from the registry                  |
+| `holderCount`    | number | Count of token holders with a non-zero balance                        |
+| `transferCount`  | number | Exact count from paginating SFT share transfer rows                   |
+| `bridgedSupply`  | string | `depositVolume - withdrawVolume`, in raw token units                  |
+| `depositVolume`  | string | Sum of all SFT deposit amounts, in raw token units                    |
+| `withdrawVolume` | string | Sum of all SFT withdraw amounts, in raw token units                   |
+| `activityVolume` | string | `depositVolume + withdrawVolume`, in raw token units                  |
+| `activity`       | object | Recent deposit and withdraw rows only; transfer rows are not returned |
+
+Aggregate counts and volumes are cached for 5 minutes by SFT subgraph URL and
+wrapped token address to avoid repeated full relation scans. The batch
+`/v1/tokens/details` response is also cached for 5 minutes for landing/sidebar
+usage. Full holder lists are not returned.
+
 ## Token Proofs
 
 ```

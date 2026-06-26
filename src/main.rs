@@ -84,6 +84,8 @@ enum StartupRegistryError {
         routes::tokens::get_wrap_ratios,
         routes::tokens::get_wrap_ratio_by_address,
         routes::tokens::get_wrap_ratio_history_by_address,
+        routes::tokens::get_token_details,
+        routes::tokens::get_token_details_by_address,
         routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
@@ -472,6 +474,22 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
+    }
+
+    #[test]
+    fn test_openapi_documents_token_details_activity_limit() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+        let details_path = &openapi["paths"]["/v1/tokens/{address}/details"]["get"];
+        let parameters = details_path["parameters"]
+            .as_array()
+            .expect("parameters is an array");
+
+        assert!(parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "activityLimit"));
+        assert!(!parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "activity_limit"));
     }
 
     fn test_config(
