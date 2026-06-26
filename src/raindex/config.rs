@@ -1,7 +1,10 @@
 use crate::error::ApiError;
-use rain_orderbook_app_settings::yaml::raindex::RaindexYaml;
+use rain_orderbook_app_settings::yaml::{
+    raindex::{RaindexYaml, RaindexYamlValidation},
+    YamlParsable,
+};
 use rain_orderbook_common::raindex_client::RaindexClient;
-use rain_orderbook_js_api::registry::DotrainRegistry;
+use rain_orderbook_common::registry::DotrainRegistry;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -42,9 +45,9 @@ impl RaindexProvider {
                     .get_raindex_client(db.clone())
                     .await
                     .map_err(|e| RaindexProviderError::ClientInit(e.to_string()))?;
-                let raindex_yaml = registry
-                    .get_raindex_yaml()
-                    .map_err(|e| RaindexProviderError::RegistryLoad(e.to_string()))?;
+                let raindex_yaml =
+                    RaindexYaml::new(vec![registry.settings()], RaindexYamlValidation::default())
+                        .map_err(|e| RaindexProviderError::RegistryLoad(e.to_string()))?;
 
                 Ok(RaindexProvider {
                     client,

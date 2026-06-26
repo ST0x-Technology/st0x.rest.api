@@ -94,6 +94,8 @@ enum StartupRegistryError {
         routes::orders::get_orders_by_tx,
         routes::orders::get_orders_by_address,
         routes::orders::get_orders_by_token,
+        routes::vaults::get_vaults,
+        routes::vaults::get_vault_totals,
         routes::admin::put_registry,
         routes::trades::get_by_tx::get_trades_by_tx,
         routes::trades::get_by_order_hashes::get_trades_by_order_hashes,
@@ -111,6 +113,7 @@ enum StartupRegistryError {
         (name = "Swap", description = "Swap quote and calldata endpoints"),
         (name = "Order", description = "Order deployment and management endpoints"),
         (name = "Orders", description = "Order listing and query endpoints"),
+        (name = "Vaults", description = "Orderbook vault position and total endpoints"),
         (name = "Admin", description = "Administrative endpoints"),
         (name = "Trades", description = "Trade listing and query endpoints"),
         (name = "Registry", description = "Registry information endpoints"),
@@ -172,6 +175,7 @@ pub(crate) fn rocket(
         .mount("/v1/swap", routes::swap::routes())
         .mount("/v1/order", routes::order::routes())
         .mount("/v1/orders", routes::orders::routes())
+        .mount("/v1/vaults", routes::vaults::routes())
         .mount("/v1/trades", routes::trades::routes())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())

@@ -4,3 +4,4 @@ pub mod order;
 pub mod orders;
 pub mod swap;
 pub mod trades;
+pub mod vaults;

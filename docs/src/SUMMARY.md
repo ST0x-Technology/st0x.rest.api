@@ -6,6 +6,7 @@
 - [Tokens](./tokens.md)
 - [Swap Flow](./swap-flow.md)
 - [Order Management](./orders.md)
+- [Vaults](./vaults.md)
 - [Trade Monitoring](./trades.md)
 - [Registry](./registry.md)
 - [Error Handling](./errors.md)
