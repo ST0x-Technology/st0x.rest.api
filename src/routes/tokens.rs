@@ -15,6 +15,7 @@ use crate::wrap_ratio::{
 };
 use alloy::primitives::Address;
 use alloy::primitives::U256;
+use futures::StreamExt;
 use moka::future::Cache;
 use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_common::raindex_client::RaindexError;
@@ -37,6 +38,9 @@ const TOKEN_DETAILS_AGGREGATE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const TOKEN_DETAILS_AGGREGATE_CACHE_CAPACITY: u64 = 512;
 const TOKEN_DETAILS_LIST_CACHE_CAPACITY: u64 = 64;
 const SUBGRAPH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const SUBGRAPH_MAX_ATTEMPTS: usize = 3;
+const SUBGRAPH_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+const SUBGRAPH_ERROR_BODY_LOG_LIMIT: u64 = 2_048;
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
@@ -654,49 +658,115 @@ async fn post_graphql<T: for<'de> Deserialize<'de>>(
     query: &str,
     variables: Value,
 ) -> Result<T, ApiError> {
-    let response = reqwest::Client::new()
-        .post(url)
-        .timeout(SUBGRAPH_REQUEST_TIMEOUT)
-        .json(&json!({
-            "query": query,
-            "variables": variables,
-        }))
-        .send()
-        .await
-        .map_err(|error| {
-            tracing::error!(url, error = %error, "failed to query subgraph");
-            ApiError::Internal("failed to query subgraph".into())
-        })?;
+    let client = reqwest::Client::new();
+    let payload = json!({
+        "query": query,
+        "variables": variables,
+    });
+    let mut last_error = None;
 
-    let status = response.status();
-    if !status.is_success() {
-        tracing::error!(
+    for attempt in 1..=SUBGRAPH_MAX_ATTEMPTS {
+        let response = match client
+            .post(url)
+            .timeout(SUBGRAPH_REQUEST_TIMEOUT)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    url,
+                    attempt,
+                    max_attempts = SUBGRAPH_MAX_ATTEMPTS,
+                    error = %error,
+                    "failed to query subgraph"
+                );
+                last_error = Some(ApiError::Internal("failed to query subgraph".into()));
+                if attempt < SUBGRAPH_MAX_ATTEMPTS {
+                    tokio::time::sleep(SUBGRAPH_RETRY_BACKOFF * attempt as u32).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let body = response
+                .json::<GraphqlResponse<T>>()
+                .await
+                .map_err(|error| {
+                    tracing::error!(url, error = %error, "failed to decode subgraph response");
+                    ApiError::Internal("failed to decode subgraph response".into())
+                })?;
+
+            if let Some(errors) = body.errors {
+                tracing::error!(url, errors = %errors, "subgraph returned GraphQL errors");
+                return Err(ApiError::Internal(
+                    "subgraph returned GraphQL errors".into(),
+                ));
+            }
+
+            return body.data.ok_or_else(|| {
+                tracing::error!(url, "subgraph response missing data");
+                ApiError::Internal("subgraph response missing data".into())
+            });
+        }
+
+        let status_code = status.as_u16();
+        let should_retry = status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+        let body = read_limited_response_body(response, SUBGRAPH_ERROR_BODY_LOG_LIMIT).await;
+        tracing::warn!(
             url,
-            status = status.as_u16(),
+            status = status_code,
+            attempt,
+            max_attempts = SUBGRAPH_MAX_ATTEMPTS,
+            retryable = should_retry,
+            body_snippet = %body,
             "subgraph returned error status"
         );
-        return Err(ApiError::Internal("subgraph returned error status".into()));
+        last_error = Some(ApiError::Internal("subgraph returned error status".into()));
+        if should_retry && attempt < SUBGRAPH_MAX_ATTEMPTS {
+            tokio::time::sleep(SUBGRAPH_RETRY_BACKOFF * attempt as u32).await;
+        } else {
+            break;
+        }
     }
 
-    let body = response
-        .json::<GraphqlResponse<T>>()
-        .await
-        .map_err(|error| {
-            tracing::error!(url, error = %error, "failed to decode subgraph response");
-            ApiError::Internal("failed to decode subgraph response".into())
-        })?;
+    Err(last_error.unwrap_or_else(|| ApiError::Internal("failed to query subgraph".into())))
+}
 
-    if let Some(errors) = body.errors {
-        tracing::error!(url, errors = %errors, "subgraph returned GraphQL errors");
-        return Err(ApiError::Internal(
-            "subgraph returned GraphQL errors".into(),
-        ));
+async fn read_limited_response_body(response: reqwest::Response, limit: u64) -> String {
+    let max_bytes = limit.saturating_add(1) as usize;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+
+    while bytes.len() < max_bytes {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        match chunk {
+            Ok(chunk) => {
+                let remaining = max_bytes - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to read subgraph error body");
+                break;
+            }
+        }
     }
 
-    body.data.ok_or_else(|| {
-        tracing::error!(url, "subgraph response missing data");
-        ApiError::Internal("subgraph response missing data".into())
-    })
+    let was_truncated = bytes.len() as u64 > limit;
+    bytes.truncate(limit as usize);
+    let mut body = String::from_utf8_lossy(&bytes).into_owned();
+    if was_truncated {
+        body.push_str("...[truncated]");
+    }
+    body
 }
 
 fn build_token_proofs_response(
@@ -1046,7 +1116,7 @@ async fn read_token_details_aggregate(
         .await
         .map_err(|error| {
             tracing::error!(error = %error, "failed to read token details aggregate");
-            ApiError::Internal("failed to read token details aggregate".into())
+            error.as_ref().clone()
         })
 }
 
@@ -1786,9 +1856,16 @@ pub async fn get_token_details(
             "returning token details"
         );
         let response = TokenDetailsListResponse { data, errors };
-        token_details_list_cache()
-            .insert(cache_key, response.clone())
-            .await;
+        if response.errors.is_empty() {
+            token_details_list_cache()
+                .insert(cache_key, response.clone())
+                .await;
+        } else {
+            tracing::warn!(
+                error_count = response.errors.len(),
+                "skipping token details list cache because response is partial"
+            );
+        }
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -1944,7 +2021,11 @@ pub fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_token_details_aggregate_cache, SFT_PAGE_SIZE};
+    use super::{
+        api_error_message, clear_token_details_aggregate_cache, post_graphql,
+        read_limited_response_body, SftTokenHolderPageData, SFT_PAGE_SIZE,
+        SUBGRAPH_ERROR_BODY_LOG_LIMIT,
+    };
     use crate::db::wrapped_exchange_rate_history::{
         insert_wrapped_exchange_rate_snapshots, NewWrappedExchangeRateSnapshot,
     };
@@ -1964,6 +2045,7 @@ mod tests {
     };
     use rocket::http::{Header, Status};
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::sync::{Arc as StdArc, Mutex};
 
     const WT_MSTR: Address = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
@@ -2708,6 +2790,56 @@ using-tokens-from:
         (format!("http://{addr}/sft"), requests)
     }
 
+    async fn mock_scripted_subgraph(
+        responses: Vec<(u16, String)>,
+    ) -> (String, StdArc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock scripted subgraph");
+        let addr = listener
+            .local_addr()
+            .expect("mock scripted subgraph address");
+        let requests = StdArc::new(Mutex::new(Vec::new()));
+        let recorded_requests = requests.clone();
+        let scripted_responses = StdArc::new(Mutex::new(VecDeque::from(responses)));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = recorded_requests.clone();
+                let scripted_responses = scripted_responses.clone();
+
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                        .await
+                        .unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    requests
+                        .lock()
+                        .expect("mock scripted subgraph request lock")
+                        .push(request);
+                    let (status, body) = scripted_responses
+                        .lock()
+                        .expect("mock scripted subgraph responses lock")
+                        .pop_front()
+                        .unwrap_or_else(|| (500, "unexpected request".to_string()));
+                    let reason = if status == 200 { "OK" } else { "ERROR" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/sft"), requests)
+    }
+
     async fn token_details_client(sft_url: &str) -> rocket::local::asynchronous::Client {
         proofs_client(sft_url, "https://example.com/metadata").await
     }
@@ -3134,6 +3266,70 @@ using-tokens-from:
     }
 
     #[rocket::async_test]
+    async fn test_post_graphql_retries_retryable_status_then_succeeds() {
+        let success_body = json!({
+            "data": {
+                "tokenHolders": []
+            }
+        })
+        .to_string();
+        let (sft_url, requests) = mock_scripted_subgraph(vec![
+            (500, "temporary upstream failure".into()),
+            (200, success_body),
+        ])
+        .await;
+
+        let data = post_graphql::<SftTokenHolderPageData>(
+            &sft_url,
+            "query TokenHolderPage { tokenHolders { id } }",
+            json!({}),
+        )
+        .await
+        .expect("retryable status eventually succeeds");
+
+        assert!(data.token_holders.is_empty());
+        let recorded = requests.lock().expect("mock requests").clone();
+        assert_eq!(recorded.len(), 2);
+    }
+
+    #[rocket::async_test]
+    async fn test_post_graphql_does_not_retry_permanent_client_status() {
+        let (sft_url, requests) = mock_scripted_subgraph(vec![(
+            400,
+            "permanent bad request".repeat(SUBGRAPH_ERROR_BODY_LOG_LIMIT as usize),
+        )])
+        .await;
+
+        let error = post_graphql::<SftTokenHolderPageData>(
+            &sft_url,
+            "query TokenHolderPage { tokenHolders { id } }",
+            json!({}),
+        )
+        .await
+        .expect_err("permanent client status fails");
+
+        assert_eq!(api_error_message(&error), "subgraph returned error status");
+        let recorded = requests.lock().expect("mock requests").clone();
+        assert_eq!(recorded.len(), 1);
+    }
+
+    #[rocket::async_test]
+    async fn test_read_limited_response_body_truncates_oversized_body() {
+        let (sft_url, _) =
+            mock_scripted_subgraph(vec![(500, "0123456789abcdefghijklmnopqrstuvwxyz".into())])
+                .await;
+        let response = reqwest::Client::new()
+            .post(&sft_url)
+            .send()
+            .await
+            .expect("mock response");
+
+        let body = read_limited_response_body(response, 10).await;
+
+        assert_eq!(body, "0123456789...[truncated]");
+    }
+
+    #[rocket::async_test]
     async fn test_get_token_details_by_address_returns_not_found_for_missing_vault() {
         clear_token_details_aggregate_cache();
         let (sft_url, _) = mock_token_details_subgraph().await;
@@ -3171,6 +3367,31 @@ using-tokens-from:
     async fn test_get_token_details_uses_cached_list_response() {
         clear_token_details_aggregate_cache();
         let (sft_url, requests) = mock_token_details_subgraph().await;
+        let client = token_details_client(&sft_url).await;
+
+        for _ in 0..2 {
+            let response = authorized_get(&client, "/v1/tokens/details".to_string()).await;
+            assert_eq!(response.status(), Status::Ok);
+        }
+
+        let recorded = requests.lock().expect("mock requests").clone();
+        let token_details_requests = recorded
+            .iter()
+            .filter(|request| request.contains("query TokenDetails"))
+            .count();
+        let holder_page_requests = recorded
+            .iter()
+            .filter(|request| request.contains("query TokenHolderPage"))
+            .count();
+
+        assert_eq!(token_details_requests, 1);
+        assert_eq!(holder_page_requests, 2);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_details_does_not_cache_partial_list_response() {
+        clear_token_details_aggregate_cache();
+        let (sft_url, requests) = mock_token_details_subgraph().await;
         let client = token_details_multi_client(&sft_url).await;
 
         for _ in 0..2 {
@@ -3188,7 +3409,7 @@ using-tokens-from:
             .filter(|request| request.contains("query TokenHolderPage"))
             .count();
 
-        assert_eq!(token_details_requests, 2);
+        assert_eq!(token_details_requests, 4);
         assert_eq!(holder_page_requests, 2);
     }
 
