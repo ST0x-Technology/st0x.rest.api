@@ -87,7 +87,11 @@ pub async fn post_swap_calldata_v2(
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
     async move {
-        tracing::info!(body = ?req, "request received");
+        tracing::info!(
+            mode = ?req.mode,
+            denomination = ?req.denomination,
+            "request received"
+        );
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
