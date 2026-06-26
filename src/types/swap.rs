@@ -62,6 +62,34 @@ pub struct SwapCalldataRequest {
     pub denomination: SwapDenomination,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SwapCalldataMode {
+    BuyUpTo,
+    SpendExact,
+    SpendUpTo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapCalldataV2Request {
+    #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub taker: Address,
+    #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
+    pub input_token: Address,
+    #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
+    pub output_token: Address,
+    #[schema(example = "spendExact")]
+    pub mode: SwapCalldataMode,
+    #[schema(example = "100")]
+    pub amount: String,
+    #[schema(example = "2600")]
+    pub price_cap: String,
+    #[serde(default)]
+    #[schema(example = "wrapped", default = "wrapped")]
+    pub denomination: SwapDenomination,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataResponse {
