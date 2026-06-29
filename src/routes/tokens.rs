@@ -1215,6 +1215,7 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::{Arc as StdArc, Mutex};
+    use tokio::sync::Mutex as AsyncMutex;
 
     const WT_MSTR: Address = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
     const T_MSTR: Address = address!("013b782f402d61aa1004cca95b9f5bb402c9d5fe");
@@ -1223,6 +1224,7 @@ mod tests {
     const WT_BAD: Address = address!("1111111111111111111111111111111111111111");
     const T_BAD: Address = address!("2222222222222222222222222222222222222222");
     const WT_LEGACY: Address = address!("5555555555555555555555555555555555555555");
+    static TOKEN_DETAILS_CACHE_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -2331,6 +2333,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_by_address_returns_aggregates_and_recent_activity() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, _) = mock_token_details_subgraph().await;
         let client = token_details_client(&sft_url).await;
@@ -2368,6 +2371,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_by_address_resolves_unwrapped_and_legacy_addresses() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, requests) = mock_token_details_subgraph().await;
         let client = token_details_client(&sft_url).await;
@@ -2395,6 +2399,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_uses_cached_aggregates() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, requests) = mock_token_details_subgraph().await;
         let client = token_details_client(&sft_url).await;
@@ -2506,6 +2511,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_by_address_returns_not_found_for_missing_vault() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, _) = mock_token_details_subgraph().await;
         let client = token_details_multi_client(&sft_url).await;
@@ -2517,6 +2523,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_returns_data_and_per_token_errors() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, _) = mock_token_details_subgraph().await;
         let client = token_details_multi_client(&sft_url).await;
@@ -2540,6 +2547,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_uses_cached_list_response() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, requests) = mock_token_details_subgraph().await;
         let client = token_details_client(&sft_url).await;
@@ -2565,6 +2573,7 @@ using-tokens-from:
 
     #[rocket::async_test]
     async fn test_get_token_details_does_not_cache_partial_list_response() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
         clear_token_details_aggregate_cache();
         let (sft_url, requests) = mock_token_details_subgraph().await;
         let client = token_details_multi_client(&sft_url).await;
