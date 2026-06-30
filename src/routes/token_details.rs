@@ -16,6 +16,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -133,6 +134,27 @@ struct SftTokenDetailsVault {
     deposits: Vec<SftReceiptActivity>,
     #[serde(default)]
     withdraws: Vec<SftReceiptActivity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SftTokenDetailsListData {
+    #[serde(default)]
+    offchain_asset_receipt_vaults: Vec<SftTokenDetailsSummaryVault>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SftTokenDetailsSummaryVault {
+    receipt_contract_address: Option<Address>,
+    wrapped_token_contract_address: Option<Address>,
+    total_shares: String,
+    name: String,
+    symbol: String,
+    token_holder_count: String,
+    share_transfer_count: String,
+    deposit_volume: String,
+    withdraw_volume: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +292,13 @@ fn parse_u256_decimal(value: &str, field: &str) -> Result<U256, ApiError> {
     U256::from_str(value).map_err(|error| {
         tracing::error!(field, value, error = %error, "invalid decimal integer from subgraph");
         ApiError::Internal("invalid amount from subgraph".into())
+    })
+}
+
+fn parse_u64_decimal(value: &str, field: &str) -> Result<u64, ApiError> {
+    value.parse::<u64>().map_err(|error| {
+        tracing::error!(field, value, error = %error, "invalid count from subgraph");
+        ApiError::Internal("invalid count from subgraph".into())
     })
 }
 
@@ -516,6 +545,24 @@ fn build_token_details_summary(
     vault: &SftTokenDetailsVault,
     aggregate: &TokenDetailsAggregate,
 ) -> Result<TokenDetailsSummaryResponse, ApiError> {
+    build_token_details_summary_fields(
+        token,
+        vault.receipt_contract_address,
+        &vault.name,
+        &vault.symbol,
+        &vault.total_shares,
+        aggregate,
+    )
+}
+
+fn build_token_details_summary_fields(
+    token: &TokenCfg,
+    receipt_contract_address: Option<Address>,
+    vault_name: &str,
+    vault_symbol: &str,
+    total_shares: &str,
+    aggregate: &TokenDetailsAggregate,
+) -> Result<TokenDetailsSummaryResponse, ApiError> {
     let bridged_supply = checked_sub_u256(
         aggregate.deposit_volume,
         aggregate.withdraw_volume,
@@ -529,11 +576,11 @@ fn build_token_details_summary(
 
     Ok(TokenDetailsSummaryResponse {
         address: token.address,
-        receipt_contract_address: vault.receipt_contract_address,
-        name: token_name(token, &vault.name),
-        symbol: token_symbol(token, &vault.symbol),
+        receipt_contract_address,
+        name: token_name(token, vault_name),
+        symbol: token_symbol(token, vault_symbol),
         decimals: token.decimals.unwrap_or(18),
-        total_supply: vault.total_shares.clone(),
+        total_supply: total_shares.to_string(),
         holder_count: aggregate.holder_count,
         transfer_count: aggregate.transfer_count,
         bridged_supply: bridged_supply.to_string(),
@@ -541,6 +588,32 @@ fn build_token_details_summary(
         withdraw_volume: aggregate.withdraw_volume.to_string(),
         activity_volume: activity_volume.to_string(),
     })
+}
+
+fn aggregate_from_summary_vault(
+    vault: &SftTokenDetailsSummaryVault,
+) -> Result<TokenDetailsAggregate, ApiError> {
+    Ok(TokenDetailsAggregate {
+        holder_count: parse_u64_decimal(&vault.token_holder_count, "tokenHolderCount")?,
+        transfer_count: parse_u64_decimal(&vault.share_transfer_count, "shareTransferCount")?,
+        deposit_volume: parse_u256_decimal(&vault.deposit_volume, "depositVolume")?,
+        withdraw_volume: parse_u256_decimal(&vault.withdraw_volume, "withdrawVolume")?,
+    })
+}
+
+fn build_token_details_list_summary_response(
+    token: &TokenCfg,
+    vault: &SftTokenDetailsSummaryVault,
+) -> Result<TokenDetailsSummaryResponse, ApiError> {
+    let aggregate = aggregate_from_summary_vault(vault)?;
+    build_token_details_summary_fields(
+        token,
+        vault.receipt_contract_address,
+        &vault.name,
+        &vault.symbol,
+        &vault.total_shares,
+        &aggregate,
+    )
 }
 
 fn build_receipt_activity(
@@ -668,14 +741,53 @@ async fn read_token_details_response(
     build_token_details_response(token, vault, aggregate)
 }
 
-async fn read_token_details_summary_response(
-    token: &TokenCfg,
+async fn read_token_details_list_vaults(
     sft_subgraph_url: &str,
-) -> Result<TokenDetailsSummaryResponse, ApiError> {
-    let vault = read_sft_token_details_vault(token.address, sft_subgraph_url, 1).await?;
-    let aggregate =
-        read_token_details_aggregate(sft_subgraph_url, token.address, &vault.id).await?;
-    build_token_details_summary(token, &vault, &aggregate)
+    addresses: &[Address],
+) -> Result<HashMap<Address, SftTokenDetailsSummaryVault>, ApiError> {
+    const QUERY: &str = r#"
+query TokenDetailsList($addresses: [Bytes!]!) {
+  offchainAssetReceiptVaults(
+    first: 1000
+    where: { wrappedTokenContractAddress_in: $addresses }
+  ) {
+    receiptContractAddress
+    wrappedTokenContractAddress
+    totalShares
+    name
+    symbol
+    tokenHolderCount
+    shareTransferCount
+    depositVolume
+    withdrawVolume
+  }
+}
+"#;
+
+    let mut vaults = HashMap::new();
+    for chunk in addresses.chunks(SFT_PAGE_SIZE) {
+        let address_values = chunk
+            .iter()
+            .map(|address| format!("{address:#x}"))
+            .collect::<Vec<_>>();
+        let data = post_graphql::<SftTokenDetailsListData>(
+            sft_subgraph_url,
+            QUERY,
+            json!({
+                "addresses": address_values,
+            }),
+        )
+        .await?;
+
+        for vault in data.offchain_asset_receipt_vaults {
+            let Some(wrapped_address) = vault.wrapped_token_contract_address else {
+                tracing::error!("token details list vault missing wrapped token address");
+                continue;
+            };
+            vaults.insert(wrapped_address, vault);
+        }
+    }
+    Ok(vaults)
 }
 
 fn activity_limit(params: &TokenDetailsQueryParams) -> u32 {
@@ -739,12 +851,68 @@ pub async fn get_token_details(
 
         let mut data = Vec::new();
         let mut errors = Vec::new();
+        let mut vaults_by_subgraph = HashMap::new();
+        let mut tokens_by_subgraph: HashMap<String, Vec<&TokenCfg>> = HashMap::new();
 
         for item in &batch_items {
-            let row = match &item.sft_subgraph_url {
-                Ok(url) => read_token_details_summary_response(&item.token, url).await,
-                Err(error) => Err(error.clone()),
+            match &item.sft_subgraph_url {
+                Ok(url) => tokens_by_subgraph
+                    .entry(url.clone())
+                    .or_default()
+                    .push(&item.token),
+                Err(error) => {
+                    tracing::error!(
+                        address = %item.token.address,
+                        error = %error,
+                        "failed to resolve token details subgraph"
+                    );
+                    errors.push(TokenDetailsErrorResponse {
+                        address: item.token.address,
+                        message: api_error_message(error),
+                    });
+                }
+            }
+        }
+
+        for (url, tokens) in &tokens_by_subgraph {
+            let addresses = tokens.iter().map(|token| token.address).collect::<Vec<_>>();
+            match read_token_details_list_vaults(url, &addresses).await {
+                Ok(vaults) => {
+                    vaults_by_subgraph.insert(url.clone(), vaults);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        url,
+                        error = %error,
+                        "failed to read batched token details"
+                    );
+                    for token in tokens {
+                        errors.push(TokenDetailsErrorResponse {
+                            address: token.address,
+                            message: api_error_message(&error),
+                        });
+                    }
+                }
+            }
+        }
+
+        for item in &batch_items {
+            let Ok(url) = &item.sft_subgraph_url else {
+                continue;
             };
+            let Some(vaults) = vaults_by_subgraph.get(url) else {
+                continue;
+            };
+            let row = vaults
+                .get(&item.token.address)
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        address = %item.token.address,
+                        "SFT vault not found for token details"
+                    );
+                    ApiError::NotFound("SFT vault not found for token".into())
+                })
+                .and_then(|vault| build_token_details_list_summary_response(&item.token, vault));
 
             match row {
                 Ok(row) => data.push(row),

@@ -66,16 +66,16 @@ curl https://api.st0x.io/v1/tokens \
 
 ### Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `key` | string | Token key from the registry settings |
-| `address` | string | Token contract address on Base |
-| `symbol` | string | Token ticker symbol |
-| `name` | string | Full token name |
-| `isin` | string or null | ISIN identifier, when available |
-| `decimals` | number | Token decimal places |
-| `network` | object | Token network metadata with RPC URLs removed |
-| `extensions` | object or null | Additional token metadata, when available |
+| Field        | Type           | Description                                  |
+| ------------ | -------------- | -------------------------------------------- |
+| `key`        | string         | Token key from the registry settings         |
+| `address`    | string         | Token contract address on Base               |
+| `symbol`     | string         | Token ticker symbol                          |
+| `name`       | string         | Full token name                              |
+| `isin`       | string or null | ISIN identifier, when available              |
+| `decimals`   | number         | Token decimal places                         |
+| `network`    | object         | Token network metadata with RPC URLs removed |
+| `extensions` | object or null | Additional token metadata, when available    |
 
 Use the `address` field when specifying tokens in swap and order requests.
 
@@ -256,17 +256,16 @@ The batch endpoint returns successful rows in `data` and per-token failures in
 | ---------------- | ------ | --------------------------------------------------------------------- |
 | `address`        | string | Current wrapped ST0x token address from the registry                  |
 | `holderCount`    | number | Count of token holders with a non-zero balance                        |
-| `transferCount`  | number | Exact count from paginating SFT share transfer rows                   |
+| `transferCount`  | number | Count of SFT share transfer rows                                      |
 | `bridgedSupply`  | string | `depositVolume - withdrawVolume`, in raw token units                  |
 | `depositVolume`  | string | Sum of all SFT deposit amounts, in raw token units                    |
 | `withdrawVolume` | string | Sum of all SFT withdraw amounts, in raw token units                   |
 | `activityVolume` | string | `depositVolume + withdrawVolume`, in raw token units                  |
 | `activity`       | object | Recent deposit and withdraw rows only; transfer rows are not returned |
 
-Aggregate counts and volumes are cached for 5 minutes by SFT subgraph URL and
-wrapped token address to avoid repeated full relation scans. The batch
-`/v1/tokens/details` response is also cached for 5 minutes for landing/sidebar
-usage. Full holder lists are not returned.
+Aggregate counts and volumes come from the configured SFT subgraph and are
+cached for 5 minutes. The batch `/v1/tokens/details` response is also cached for
+5 minutes for landing/sidebar usage. Full holder lists are not returned.
 
 ## Token Proofs
 

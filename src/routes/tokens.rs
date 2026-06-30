@@ -1879,10 +1879,44 @@ using-tokens-from:
         })
     }
 
+    fn token_details_list_body(body: &serde_json::Value) -> serde_json::Value {
+        let missing_address = format!("{WT_SECOND:#x}");
+        let vaults = body["variables"]["addresses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|address| address.as_str())
+            .filter(|address| *address != missing_address)
+            .map(|address| {
+                json!({
+                    "receiptContractAddress": format!("{T_SECOND:#x}"),
+                    "wrappedTokenContractAddress": address,
+                    "totalShares": "1000",
+                    "name": "Subgraph MicroStrategy",
+                    "symbol": "sgMSTR",
+                    "tokenHolderCount": "1001",
+                    "shareTransferCount": "1002",
+                    "depositVolume": "300",
+                    "withdrawVolume": "40"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "data": {
+                "offchainAssetReceiptVaults": vaults
+            }
+        })
+    }
+
     fn token_details_response_for_request(request: &str) -> serde_json::Value {
         let body = request_json(request);
         let query = body["query"].as_str().unwrap_or_default();
         let last_id = variables_last_id(&body);
+
+        if query.contains("query TokenDetailsList") {
+            return token_details_list_body(&body);
+        }
 
         if query.contains("query TokenDetails") {
             if body["variables"]["address"] == format!("{WT_SECOND:#x}") {
@@ -1926,6 +1960,40 @@ using-tokens-from:
         json!({ "data": { "offchainAssetReceiptVaults": [] } })
     }
 
+    async fn read_mock_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+
+        loop {
+            let n = tokio::io::AsyncReadExt::read(socket, &mut chunk)
+                .await
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
     async fn mock_token_details_subgraph() -> (String, StdArc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1944,11 +2012,7 @@ using-tokens-from:
                 let requests = recorded_requests.clone();
 
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 8192];
-                    let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
-                        .await
-                        .unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let request = read_mock_http_request(&mut socket).await;
                     requests
                         .lock()
                         .expect("mock token details request lock")
@@ -1989,11 +2053,7 @@ using-tokens-from:
                 let scripted_responses = scripted_responses.clone();
 
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 8192];
-                    let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
-                        .await
-                        .unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let request = read_mock_http_request(&mut socket).await;
                     requests
                         .lock()
                         .expect("mock scripted subgraph request lock")
@@ -2081,6 +2141,73 @@ using-tokens-from:
   ]
 }}"#
         );
+        let registry_url =
+            mock_raindex_registry_url_with_settings_and_tokens(&settings, &remote_tokens).await;
+        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
+            .await
+            .expect("load raindex config");
+        TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await
+    }
+
+    fn token_details_test_address(index: usize) -> String {
+        format!("0x{:040x}", index + 1)
+    }
+
+    async fn token_details_many_client(
+        sft_url: &str,
+        token_count: usize,
+    ) -> rocket::local::asynchronous::Client {
+        let settings = format!(
+            r#"version: 6
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+subgraphs:
+  base: https://example.com/raindex-subgraph
+  sft-base: {sft_url}
+metaboards:
+  base: https://example.com/metadata
+raindexes:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+using-tokens-from:
+  - __TOKENS_URL__
+"#
+        );
+        let tokens = (0..token_count)
+            .map(|index| {
+                json!({
+                    "chainId": 8453,
+                    "address": token_details_test_address(index),
+                    "decimals": 18,
+                    "name": format!("Wrapped Test {index} ST0x"),
+                    "symbol": format!("wtTEST{index}"),
+                    "extensions": {
+                        "category": "ST0x"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let remote_tokens = json!({
+            "name": "ST0x Token Details Large List",
+            "timestamp": "2026-06-02T00:00:00.000Z",
+            "version": { "major": 1, "minor": 0, "patch": 0 },
+            "tokens": tokens
+        })
+        .to_string();
         let registry_url =
             mock_raindex_registry_url_with_settings_and_tokens(&settings, &remote_tokens).await;
         let config = crate::raindex::RaindexProvider::load(&registry_url, None)
@@ -2560,7 +2687,7 @@ using-tokens-from:
         let recorded = requests.lock().expect("mock requests").clone();
         let token_details_requests = recorded
             .iter()
-            .filter(|request| request.contains("query TokenDetails"))
+            .filter(|request| request.contains("query TokenDetailsList"))
             .count();
         let holder_page_requests = recorded
             .iter()
@@ -2568,7 +2695,53 @@ using-tokens-from:
             .count();
 
         assert_eq!(token_details_requests, 1);
-        assert_eq!(holder_page_requests, 2);
+        assert_eq!(holder_page_requests, 0);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_token_details_chunks_batched_list_queries() {
+        let _cache_guard = TOKEN_DETAILS_CACHE_TEST_LOCK.lock().await;
+        clear_token_details_aggregate_cache();
+        let (sft_url, requests) = mock_token_details_subgraph().await;
+        let token_count = SFT_PAGE_SIZE + 1;
+        let client = token_details_many_client(&sft_url, token_count).await;
+
+        let response = authorized_get(&client, "/v1/tokens/details".to_string()).await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"].as_array().expect("data is an array").len(),
+            token_count
+        );
+        assert!(body["errors"]
+            .as_array()
+            .expect("errors is an array")
+            .is_empty());
+
+        let recorded = requests.lock().expect("mock requests").clone();
+        let token_details_requests = recorded
+            .iter()
+            .filter(|request| request.contains("query TokenDetailsList"))
+            .map(|request| request_json(request))
+            .collect::<Vec<_>>();
+        let chunk_sizes = token_details_requests
+            .iter()
+            .map(|request| {
+                request["variables"]["addresses"]
+                    .as_array()
+                    .expect("addresses is an array")
+                    .len()
+            })
+            .collect::<Vec<_>>();
+        let holder_page_requests = recorded
+            .iter()
+            .filter(|request| request.contains("query TokenHolderPage"))
+            .count();
+
+        assert_eq!(chunk_sizes, vec![SFT_PAGE_SIZE, 1]);
+        assert_eq!(holder_page_requests, 0);
     }
 
     #[rocket::async_test]
@@ -2586,15 +2759,15 @@ using-tokens-from:
         let recorded = requests.lock().expect("mock requests").clone();
         let token_details_requests = recorded
             .iter()
-            .filter(|request| request.contains("query TokenDetails"))
+            .filter(|request| request.contains("query TokenDetailsList"))
             .count();
         let holder_page_requests = recorded
             .iter()
             .filter(|request| request.contains("query TokenHolderPage"))
             .count();
 
-        assert_eq!(token_details_requests, 4);
-        assert_eq!(holder_page_requests, 2);
+        assert_eq!(token_details_requests, 2);
+        assert_eq!(holder_page_requests, 0);
     }
 
     #[rocket::async_test]
