@@ -64,16 +64,67 @@ is not pre-converted.
 
 Do not pass unwrapped-normalized quote values into other endpoints unless those
 endpoints explicitly support `denomination=unwrapped` and you call them that
-way. `/v1/swap/calldata` supports the same `denomination` field, but the swap
-still purchases wrapped/orderbook tokens.
+way. The calldata endpoints support the same `denomination` field, but swaps
+still use wrapped/orderbook token addresses.
 
 ## Step 2: Get Calldata
+
+For new integrations, use `POST /v2/swap/calldata`. It supports both
+output-targeted swaps and spend-mode swaps. `POST /v1/swap/calldata` remains
+available for existing output-targeted clients.
+
+### Recommended: V2 Mode-Based Calldata
+
+```
+POST /v2/swap/calldata
+```
+
+#### Request
+
+```bash
+curl -X POST https://api.st0x.io/v2/swap/calldata \
+  -H "Authorization: Basic <credentials>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "taker": "0xYourWalletAddress",
+    "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "outputToken": "0x4200000000000000000000000000000000000006",
+    "mode": "spendExact",
+    "amount": "2500.0",
+    "priceCap": "2600.0",
+    "denomination": "wrapped"
+  }'
+```
+
+| Field          | Type   | Description                                                                                                                                                         |
+| -------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `taker`        | string | Your wallet address that will execute the transaction                                                                                                               |
+| `inputToken`   | string | Wrapped/orderbook token address you are selling                                                                                                                     |
+| `outputToken`  | string | Wrapped/orderbook token address you want to receive                                                                                                                 |
+| `mode`         | string | Swap mode. One of `"buyUpTo"`, `"spendExact"`, or `"spendUpTo"`                                                                                                     |
+| `amount`       | string | Target amount in the selected `denomination`. For `buyUpTo`, this is output amount. For `spendExact` and `spendUpTo`, this is input amount                          |
+| `priceCap`     | string | Maximum input-token amount you are willing to spend per 1 output token, in the selected `denomination`                                                              |
+| `denomination` | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `amount` and `priceCap` as unwrapped display values for wrapped ST0x/ERC4626 tokens. |
+
+Mode behavior:
+
+| Mode         | Amount Means                 | Fill Behavior                                   |
+| ------------ | ---------------------------- | ----------------------------------------------- |
+| `buyUpTo`    | Output-token amount to buy   | Buy up to `amount`; partial fills are allowed   |
+| `spendExact` | Input-token amount to spend  | Spend exactly `amount`; fails if not fillable   |
+| `spendUpTo`  | Maximum input-token to spend | Spend up to `amount`; partial fills are allowed |
+
+Set `priceCap` slightly above the quote price to allow for price movement. For
+example, when selling USDC for WETH, `"priceCap": "2600"` means the swap will
+not pay more than 2600 USDC per 1 WETH.
+
+### Legacy: V1 Output-Targeted Calldata
 
 ```
 POST /v1/swap/calldata
 ```
 
-### Request
+#### Request
 
 ```bash
 curl -X POST https://api.st0x.io/v1/swap/calldata \
@@ -98,13 +149,16 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
 | `maximumIoRatio` | string | Maximum acceptable IO ratio in the selected `denomination`                                                                                                                      |
 | `denomination`   | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `outputAmount` and `maximumIoRatio` as unwrapped display values for wrapped ST0x/ERC4626 tokens. |
 
+V1 is equivalent to v2 with `"mode": "buyUpTo"`. It cannot express spend-based
+intent.
+
 Set `maximumIoRatio` slightly above the `estimatedIoRatio` from the quote to
 allow for price movement.
 
 For calldata, `denomination=unwrapped` only changes how numeric fields are
-interpreted and displayed. The API converts `outputAmount` and `maximumIoRatio`
-to wrapped/orderbook units before generating calldata. Clients must still pass
-the wrapped/orderbook token addresses for `inputToken` and `outputToken`; the
+interpreted and displayed. The API converts request amounts and price limits to
+wrapped/orderbook units before generating calldata. Clients must still pass the
+wrapped/orderbook token addresses for `inputToken` and `outputToken`; the
 endpoint does not translate unwrapped asset addresses.
 
 ### Response
@@ -148,18 +202,21 @@ the swap calldata:
 }
 ```
 
-| Field            | Type   | Description                                                                        |
-| ---------------- | ------ | ---------------------------------------------------------------------------------- |
-| `to`             | string | Contract address to send the transaction to                                        |
-| `data`           | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed            |
-| `value`          | string | Native token value to send (usually `"0x0"`)                                       |
-| `estimatedInput` | string | Expected input amount in the requested `denomination`                              |
-| `denomination`   | string | Denomination used for `estimatedInput`                                             |
-| `approvals`      | array  | Token approvals needed — if non-empty, approve first then call this endpoint again |
+| Field            | Type   | Description                                                                                                                                                                                    |
+| ---------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to`             | string | Contract address to send the transaction to                                                                                                                                                    |
+| `data`           | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed                                                                                                                        |
+| `value`          | string | Native token value to send (usually `"0x0"`)                                                                                                                                                   |
+| `estimatedInput` | string | Expected input amount in the requested `denomination` when calldata is ready. When approvals are needed, this is the input-token approval amount/cap required before calldata can be generated |
+| `denomination`   | string | Denomination used for `estimatedInput`                                                                                                                                                         |
+| `approvals`      | array  | Token approvals needed — if non-empty, approve first then call this endpoint again                                                                                                             |
 
 Approval entries always describe the actual on-chain approval requirements in
 wrapped/orderbook token units. They are not converted or relabeled when
-`denomination=unwrapped`.
+`denomination=unwrapped`. For approval-required responses, `estimatedInput`
+matches the approval requirement expressed in the requested `denomination`, not
+the final simulated spend. Call the calldata endpoint again after approving to
+receive the ready calldata response with the expected input amount.
 
 ## Step 3: Handle Approvals
 
@@ -191,16 +248,17 @@ QUOTE=$(curl -s -X POST https://api.st0x.io/v1/swap/quote \
 
 echo "$QUOTE" | jq .estimatedIoRatio
 
-# 2. Get calldata (add some slippage to the IO ratio)
-CALLDATA=$(curl -s -X POST https://api.st0x.io/v1/swap/calldata \
+# 2. Get calldata (add some slippage to the quoted price)
+CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
-    "outputAmount": "1.0",
-    "maximumIoRatio": "2600.0"
+    "mode": "buyUpTo",
+    "amount": "1.0",
+    "priceCap": "2600.0"
   }')
 
 # 3. Check if approvals are needed
@@ -214,15 +272,16 @@ if [ "$APPROVALS" != "[]" ]; then
 
   # Now call the calldata endpoint again — this time approvals are in place
   # and the response will contain the swap calldata in "data"
-  CALLDATA=$(curl -s -X POST https://api.st0x.io/v1/swap/calldata \
+  CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
     -H "Authorization: Basic <credentials>" \
     -H "Content-Type: application/json" \
     -d '{
       "taker": "0xYourWalletAddress",
       "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       "outputToken": "0x4200000000000000000000000000000000000006",
-      "outputAmount": "1.0",
-      "maximumIoRatio": "2600.0"
+      "mode": "buyUpTo",
+      "amount": "1.0",
+      "priceCap": "2600.0"
     }')
 fi
 

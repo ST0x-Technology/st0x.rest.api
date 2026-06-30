@@ -276,6 +276,10 @@ pub fn routes() -> Vec<Route> {
     rocket::routes![quote::post_swap_quote, calldata::post_swap_calldata]
 }
 
+pub fn routes_v2() -> Vec<Route> {
+    rocket::routes![calldata::post_swap_calldata_v2]
+}
+
 #[cfg(test)]
 mod tests {
     use super::swap_candidates_cache_key;
