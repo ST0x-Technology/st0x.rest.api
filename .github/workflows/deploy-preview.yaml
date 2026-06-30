@@ -1,6 +1,16 @@
 name: Deploy Preview
 on:
   workflow_dispatch:
+    inputs:
+      deploy_scope:
+        description: "Deploy scope"
+        required: true
+        type: choice
+        default: "service"
+        options:
+          - service
+          - system
+          - all
 concurrency:
   group: deploy-preview
   cancel-in-progress: false
@@ -57,6 +67,7 @@ jobs:
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
       - name: Provision preview infrastructure
+        if: (inputs.deploy_scope || 'service') == 'all'
         env:
           TF_VAR_do_token: ${{ secrets.DO_TOKEN }}
         run: |
@@ -71,6 +82,7 @@ jobs:
           fi
           nix run .#tfPreviewProvision
       - name: Commit encrypted Terraform state
+        if: (inputs.deploy_scope || 'service') == 'all'
         run: |
           git add infra/terraform.tfstate.age keys.nix
           if git diff --cached --quiet; then
@@ -89,6 +101,7 @@ jobs:
           echo "::add-mask::$host_ip"
           echo "HOST_IP=$host_ip" >> "$GITHUB_ENV"
       - name: Bootstrap preview host
+        if: (inputs.deploy_scope || 'service') == 'all'
         run: DEPLOY_ENV=preview nix run .#bootstrap
       - name: Trust preview host key
         env:
@@ -103,6 +116,15 @@ jobs:
           fi
       # Prepare local build artifacts used by deploy-rs.
       - run: ./prep.sh
+      - name: Deploy preview service
+        if: (inputs.deploy_scope || 'service') == 'service'
+        timeout-minutes: 60
+        run: nix run .#deployPreviewService -- rest-api
+      - name: Deploy preview system
+        if: (inputs.deploy_scope || 'service') == 'system'
+        timeout-minutes: 60
+        run: nix run .#deployPreviewNixos
       - name: Deploy preview system and service
+        if: (inputs.deploy_scope || 'service') == 'all'
         timeout-minutes: 60
         run: nix run .#deployPreviewAll
