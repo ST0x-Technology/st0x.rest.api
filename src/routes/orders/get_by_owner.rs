@@ -18,6 +18,7 @@ use tracing::Instrument;
 
 pub(crate) async fn process_get_orders_by_owner(
     ds: &dyn OrdersListDataSource,
+    chain_ids: Option<Vec<u32>>,
     address: Address,
     state: Option<OrderState>,
     page: Option<u16>,
@@ -37,7 +38,12 @@ pub(crate) async fn process_get_orders_by_owner(
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
     let (orders, total_count) = ds
-        .get_orders_list(filters, Some(page_num), Some(effective_page_size))
+        .get_orders_list(
+            chain_ids,
+            filters,
+            Some(page_num),
+            Some(effective_page_size),
+        )
         .await?;
 
     tracing::info!(
@@ -92,17 +98,23 @@ pub async fn get_orders_by_address(
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
         let state = params.state;
+        let (client, chain_ids) = {
+            let raindex = shared_raindex.read().await;
+            let chain_ids =
+                crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
+            (raindex.client().clone(), chain_ids)
+        };
         let page = params.page;
         let page_size = params.page_size;
         let denomination = params.denomination.unwrap_or_default();
-        let raindex = shared_raindex.read().await;
         let ds = RaindexOrdersListDataSource {
-            client: raindex.client(),
+            client: &client,
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
         let response =
-            process_get_orders_by_owner(&ds, addr, state, page, page_size, denomination).await?;
+            process_get_orders_by_owner(&ds, chain_ids, addr, state, page, page_size, denomination)
+                .await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -133,7 +145,7 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_owner(&ds, None, addr, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
@@ -163,7 +175,7 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_owner(&ds, None, addr, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
@@ -183,7 +195,7 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_owner(&ds, None, addr, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
@@ -202,7 +214,8 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped).await;
+            process_get_orders_by_owner(&ds, None, addr, None, None, None, Denomination::Wrapped)
+                .await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -217,7 +230,7 @@ mod tests {
             .parse()
             .unwrap();
         let result =
-            process_get_orders_by_owner(&ds, addr, None, None, None, Denomination::Wrapped)
+            process_get_orders_by_owner(&ds, None, addr, None, None, None, Denomination::Wrapped)
                 .await
                 .unwrap();
 
@@ -237,6 +250,7 @@ mod tests {
 
         let result = process_get_orders_by_owner(
             &ds,
+            None,
             addr,
             Some(OrderState::Inactive),
             None,
@@ -261,6 +275,7 @@ mod tests {
 
         let result = process_get_orders_by_owner(
             &ds,
+            None,
             addr,
             Some(OrderState::All),
             None,

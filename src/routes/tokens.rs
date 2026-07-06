@@ -46,6 +46,15 @@ pub struct TokenResponse {
     isin: Option<String>,
 }
 
+#[derive(Debug, Clone, FromForm, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenListParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    chain_id: Option<u32>,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioErrorResponse {
@@ -742,6 +751,7 @@ query TokenMetadata($subject: String!) {
     path = "/v1/tokens",
     tag = "Tokens",
     security(("basicAuth" = [])),
+    params(TokenListParams),
     responses(
         (
             status = 200,
@@ -771,22 +781,26 @@ query TokenMetadata($subject: String!) {
                 }
             ])
         ),
+        (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/")]
+#[get("/?<params..>")]
 pub async fn get_tokens(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
+    params: TokenListParams,
 ) -> Result<Json<Vec<TokenResponse>>, ApiError> {
     async move {
-        tracing::info!("request received");
+        tracing::info!(params = ?params, "request received");
 
         let raindex = shared_raindex.read().await;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
         let tokens = raindex
             .client()
             .get_all_tokens()
@@ -795,7 +809,15 @@ pub async fn get_tokens(
                 ApiError::Internal("failed to retrieve token list".into())
             })?;
 
-        let result: Vec<TokenResponse> = tokens.into_values().map(TokenResponse::from).collect();
+        let result: Vec<TokenResponse> = tokens
+            .into_values()
+            .filter(|token| {
+                chain_ids
+                    .as_ref()
+                    .is_none_or(|chain_ids| chain_ids.contains(&token.network.chain_id))
+            })
+            .map(TokenResponse::from)
+            .collect();
         tracing::info!(count = result.len(), "returning tokens");
         Ok(Json(result))
     }
@@ -1185,6 +1207,10 @@ pub fn routes() -> Vec<Route> {
         get_token_details_by_address,
         get_token_proofs
     ]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }
 
 #[cfg(test)]
@@ -2297,6 +2323,90 @@ tokens:
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         let tokens = body.as_array().expect("tokens is an array");
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_filters_by_chain_id() {
+        let settings = r#"version: 6
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+  polygon:
+    rpcs:
+      - https://polygon-rpc.com
+    chain-id: 137
+    currency: POL
+subgraphs:
+  base: https://example.com/base-subgraph
+  polygon: https://example.com/polygon-subgraph
+raindexes:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+  polygon:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: polygon
+    subgraph: polygon
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+  polygon:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: polygon
+tokens:
+  usdc-base:
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    network: base
+    decimals: 6
+    label: USD Coin
+    symbol: USDC
+  usdc-polygon:
+    address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+    network: polygon
+    decimals: 6
+    label: USD Coin (PoS)
+    symbol: USDC
+"#;
+        let registry_url =
+            crate::test_helpers::mock_raindex_registry_url_with_settings(settings).await;
+        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
+            .await
+            .expect("load raindex config");
+        let client = TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v2/tokens?chainId=137")
+            .header(Header::new("Authorization", header.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let tokens = body.as_array().expect("tokens is an array");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0]["address"],
+            "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+        );
+        assert_eq!(tokens[0]["network"]["chainId"], 137);
+
+        let response = client
+            .get("/v2/tokens?chainId=999")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
     }
 
     #[rocket::async_test]

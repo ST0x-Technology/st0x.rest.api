@@ -43,11 +43,13 @@ pub async fn get_trades_by_address(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let raindex = shared_raindex.read().await;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
         let ds = RaindexTradesDataSource {
             client: raindex.client(),
             pool: pool.inner(),
         };
-        process_get_trades_by_address(&ds, address.0, params).await
+        process_get_trades_by_address(&ds, chain_ids, address.0, params).await
     }
     .instrument(span.0)
     .await
@@ -55,6 +57,7 @@ pub async fn get_trades_by_address(
 
 pub(super) async fn process_get_trades_by_address(
     ds: &dyn TradesDataSource,
+    chain_ids: Option<Vec<u32>>,
     owner: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
@@ -63,6 +66,7 @@ pub(super) async fn process_get_trades_by_address(
 
     let result = ds
         .get_trades_for_owner(
+            chain_ids,
             owner,
             PaginationParams {
                 page: Some(sdk_page),
@@ -95,6 +99,7 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
@@ -102,6 +107,7 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -114,6 +120,7 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -124,6 +131,7 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _taker: Address,
             _page: u16,
             _page_size: u16,
@@ -134,6 +142,7 @@ mod tests {
 
         async fn get_trades_by_order_hashes(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _order_hashes: Vec<B256>,
             _time_filter: TimeFilter,
         ) -> Result<
@@ -150,6 +159,7 @@ mod tests {
             owner_result: Ok(mock_trades_list_result()),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -158,6 +168,7 @@ mod tests {
         };
         let result = process_get_trades_by_address(
             &ds,
+            None,
             address!("0000000000000000000000000000000000000001"),
             params,
         )
@@ -185,6 +196,7 @@ mod tests {
             owner_result: Ok(mock_empty_trades_list_result()),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -193,6 +205,7 @@ mod tests {
         };
         let result = process_get_trades_by_address(
             &ds,
+            None,
             address!("0000000000000000000000000000000000000001"),
             params,
         )
@@ -212,6 +225,7 @@ mod tests {
             owner_result: Err(ApiError::Internal("subgraph error".into())),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -220,6 +234,7 @@ mod tests {
         };
         let result = process_get_trades_by_address(
             &ds,
+            None,
             address!("0000000000000000000000000000000000000001"),
             params,
         )

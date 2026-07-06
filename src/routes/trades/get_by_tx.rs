@@ -48,12 +48,15 @@ pub async fn get_trades_by_tx(
     async move {
         tracing::info!(tx_hash = ?tx_hash, params = ?params, "request received");
         let raindex = shared_raindex.read().await;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
         let trades_ds = RaindexTradesDataSource {
             client: raindex.client(),
             pool: pool.inner(),
         };
         process_get_trades_by_tx(
             &trades_ds,
+            chain_ids,
             tx_hash.0,
             params.denomination.unwrap_or_default(),
         )
@@ -65,10 +68,11 @@ pub async fn get_trades_by_tx(
 
 pub(super) async fn process_get_trades_by_tx(
     trades_ds: &dyn TradesDataSource,
+    chain_ids: Option<Vec<u32>>,
     tx_hash: B256,
     denomination: Denomination,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
-    let result = trades_ds.get_trades_by_tx(tx_hash).await?;
+    let result = trades_ds.get_trades_by_tx(chain_ids, tx_hash).await?;
     let trades = result.trades();
 
     if trades.is_empty() {
@@ -268,6 +272,7 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             match &self.result {
@@ -278,6 +283,7 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -287,6 +293,7 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -297,6 +304,7 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _taker: Address,
             _page: u16,
             _page_size: u16,
@@ -307,6 +315,7 @@ mod tests {
 
         async fn get_trades_by_order_hashes(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _order_hashes: Vec<B256>,
             _time_filter: TimeFilter,
         ) -> Result<
@@ -332,6 +341,7 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
+            None,
             "0x0000000000000000000000000000000000000000000000000000000000000088"
                 .parse()
                 .unwrap(),
@@ -370,6 +380,7 @@ mod tests {
 
         let result = process_get_trades_by_tx(
             &trades_ds,
+            None,
             "0x0000000000000000000000000000000000000000000000000000000000000088"
                 .parse()
                 .unwrap(),
@@ -397,6 +408,7 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
+            None,
             "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .parse()
                 .unwrap(),
@@ -414,6 +426,7 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
+            None,
             "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .parse()
                 .unwrap(),
@@ -431,6 +444,7 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
+            None,
             "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .parse()
                 .unwrap(),

@@ -19,6 +19,7 @@ use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch as fetch_order_quotes_batch, RaindexOrderQuote,
 };
 use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
+use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 use std::collections::BTreeMap;
@@ -43,6 +44,7 @@ pub(crate) struct OrderQuoteSummary {
 pub(crate) trait OrdersListDataSource: Send + Sync {
     async fn get_orders_list(
         &self,
+        chain_ids: Option<Vec<u32>>,
         filters: GetOrdersFilters,
         page: Option<u16>,
         page_size: Option<u16>,
@@ -280,13 +282,14 @@ where
 impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
     async fn get_orders_list(
         &self,
+        chain_ids: Option<Vec<u32>>,
         filters: GetOrdersFilters,
         page: Option<u16>,
         page_size: Option<u16>,
     ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
         let result = self
             .client
-            .get_orders(None, Some(filters), page, page_size)
+            .get_orders(chain_ids.map(ChainIds), Some(filters), page, page_size)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
@@ -640,6 +643,10 @@ pub fn routes() -> Vec<Route> {
     ]
 }
 
+pub fn routes_v2() -> Vec<Route> {
+    routes()
+}
+
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use super::OrdersListDataSource;
@@ -664,6 +671,7 @@ pub(crate) mod test_fixtures {
     impl OrdersListDataSource for MockOrdersListDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,
@@ -689,6 +697,7 @@ pub(crate) mod test_fixtures {
     impl OrdersListDataSource for RecordingOrdersListDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,
@@ -727,6 +736,7 @@ mod tests {
     impl OrdersListDataSource for BatchingTestDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,

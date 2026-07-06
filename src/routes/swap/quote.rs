@@ -40,15 +40,57 @@ pub async fn post_swap_quote(
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let req = request.into_inner();
+    handle_swap_quote(shared_raindex, app_state, pool, span, req).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/v2/swap/quote",
+    tag = "Swap",
+    security(("basicAuth" = [])),
+    request_body = SwapQuoteRequest,
+    responses(
+        (status = 200, description = "Swap quote", body = SwapQuoteResponse),
+        (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 404, description = "No liquidity found", body = ApiErrorResponse),
+        (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    )
+)]
+#[post("/quote", data = "<request>")]
+pub async fn post_swap_quote_v2(
+    _global: GlobalRateLimit,
+    _key: AuthenticatedKey,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
+    pool: &State<DbPool>,
+    span: TracingSpan,
+    request: Json<SwapQuoteRequest>,
+) -> Result<Json<SwapQuoteResponse>, ApiError> {
+    let req = request.into_inner();
+    handle_swap_quote(shared_raindex, app_state, pool, span, req).await
+}
+
+async fn handle_swap_quote(
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    app_state: &State<ApplicationState>,
+    pool: &State<DbPool>,
+    span: TracingSpan,
+    req: SwapQuoteRequest,
+) -> Result<Json<SwapQuoteResponse>, ApiError> {
     async move {
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_quote(&ds, req).await?;
+        let response = process_swap_quote(&ds, req, chain_id).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -58,12 +100,13 @@ pub async fn post_swap_quote(
 async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
+    chain_id: u32,
 ) -> Result<SwapQuoteResponse, ApiError> {
-    ds.validate_supported_tokens(req.input_token, req.output_token)
+    ds.validate_supported_tokens(chain_id, req.input_token, req.output_token)
         .await?;
 
     let orders = ds
-        .get_orders_for_pair(req.input_token, req.output_token)
+        .get_orders_for_pair(chain_id, req.input_token, req.output_token)
         .await?;
 
     if orders.is_empty() {
@@ -130,6 +173,7 @@ async fn process_swap_quote(
     })?;
 
     Ok(SwapQuoteResponse {
+        chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         output_amount: req.output_amount,
@@ -157,6 +201,7 @@ mod tests {
 
     fn quote_request(output_amount: &str) -> SwapQuoteRequest {
         SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
@@ -170,6 +215,7 @@ mod tests {
         output_amount: &str,
     ) -> SwapQuoteRequest {
         SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token,
             output_token,
             output_amount: output_amount.to_string(),
@@ -196,22 +242,24 @@ mod tests {
     impl SwapDataSource for MockQuoteDataSource {
         async fn validate_supported_tokens(
             &self,
+            chain_id: u32,
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
         ) -> Result<(), ApiError> {
             self.base
-                .validate_supported_tokens(input_token, output_token)
+                .validate_supported_tokens(chain_id, input_token, output_token)
                 .await
         }
 
         async fn get_orders_for_pair(
             &self,
+            chain_id: u32,
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
         ) -> Result<Vec<rain_orderbook_common::raindex_client::orders::RaindexOrder>, ApiError>
         {
             self.base
-                .get_orders_for_pair(input_token, output_token)
+                .get_orders_for_pair(chain_id, input_token, output_token)
                 .await
         }
 
@@ -256,8 +304,11 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("100"), 8453)
+            .await
+            .unwrap();
 
+        assert_eq!(result.chain_id, 8453);
         assert_eq!(result.input_token, USDC);
         assert_eq!(result.output_token, WETH);
         assert_eq!(result.output_amount, "100");
@@ -275,7 +326,9 @@ mod tests {
             candidates: vec![mock_candidate("50", "2"), mock_candidate("50", "3")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("100"), 8453)
+            .await
+            .unwrap();
 
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "100");
@@ -291,7 +344,9 @@ mod tests {
             candidates: vec![mock_candidate("30", "2")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("100"), 8453)
+            .await
+            .unwrap();
 
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "30");
@@ -310,7 +365,9 @@ mod tests {
             ],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("10")).await.unwrap();
+        let result = process_swap_quote(&ds, quote_request("10"), 8453)
+            .await
+            .unwrap();
 
         assert_eq!(result.estimated_io_ratio, "1.5");
         assert_eq!(result.estimated_input, "15");
@@ -329,7 +386,7 @@ mod tests {
             wrap_ratios: HashMap::from([(wt_mstr, wrap_ratio(wt_mstr, "2"))]),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, WETH, "100"))
+        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, WETH, "100"), 8453)
             .await
             .unwrap();
 
@@ -353,7 +410,7 @@ mod tests {
             wrap_ratios: HashMap::from([(wt_mstr, wrap_ratio(wt_mstr, "2"))]),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, wt_mstr, "100"))
+        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, wt_mstr, "100"), 8453)
             .await
             .unwrap();
 
@@ -381,9 +438,10 @@ mod tests {
             ]),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, wt_coin, "100"))
-            .await
-            .unwrap();
+        let result =
+            process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, wt_coin, "100"), 8453)
+                .await
+                .unwrap();
 
         assert_eq!(result.denomination, SwapDenomination::Unwrapped);
         assert_eq!(result.output_amount, "100");
@@ -404,7 +462,7 @@ mod tests {
             wrap_ratios: HashMap::new(),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, WETH, "100"))
+        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, WETH, "100"), 8453)
             .await
             .unwrap();
 
@@ -423,7 +481,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
     }
 
@@ -435,7 +493,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
         assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no valid quotes")));
     }
 
@@ -447,7 +505,7 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("not-a-number")).await;
+        let result = process_swap_quote(&ds, quote_request("not-a-number"), 8453).await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -459,7 +517,7 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -473,17 +531,29 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100")).await;
+        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
         assert!(
             matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
         );
     }
 
     #[rocket::async_test]
-    async fn test_swap_quote_401_without_auth() {
+    async fn test_swap_quote_v1_401_without_auth() {
         let client = TestClientBuilder::new().build().await;
         let response = client
             .post("/v1/swap/quote")
+            .header(ContentType::JSON)
+            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+    }
+
+    #[rocket::async_test]
+    async fn test_swap_quote_401_without_auth() {
+        let client = TestClientBuilder::new().build().await;
+        let response = client
+            .post("/v2/swap/quote")
             .header(ContentType::JSON)
             .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
             .dispatch()
@@ -497,7 +567,7 @@ mod tests {
         let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
         let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
         let response = client
-            .post("/v1/swap/quote")
+            .post("/v2/swap/quote")
             .header(ContentType::JSON)
             .header(rocket::http::Header::new("Authorization", header))
             .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
@@ -512,7 +582,7 @@ mod tests {
         let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
         let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
         let response = client
-            .post("/v1/swap/quote")
+            .post("/v2/swap/quote")
             .header(ContentType::JSON)
             .header(rocket::http::Header::new("Authorization", header))
             .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100","denomination":"invalid"}"#)

@@ -17,8 +17,10 @@ use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_get_orders_by_token(
     ds: &dyn OrdersListDataSource,
+    chain_ids: Option<Vec<u32>>,
     address: Address,
     state: Option<OrderState>,
     side: Option<OrderSide>,
@@ -54,7 +56,12 @@ pub(crate) async fn process_get_orders_by_token(
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
     let (orders, total_count) = ds
-        .get_orders_list(filters, Some(page_num), Some(effective_page_size))
+        .get_orders_list(
+            chain_ids,
+            filters,
+            Some(page_num),
+            Some(effective_page_size),
+        )
         .await?;
 
     tracing::info!(
@@ -110,36 +117,64 @@ pub async fn get_orders_by_token(
         let addr = address.0;
         let state = params.state;
         let side = params.side;
+        let (client, chain_ids) = {
+            let raindex = shared_raindex.read().await;
+            let chain_ids =
+                crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
+            (raindex.client().clone(), chain_ids)
+        };
         let page = params.page;
         let page_size = params.page_size;
         let denomination = params.denomination.unwrap_or_default();
         if !app_state.response_caches.is_enabled() {
-            let raindex = shared_raindex.read().await;
             let ds = RaindexOrdersListDataSource {
-                client: raindex.client(),
+                client: &client,
                 caches: &app_state.response_caches,
                 pool: pool.inner(),
             };
-            let response =
-                process_get_orders_by_token(&ds, addr, state, side, page, page_size, denomination)
-                    .await?;
+            let response = process_get_orders_by_token(
+                &ds,
+                chain_ids,
+                addr,
+                state,
+                side,
+                page,
+                page_size,
+                denomination,
+            )
+            .await?;
             return Ok(Json(response));
         }
 
-        let cache_key =
-            orders_by_token_cache_key(addr, state, side.as_ref(), page, page_size, denomination);
+        let cache_key = orders_by_token_cache_key(
+            chain_ids.as_deref(),
+            addr,
+            state,
+            side.as_ref(),
+            page,
+            page_size,
+            denomination,
+        );
         let response = app_state
             .response_caches
             .orders_by_token
             .get_or_try_insert(cache_key, || async move {
-                let raindex = shared_raindex.read().await;
                 let ds = RaindexOrdersListDataSource {
-                    client: raindex.client(),
+                    client: &client,
                     caches: &app_state.response_caches,
                     pool: pool.inner(),
                 };
-                process_get_orders_by_token(&ds, addr, state, side, page, page_size, denomination)
-                    .await
+                process_get_orders_by_token(
+                    &ds,
+                    chain_ids,
+                    addr,
+                    state,
+                    side,
+                    page,
+                    page_size,
+                    denomination,
+                )
+                .await
             })
             .await
             .map_err(|e| (*e).clone())?;
@@ -150,6 +185,7 @@ pub async fn get_orders_by_token(
 }
 
 fn orders_by_token_cache_key(
+    chain_ids: Option<&[u32]>,
     address: Address,
     state: Option<OrderState>,
     side: Option<&OrderSide>,
@@ -171,8 +207,16 @@ fn orders_by_token_cache_key(
     let page_size = page_size
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
+    let chain_key = match chain_ids {
+        Some(chain_ids) if !chain_ids.is_empty() => chain_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => "all".to_string(),
+    };
     format!(
-        "orders/token/{}/{state}/{side}/{page}/{page_size}/{denomination:?}",
+        "orders/token/{chain_key}/{}/{state}/{side}/{page}/{page_size}/{denomination:?}",
         address.to_string().to_ascii_lowercase()
     )
 }
@@ -200,10 +244,18 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
-                .await
-                .unwrap();
+        let result = process_get_orders_by_token(
+            &ds,
+            None,
+            addr,
+            None,
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "USDC");
@@ -232,6 +284,7 @@ mod tests {
             .unwrap();
         let result = process_get_orders_by_token(
             &ds,
+            None,
             addr,
             None,
             Some(OrderSide::Input),
@@ -257,10 +310,18 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
-                .await
-                .unwrap();
+        let result = process_get_orders_by_token(
+            &ds,
+            None,
+            addr,
+            None,
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.orders[0].io_ratio, "-");
         assert_eq!(result.orders[0].max_output, None);
@@ -276,9 +337,17 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
-                .await;
+        let result = process_get_orders_by_token(
+            &ds,
+            None,
+            addr,
+            None,
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 
@@ -292,10 +361,18 @@ mod tests {
         let addr: Address = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
             .parse()
             .unwrap();
-        let result =
-            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
-                .await
-                .unwrap();
+        let result = process_get_orders_by_token(
+            &ds,
+            None,
+            addr,
+            None,
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "wtMSTR");
@@ -312,6 +389,7 @@ mod tests {
 
         let result = process_get_orders_by_token(
             &ds,
+            None,
             addr,
             Some(OrderState::Inactive),
             None,
@@ -337,6 +415,7 @@ mod tests {
 
         let result = process_get_orders_by_token(
             &ds,
+            None,
             addr,
             Some(OrderState::All),
             None,
@@ -389,8 +468,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            orders_by_token_cache_key(lower, None, None, None, None, Denomination::Wrapped),
+            orders_by_token_cache_key(None, lower, None, None, None, None, Denomination::Wrapped),
             orders_by_token_cache_key(
+                None,
                 mixed,
                 None,
                 None,
@@ -401,6 +481,7 @@ mod tests {
         );
         assert_ne!(
             orders_by_token_cache_key(
+                None,
                 lower,
                 Some(OrderState::Inactive),
                 None,
@@ -409,8 +490,21 @@ mod tests {
                 Denomination::Wrapped
             ),
             orders_by_token_cache_key(
+                None,
                 lower,
                 Some(OrderState::All),
+                None,
+                None,
+                None,
+                Denomination::Wrapped
+            )
+        );
+        assert_ne!(
+            orders_by_token_cache_key(None, lower, None, None, None, None, Denomination::Wrapped),
+            orders_by_token_cache_key(
+                Some(&[8453]),
+                lower,
+                None,
                 None,
                 None,
                 None,
