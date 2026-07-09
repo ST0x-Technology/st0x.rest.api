@@ -12,6 +12,7 @@ mod denomination;
 mod erc4626;
 mod error;
 mod fairings;
+mod metrics;
 mod raindex;
 mod registry_artifact;
 mod routes;
@@ -323,13 +324,20 @@ async fn main() {
         }
     };
 
-    let log_guard = match telemetry::init(&cfg.log_dir) {
+    let log_guard = match telemetry::init(&cfg.log_dir, cfg.telemetry.as_ref()) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("failed to initialize telemetry: {e}");
             std::process::exit(1);
         }
     };
+
+    // Install the Prometheus recorder + standalone /metrics listener (:8001),
+    // reachable only over the tailnet. Non-fatal: a bind failure logs and the
+    // API keeps serving.
+    if let Err(e) = metrics::install() {
+        tracing::warn!(error = %e, "metrics exporter disabled");
+    }
 
     let pool = match db::init(&cfg.database_url, cfg.database_max_connections).await {
         Ok(p) => p,
@@ -524,6 +532,7 @@ mod tests {
             rate_limit_per_key_rpm: 60,
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
+            telemetry: None,
         }
     }
 

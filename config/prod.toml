@@ -11,3 +11,12 @@ rate_limit_global_rpm = 600
 rate_limit_per_key_rpm = 60
 docs_dir = "/var/lib/st0x-docs"
 local_db_path = "/mnt/data/st0x-rest-api/raindex.db"
+
+# Push logs + traces to the self-hosted observability stack over the tailnet
+# (VictoriaLogs :9428, VictoriaTraces :10428 on the st0x-observability GCE VM).
+# Non-secret plaintext; the OTLP path is fail-open if the box is unreachable.
+[telemetry]
+service_name = "st0x-rest-api"
+environment = "production"
+logs_endpoint = "http://st0x-observability:9428"
+traces_endpoint = "http://st0x-observability:10428"
