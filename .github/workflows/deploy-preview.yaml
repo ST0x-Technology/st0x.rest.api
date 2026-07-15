@@ -11,6 +11,11 @@ on:
           - service
           - system
           - all
+      reset_preview_state:
+        description: "Forget preview Terraform state before recreating infrastructure"
+        required: true
+        type: boolean
+        default: false
 concurrency:
   group: deploy-preview
   cancel-in-progress: false
@@ -70,6 +75,7 @@ jobs:
         if: (inputs.deploy_scope || 'service') == 'all'
         env:
           TF_VAR_do_token: ${{ secrets.DO_TOKEN }}
+          RESET_PREVIEW_STATE: ${{ inputs.reset_preview_state }}
         run: |
           if [ -z "$TF_VAR_do_token" ]; then
             echo "DO_TOKEN secret is required for preview infrastructure deploys" >&2
