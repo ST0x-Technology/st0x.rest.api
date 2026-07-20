@@ -1,7 +1,7 @@
-# Enrolls the droplet onto the st0x tailnet purely as a telemetry backhaul to
-# the observability box: the obs VM scrapes the app's Prometheus `/metrics` on
-# `:8001`, and the app pushes OTLP logs/traces to `st0x-observability:9428`
-# (VictoriaLogs) / `:10428` (VictoriaTraces).
+# Enrolls the droplet onto the rain tailnet (taile5cf8a.ts.net) purely as a
+# telemetry backhaul to the rain observability box: the obs droplet scrapes the
+# app's Prometheus `/metrics` on `:8001`, and the app pushes OTLP logs/traces to
+# `rain-management-observability:9428` (VictoriaLogs) / `:10428` (VictoriaTraces).
 #
 # Unlike the liquidity bot we do NOT serve anything over the tailnet — the public
 # API keeps its nginx + Let's Encrypt vhost on `api.st0x.io`. So there is no
@@ -9,8 +9,9 @@
 # opens the WireGuard path.
 #
 # The node joins with a per-environment, agenix-encrypted `tag:st0x-rest-api`
-# auth key (used only on first enrollment; afterwards tailscaled re-auths via the
-# stored node key in /var/lib/tailscale). The tag comes from the auth key, so no
+# auth key minted on the rain tailnet (used only on first enrollment; afterwards
+# tailscaled re-auths via the stored node key in /var/lib/tailscale). The tag
+# comes from the auth key, so no
 # `--advertise-tags` is needed. `--hostname` pins the MagicDNS name to the devops
 # scrape target. `tailscale0` is a trusted firewall interface, so the obs box can
 # reach `:8001` without that port ever being opened to the public internet.

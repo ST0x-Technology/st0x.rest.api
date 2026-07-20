@@ -38,8 +38,9 @@
         configFile = ./config/prod.toml;
         dataDir = "/mnt/data/st0x-rest-api";
         dataVolumeName = "st0x-rest-api-data";
-        # Tailnet MagicDNS name; must match the devops scrape target
-        # (terraform/observability/main.tf) + the tag:st0x-rest-api policy.
+        # Tailnet MagicDNS name; must match the rain.devops scrape target
+        # (reconcile-scrape-targets.sh in terraform/modules/observability) + the
+        # tag:st0x-rest-api policy in terraform/tailscale/policy.hujson.
         tailnetHostname = "st0x-rest-api-nixos";
       };
 

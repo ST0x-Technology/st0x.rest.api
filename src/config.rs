@@ -25,7 +25,7 @@ pub struct Config {
 
 /// Where to push OTLP logs/traces, and how signals are labelled. Endpoints are
 /// the VictoriaLogs (`:9428`) / VictoriaTraces (`:10428`) ingest URLs, reached
-/// over the tailnet (e.g. `http://st0x-observability:9428`).
+/// over the tailnet (e.g. `http://rain-management-observability.taile5cf8a.ts.net:9428`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {

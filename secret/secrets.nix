@@ -1,15 +1,16 @@
 # agenix/ragenix rules for runtime secrets on the deployed droplets.
 #
 # Currently just the per-environment Tailscale auth keys used to enrol each box
-# onto the st0x tailnet (nix/tailscale.nix reads them at
+# onto the rain tailnet (nix/tailscale.nix reads them at
 # /run/agenix/tailscale-authkey-${environment}). Each is a reusable, tagged
 # `tag:st0x-rest-api` key, encrypted to that environment's service recipients:
 # an admin key (to edit) + the droplet's host key (to decrypt at activation).
 #
 # DEV HANDOFF — creating the .age files is done by the devs, not committed here:
-#   1. Mint a reusable, tagged `tag:st0x-rest-api` auth key in the Tailscale
-#      admin console (one per environment). Requires the tag:st0x-rest-api
-#      tagOwner to exist in st0x.devops terraform/tailscale/policy.hujson.
+#   1. Mint a reusable, tagged `tag:st0x-rest-api` auth key in the **rain**
+#      tailnet's Tailscale admin console (one per environment). Requires the
+#      tag:st0x-rest-api tagOwner to exist in rainlanguage/rain.devops
+#      terraform/tailscale/policy.hujson.
 #   2. From this directory:
 #        printf %s '<tskey-...>' | ragenix -e tailscale-authkey-prod.age
 #        printf %s '<tskey-...>' | ragenix -e tailscale-authkey-preview.age
