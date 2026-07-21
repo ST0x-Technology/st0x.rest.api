@@ -151,6 +151,10 @@ pub fn routes() -> Vec<Route> {
     ]
 }
 
+pub fn routes_v2() -> Vec<Route> {
+    routes()
+}
+
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use super::OrderDataSource;

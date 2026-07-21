@@ -8,6 +8,9 @@ use utoipa::{IntoParams, ToSchema};
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct TradesPaginationParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "page")]
     #[param(example = 1)]
     pub page: Option<u32>,
@@ -29,6 +32,9 @@ pub struct TradesPaginationParams {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct TradesByTxParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "denomination")]
     #[param(example = "wrapped")]
     pub denomination: Option<Denomination>,
@@ -78,6 +84,8 @@ pub struct TradesByAddressResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TradesByOrderHashesRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(
         value_type = Vec<String>,
         example = json!(["0x000000000000000000000000000000000000000000000000000000000000abcd"])

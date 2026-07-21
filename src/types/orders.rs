@@ -8,6 +8,9 @@ use utoipa::{IntoParams, ToSchema};
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersPaginationParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "state")]
     pub state: Option<OrderState>,
     #[field(name = "page")]
@@ -54,6 +57,9 @@ pub enum OrderSummaryOrderType {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersByTokenParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "state")]
     pub state: Option<OrderState>,
     #[field(name = "side")]

@@ -25,6 +25,7 @@ const TOTALS_PAGE_SIZE: u16 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VaultRecord {
+    pub chain_id: u32,
     pub id: String,
     pub vault_id: String,
     pub owner: Address,
@@ -48,6 +49,7 @@ pub(crate) struct VaultsPage {
 pub(crate) trait VaultsDataSource: Send + Sync {
     async fn get_vaults(
         &self,
+        chain_ids: Option<Vec<u32>>,
         filters: GetVaultsFilters,
         page: u16,
         page_size: u16,
@@ -62,6 +64,7 @@ pub(crate) struct RaindexVaultsDataSource<'a> {
 impl VaultsDataSource for RaindexVaultsDataSource<'_> {
     async fn get_vaults(
         &self,
+        chain_ids: Option<Vec<u32>>,
         filters: GetVaultsFilters,
         page: u16,
         page_size: u16,
@@ -69,7 +72,7 @@ impl VaultsDataSource for RaindexVaultsDataSource<'_> {
         let response = self
             .client
             .get_vaults(
-                Some(ChainIds(vec![crate::CHAIN_ID])),
+                chain_ids.map(ChainIds),
                 Some(filters),
                 Some(page),
                 Some(page_size),
@@ -120,6 +123,7 @@ fn vault_record_from_sdk(vault: RaindexVault) -> Result<VaultRecord, ApiError> {
 
     Ok(VaultRecord {
         id: vault.id().to_string(),
+        chain_id: vault.chain_id(),
         vault_id: vault.vault_id().to_string(),
         owner: vault.owner(),
         token: VaultTokenResponse {
@@ -177,6 +181,7 @@ fn order_refs(order_hashes: Vec<FixedBytes<32>>) -> Vec<VaultOrderRef> {
 
 fn position_response(vault: VaultRecord) -> VaultPositionResponse {
     VaultPositionResponse {
+        chain_id: vault.chain_id,
         id: vault.id,
         vault_id: vault.vault_id,
         owner: vault.owner,
@@ -190,6 +195,7 @@ fn position_response(vault: VaultRecord) -> VaultPositionResponse {
 
 pub(crate) async fn process_get_vaults(
     ds: &dyn VaultsDataSource,
+    chain_ids: Option<Vec<u32>>,
     params: VaultsQueryParams,
 ) -> Result<VaultsResponse, ApiError> {
     let owner = params
@@ -211,7 +217,7 @@ pub(crate) async fn process_get_vaults(
         ..Default::default()
     };
 
-    let page = ds.get_vaults(filters, page, page_size).await?;
+    let page = ds.get_vaults(chain_ids, filters, page, page_size).await?;
 
     Ok(VaultsResponse {
         vaults: page.vaults.into_iter().map(position_response).collect(),
@@ -226,6 +232,7 @@ pub(crate) async fn process_get_vaults(
 
 #[derive(Debug, Clone)]
 struct VaultTotalAccumulator {
+    chain_id: u32,
     token: VaultTokenResponse,
     total_balance: U256,
     vault_count: u64,
@@ -233,18 +240,19 @@ struct VaultTotalAccumulator {
 
 pub(crate) async fn process_get_vault_totals(
     ds: &dyn VaultsDataSource,
+    chain_ids: Option<Vec<u32>>,
 ) -> Result<VaultTotalsResponse, ApiError> {
     let filters = GetVaultsFilters {
         owners: Vec::new(),
         hide_zero_balance: true,
         ..Default::default()
     };
-    let mut totals: HashMap<Address, VaultTotalAccumulator> = HashMap::new();
+    let mut totals: HashMap<(u32, Address), VaultTotalAccumulator> = HashMap::new();
     let mut page = DEFAULT_PAGE;
 
     loop {
         let response = ds
-            .get_vaults(filters.clone(), page, TOTALS_PAGE_SIZE)
+            .get_vaults(chain_ids.clone(), filters.clone(), page, TOTALS_PAGE_SIZE)
             .await?;
 
         for vault in response
@@ -252,14 +260,14 @@ pub(crate) async fn process_get_vault_totals(
             .into_iter()
             .filter(|vault| vault.balance > U256::ZERO)
         {
-            let entry =
-                totals
-                    .entry(vault.token.address)
-                    .or_insert_with(|| VaultTotalAccumulator {
-                        token: vault.token.clone(),
-                        total_balance: U256::ZERO,
-                        vault_count: 0,
-                    });
+            let entry = totals
+                .entry((vault.chain_id, vault.token.address))
+                .or_insert_with(|| VaultTotalAccumulator {
+                    chain_id: vault.chain_id,
+                    token: vault.token.clone(),
+                    total_balance: U256::ZERO,
+                    vault_count: 0,
+                });
             entry.total_balance += vault.balance;
             entry.vault_count += 1;
         }
@@ -276,6 +284,7 @@ pub(crate) async fn process_get_vault_totals(
     let mut totals: Vec<VaultTotalResponse> = totals
         .into_values()
         .map(|total| VaultTotalResponse {
+            chain_id: total.chain_id,
             token: VaultTotalTokenResponse {
                 address: total.token.address,
                 symbol: total.token.symbol,
@@ -285,7 +294,11 @@ pub(crate) async fn process_get_vault_totals(
             vault_count: total.vault_count,
         })
         .collect();
-    totals.sort_by(|a, b| a.token.address.cmp(&b.token.address));
+    totals.sort_by(|a, b| {
+        a.chain_id
+            .cmp(&b.chain_id)
+            .then_with(|| a.token.address.cmp(&b.token.address))
+    });
 
     Ok(VaultTotalsResponse { totals })
 }
@@ -315,10 +328,12 @@ pub async fn get_vaults(
     async move {
         tracing::info!(params = ?params, "request received");
         let raindex = shared_raindex.read().await;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
         let ds = RaindexVaultsDataSource {
             client: raindex.client(),
         };
-        let response = process_get_vaults(&ds, params.clone())
+        let response = process_get_vaults(&ds, chain_ids, params.clone())
             .await
             .map_err(|error| {
                 tracing::warn!(params = ?params, error = %error, "get_vaults failed");
@@ -357,13 +372,16 @@ pub async fn get_vault_totals(
     async move {
         tracing::info!("request received");
         let raindex = shared_raindex.read().await;
+        let chain_ids = None;
         let ds = RaindexVaultsDataSource {
             client: raindex.client(),
         };
-        let response = process_get_vault_totals(&ds).await.map_err(|error| {
-            tracing::warn!(error = %error, "get_vault_totals failed");
-            error
-        })?;
+        let response = process_get_vault_totals(&ds, chain_ids)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "get_vault_totals failed");
+                error
+            })?;
         tracing::info!(
             token_count = response.totals.len(),
             "returning vault totals"
@@ -378,6 +396,10 @@ pub fn routes() -> Vec<Route> {
     rocket::routes![get_vault_totals, get_vaults]
 }
 
+pub fn routes_v2() -> Vec<Route> {
+    routes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,17 +412,20 @@ mod tests {
     const TOKEN_B: Address = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     const ORDERBOOK: Address = address!("d2938e7c9fe3597f78832ce780feb61945c377d7");
 
+    type VaultsCall = (Option<Vec<u32>>, GetVaultsFilters, u16, u16);
+
     #[derive(Clone, Default)]
     struct MockVaultsDataSource {
         vaults: Vec<VaultRecord>,
         error: Option<ApiError>,
-        calls: Arc<Mutex<Vec<(GetVaultsFilters, u16, u16)>>>,
+        calls: Arc<Mutex<Vec<VaultsCall>>>,
     }
 
     #[async_trait]
     impl VaultsDataSource for MockVaultsDataSource {
         async fn get_vaults(
             &self,
+            chain_ids: Option<Vec<u32>>,
             filters: GetVaultsFilters,
             page: u16,
             page_size: u16,
@@ -408,7 +433,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push((filters.clone(), page, page_size));
+                .push((chain_ids.clone(), filters.clone(), page, page_size));
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }
@@ -417,7 +442,10 @@ mod tests {
                 .vaults
                 .iter()
                 .filter(|vault| {
-                    (filters.owners.is_empty() || filters.owners.contains(&vault.owner))
+                    chain_ids
+                        .as_ref()
+                        .is_none_or(|chain_ids| chain_ids.contains(&vault.chain_id))
+                        && (filters.owners.is_empty() || filters.owners.contains(&vault.owner))
                         && filters
                             .tokens
                             .as_ref()
@@ -464,6 +492,7 @@ mod tests {
         order_hash_seed: u8,
     ) -> VaultRecord {
         VaultRecord {
+            chain_id: 8453,
             id: id.to_string(),
             vault_id: balance.to_string(),
             owner,
@@ -477,6 +506,7 @@ mod tests {
 
     fn params(owner: &str) -> VaultsQueryParams {
         VaultsQueryParams {
+            chain_id: None,
             owner: Some(owner.to_string()),
             token: None,
             hide_zero_balance: None,
@@ -492,7 +522,7 @@ mod tests {
             ..Default::default()
         };
 
-        let response = process_get_vaults(&ds, params(&OWNER.to_string()))
+        let response = process_get_vaults(&ds, None, params(&OWNER.to_string()))
             .await
             .unwrap();
 
@@ -526,10 +556,29 @@ mod tests {
         let mut params = params(&OWNER.to_string());
         params.token = Some(TOKEN_B.to_string());
 
-        let response = process_get_vaults(&ds, params).await.unwrap();
+        let response = process_get_vaults(&ds, None, params).await.unwrap();
 
         assert_eq!(response.vaults.len(), 1);
         assert_eq!(response.vaults[0].token.address, TOKEN_B);
+    }
+
+    #[rocket::async_test]
+    async fn get_vaults_applies_chain_filter() {
+        let base_vault = vault("1", OWNER, token(TOKEN_A, "USDC", 6), 1, 1);
+        let mut polygon_vault = vault("2", OWNER, token(TOKEN_A, "USDC", 6), 2, 3);
+        polygon_vault.chain_id = 137;
+        let ds = MockVaultsDataSource {
+            vaults: vec![base_vault, polygon_vault],
+            ..Default::default()
+        };
+
+        let response = process_get_vaults(&ds, Some(vec![137]), params(&OWNER.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.vaults.len(), 1);
+        assert_eq!(response.vaults[0].chain_id, 137);
+        assert_eq!(response.vaults[0].balance, "2");
     }
 
     #[rocket::async_test]
@@ -544,7 +593,7 @@ mod tests {
         let mut params = params(&OWNER.to_string());
         params.hide_zero_balance = Some(true);
 
-        let response = process_get_vaults(&ds, params).await.unwrap();
+        let response = process_get_vaults(&ds, None, params).await.unwrap();
 
         assert_eq!(response.vaults.len(), 1);
         assert_eq!(response.vaults[0].balance, "5");
@@ -570,7 +619,7 @@ mod tests {
         params.page = Some(2);
         params.page_size = Some(1);
 
-        let response = process_get_vaults(&ds, params).await.unwrap();
+        let response = process_get_vaults(&ds, None, params).await.unwrap();
 
         assert_eq!(response.vaults.len(), 1);
         assert_eq!(response.vaults[0].id, "1");
@@ -584,21 +633,21 @@ mod tests {
     async fn get_vaults_rejects_invalid_owner_and_token() {
         let ds = MockVaultsDataSource::default();
 
-        let err = process_get_vaults(&ds, params("not-an-address"))
+        let err = process_get_vaults(&ds, None, params("not-an-address"))
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
 
         let mut params = params(&OWNER.to_string());
         params.token = Some("not-a-token".to_string());
-        let err = process_get_vaults(&ds, params).await.unwrap_err();
+        let err = process_get_vaults(&ds, None, params).await.unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[rocket::async_test]
     async fn get_vaults_requires_owner() {
         let ds = MockVaultsDataSource::default();
-        let err = process_get_vaults(&ds, VaultsQueryParams::default())
+        let err = process_get_vaults(&ds, None, VaultsQueryParams::default())
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
@@ -610,7 +659,7 @@ mod tests {
             error: Some(ApiError::Internal("subgraph error".into())),
             ..Default::default()
         };
-        let err = process_get_vaults(&ds, params(&OWNER.to_string()))
+        let err = process_get_vaults(&ds, None, params(&OWNER.to_string()))
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::Internal(_)));
@@ -618,24 +667,33 @@ mod tests {
 
     #[rocket::async_test]
     async fn get_vault_totals_aggregates_non_zero_by_token() {
+        let mut polygon_vault = vault("4", OTHER_OWNER, token(TOKEN_A, "USDC", 6), 13, 7);
+        polygon_vault.chain_id = 137;
         let ds = MockVaultsDataSource {
             vaults: vec![
                 vault("1", OWNER, token(TOKEN_A, "USDC", 6), 7, 1),
                 vault("2", OTHER_OWNER, token(TOKEN_A, "USDC", 6), 5, 3),
                 vault("3", OWNER, token(TOKEN_B, "WETH", 18), 11, 5),
+                polygon_vault,
             ],
             ..Default::default()
         };
 
-        let response = process_get_vault_totals(&ds).await.unwrap();
+        let response = process_get_vault_totals(&ds, None).await.unwrap();
 
-        assert_eq!(response.totals.len(), 2);
+        assert_eq!(response.totals.len(), 3);
+        assert_eq!(response.totals[0].chain_id, 137);
         assert_eq!(response.totals[0].token.address, TOKEN_A);
-        assert_eq!(response.totals[0].total_balance, "12");
-        assert_eq!(response.totals[0].vault_count, 2);
-        assert_eq!(response.totals[1].token.address, TOKEN_B);
-        assert_eq!(response.totals[1].total_balance, "11");
-        assert_eq!(response.totals[1].vault_count, 1);
+        assert_eq!(response.totals[0].total_balance, "13");
+        assert_eq!(response.totals[0].vault_count, 1);
+        assert_eq!(response.totals[1].chain_id, 8453);
+        assert_eq!(response.totals[1].token.address, TOKEN_A);
+        assert_eq!(response.totals[1].total_balance, "12");
+        assert_eq!(response.totals[1].vault_count, 2);
+        assert_eq!(response.totals[2].chain_id, 8453);
+        assert_eq!(response.totals[2].token.address, TOKEN_B);
+        assert_eq!(response.totals[2].total_balance, "11");
+        assert_eq!(response.totals[2].vault_count, 1);
     }
 
     #[rocket::async_test]
@@ -648,7 +706,7 @@ mod tests {
             ..Default::default()
         };
 
-        let response = process_get_vault_totals(&ds).await.unwrap();
+        let response = process_get_vault_totals(&ds, None).await.unwrap();
 
         assert_eq!(response.totals.len(), 1);
         assert_eq!(response.totals[0].total_balance, "9");
@@ -662,10 +720,10 @@ mod tests {
             ..Default::default()
         };
 
-        process_get_vault_totals(&ds).await.unwrap();
+        process_get_vault_totals(&ds, None).await.unwrap();
 
         let calls = ds.calls.lock().unwrap();
-        assert_eq!(calls[0].0.owners, Vec::<Address>::new());
-        assert!(calls[0].0.hide_zero_balance);
+        assert_eq!(calls[0].1.owners, Vec::<Address>::new());
+        assert!(calls[0].1.hide_zero_balance);
     }
 }

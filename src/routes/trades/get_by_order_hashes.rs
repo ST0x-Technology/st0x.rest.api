@@ -48,15 +48,15 @@ pub async fn get_trades_by_order_hashes(
             end_time = request.end_time,
             "request received"
         );
-        let client = {
-            let raindex = shared_raindex.read().await;
-            raindex.client().clone()
-        };
+        let raindex = shared_raindex.read().await;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), request.chain_id)?;
+        let client = raindex.client().clone();
         let ds = RaindexTradesDataSource {
             client: &client,
             pool: pool.inner(),
         };
-        process_get_trades_by_order_hashes(&ds, request).await
+        process_get_trades_by_order_hashes(&ds, chain_ids, request).await
     }
     .instrument(span.0)
     .await
@@ -64,6 +64,7 @@ pub async fn get_trades_by_order_hashes(
 
 pub(super) async fn process_get_trades_by_order_hashes(
     ds: &dyn TradesDataSource,
+    chain_ids: Option<Vec<u32>>,
     request: TradesByOrderHashesRequest,
 ) -> Result<Json<TradesByOrderHashesResponse>, ApiError> {
     let order_hashes = parse_order_hashes(&request.order_hashes)?;
@@ -78,7 +79,7 @@ pub(super) async fn process_get_trades_by_order_hashes(
         "querying trades by order hashes"
     );
     let result = ds
-        .get_trades_by_order_hashes(order_hashes, time_filter)
+        .get_trades_by_order_hashes(chain_ids, order_hashes, time_filter)
         .await?;
 
     build_trades_by_order_hashes_response(ds, result, denomination).await
@@ -143,6 +144,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct CapturedOrderHashesQuery {
+        chain_ids: Option<Vec<u32>>,
         order_hashes: Vec<B256>,
         time_filter: TimeFilter,
     }
@@ -156,6 +158,7 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
@@ -163,6 +166,7 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -172,6 +176,7 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -182,6 +187,7 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _taker: Address,
             _page: u16,
             _page_size: u16,
@@ -192,10 +198,12 @@ mod tests {
 
         async fn get_trades_by_order_hashes(
             &self,
+            chain_ids: Option<Vec<u32>>,
             order_hashes: Vec<B256>,
             time_filter: TimeFilter,
         ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
             *self.captured.lock().unwrap() = Some(CapturedOrderHashesQuery {
+                chain_ids,
                 order_hashes,
                 time_filter,
             });
@@ -239,12 +247,13 @@ mod tests {
             captured: Arc::clone(&captured),
         };
         let request = TradesByOrderHashesRequest {
+            chain_id: None,
             order_hashes: vec![hash_a().to_string(), hash_b().to_string()],
             start_time: Some(1700000000),
             end_time: Some(1700002000),
             denomination: None,
         };
-        let result = process_get_trades_by_order_hashes(&ds, request)
+        let result = process_get_trades_by_order_hashes(&ds, Some(vec![8453]), request)
             .await
             .unwrap();
 
@@ -257,6 +266,7 @@ mod tests {
         assert!(response.trades_by_order_hash[1].trades.is_empty());
 
         let captured = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(captured.chain_ids, Some(vec![8453]));
         assert_eq!(captured.order_hashes, vec![hash_a(), hash_b()]);
         assert_eq!(captured.time_filter.start, Some(1700000000));
         assert_eq!(captured.time_filter.end, Some(1700002000));
@@ -274,12 +284,13 @@ mod tests {
             captured: Arc::clone(&captured),
         };
         let request = TradesByOrderHashesRequest {
+            chain_id: None,
             order_hashes: vec![],
             start_time: None,
             end_time: None,
             denomination: None,
         };
-        let result = process_get_trades_by_order_hashes(&ds, request)
+        let result = process_get_trades_by_order_hashes(&ds, None, request)
             .await
             .unwrap();
 
@@ -302,12 +313,13 @@ mod tests {
             captured: Arc::new(Mutex::new(None)),
         };
         let request = TradesByOrderHashesRequest {
+            chain_id: None,
             order_hashes: vec!["not-a-hash".to_string()],
             start_time: None,
             end_time: None,
             denomination: None,
         };
-        let result = process_get_trades_by_order_hashes(&ds, request).await;
+        let result = process_get_trades_by_order_hashes(&ds, None, request).await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -318,12 +330,13 @@ mod tests {
             captured: Arc::new(Mutex::new(None)),
         };
         let request = TradesByOrderHashesRequest {
+            chain_id: None,
             order_hashes: vec![hash_a().to_string()],
             start_time: None,
             end_time: None,
             denomination: None,
         };
-        let result = process_get_trades_by_order_hashes(&ds, request).await;
+        let result = process_get_trades_by_order_hashes(&ds, None, request).await;
         assert!(matches!(result, Err(ApiError::Internal(_))));
     }
 

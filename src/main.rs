@@ -19,8 +19,6 @@ mod telemetry;
 mod types;
 mod wrap_ratio;
 
-pub(crate) const CHAIN_ID: u32 = 8453;
-
 #[cfg(test)]
 mod test_helpers;
 
@@ -89,6 +87,7 @@ enum StartupRegistryError {
         routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_calldata,
+        routes::swap::post_swap_quote_v2,
         routes::swap::post_swap_calldata_v2,
         routes::order::post_order_dca,
         routes::order::post_order_solver,
@@ -175,12 +174,17 @@ pub(crate) fn rocket(
         .manage(app_state)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
+        .mount("/v2/tokens", routes::tokens::routes_v2())
         .mount("/v1/swap", routes::swap::routes())
         .mount("/v2/swap", routes::swap::routes_v2())
         .mount("/v1/order", routes::order::routes())
+        .mount("/v2/order", routes::order::routes_v2())
         .mount("/v1/orders", routes::orders::routes())
+        .mount("/v2/orders", routes::orders::routes_v2())
         .mount("/v1/vaults", routes::vaults::routes())
+        .mount("/v2/vaults", routes::vaults::routes_v2())
         .mount("/v1/trades", routes::trades::routes())
+        .mount("/v2/trades", routes::trades::routes_v2())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
         .mount("/docs", FileServer::new(docs_dir, options))
@@ -455,6 +459,9 @@ mod tests {
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
         let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+        let swap_quote_v1_path = &openapi["paths"]["/v1/swap/quote"]["post"];
+        let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
+        let swap_calldata_v1_path = &openapi["paths"]["/v1/swap/calldata"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
@@ -477,6 +484,21 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
+        assert_eq!(swap_quote_v1_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_quote_v1_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SwapQuoteRequest"
+        );
+        assert_eq!(swap_quote_v2_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_quote_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SwapQuoteRequest"
+        );
+        assert_eq!(swap_calldata_v1_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_calldata_v1_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SwapCalldataRequest"
+        );
         assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
         assert_eq!(
             swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],

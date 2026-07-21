@@ -28,12 +28,14 @@ use std::collections::HashMap;
 pub(crate) trait SwapDataSource: Send + Sync {
     async fn validate_supported_tokens(
         &self,
+        chain_id: u32,
         input_token: Address,
         output_token: Address,
     ) -> Result<(), ApiError>;
 
     async fn get_orders_for_pair(
         &self,
+        chain_id: u32,
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<RaindexOrder>, ApiError>;
@@ -66,6 +68,7 @@ pub(crate) struct RaindexSwapDataSource<'a> {
 
 fn swap_candidates_cache_key(
     orders: &[RaindexOrder],
+    chain_id: u32,
     input_token: Address,
     output_token: Address,
 ) -> String {
@@ -82,13 +85,14 @@ fn swap_candidates_cache_key(
         .collect::<Vec<_>>();
     order_keys.sort_unstable();
     let order_keys = order_keys.join(",");
-    format!("swap-candidates/latest/default/{input_token}/{output_token}/{order_keys}")
+    format!("swap-candidates/latest/default/{chain_id}/{input_token}/{output_token}/{order_keys}")
 }
 
 #[async_trait]
 impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     async fn validate_supported_tokens(
         &self,
+        chain_id: u32,
         input_token: Address,
         output_token: Address,
     ) -> Result<(), ApiError> {
@@ -97,15 +101,20 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ApiError::Internal("failed to retrieve curated tokens".into())
         })?;
 
-        let input_supported = tokens.values().any(|token| token.address == input_token);
-        let output_supported = tokens.values().any(|token| token.address == output_token);
+        let input_supported = tokens
+            .values()
+            .any(|token| token.address == input_token && token.network.chain_id == chain_id);
+        let output_supported = tokens
+            .values()
+            .any(|token| token.address == output_token && token.network.chain_id == chain_id);
 
         if input_supported && output_supported {
-            tracing::info!(input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
+            tracing::info!(chain_id, input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
             return Ok(());
         }
 
         tracing::warn!(
+            chain_id,
             input_token = %input_token,
             output_token = %output_token,
             input_supported,
@@ -119,6 +128,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
 
     async fn get_orders_for_pair(
         &self,
+        chain_id: u32,
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<RaindexOrder>, ApiError> {
@@ -132,7 +142,14 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ..Default::default()
         };
         self.client
-            .get_orders(None, Some(filters), None, None)
+            .get_orders(
+                Some(rain_orderbook_common::raindex_client::types::ChainIds(
+                    vec![chain_id],
+                )),
+                Some(filters),
+                None,
+                None,
+            )
             .await
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
@@ -171,7 +188,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         self.caches
             .swap_candidates
             .get_or_try_insert(
-                swap_candidates_cache_key(orders, input_token, output_token),
+                swap_candidates_cache_key(orders, orders[0].chain_id(), input_token, output_token),
                 fetch,
             )
             .await
@@ -182,6 +199,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         &self,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError> {
+        let chain_id = request.chain_id;
         let result = self
             .client
             .get_take_orders_calldata(request)
@@ -191,6 +209,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         if let Some(approval_info) = result.approval_info() {
             let formatted_amount = approval_info.formatted_amount().to_string();
             Ok(SwapCalldataResponse {
+                chain_id,
                 to: approval_info.spender(),
                 data: alloy::primitives::Bytes::new(),
                 value: alloy::primitives::U256::ZERO,
@@ -210,6 +229,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 ApiError::Internal("failed to format expected sell".into())
             })?;
             Ok(SwapCalldataResponse {
+                chain_id,
                 to: take_orders_info.raindex(),
                 data: take_orders_info.calldata().clone(),
                 value: alloy::primitives::U256::ZERO,
@@ -277,7 +297,7 @@ pub fn routes() -> Vec<Route> {
 }
 
 pub fn routes_v2() -> Vec<Route> {
-    rocket::routes![calldata::post_swap_calldata_v2]
+    rocket::routes![quote::post_swap_quote_v2, calldata::post_swap_calldata_v2]
 }
 
 #[cfg(test)]
@@ -310,10 +330,11 @@ mod tests {
         assert_eq!(
             swap_candidates_cache_key(
                 &[order_a.clone(), order_b.clone()],
+                8453,
                 input_token,
                 output_token,
             ),
-            swap_candidates_cache_key(&[order_b, order_a], input_token, output_token)
+            swap_candidates_cache_key(&[order_b, order_a], 8453, input_token, output_token)
         );
     }
 }
@@ -340,6 +361,7 @@ pub(crate) mod test_fixtures {
     impl SwapDataSource for MockSwapDataSource {
         async fn validate_supported_tokens(
             &self,
+            _chain_id: u32,
             _input_token: Address,
             _output_token: Address,
         ) -> Result<(), ApiError> {
@@ -348,6 +370,7 @@ pub(crate) mod test_fixtures {
 
         async fn get_orders_for_pair(
             &self,
+            _chain_id: u32,
             _input_token: Address,
             _output_token: Address,
         ) -> Result<Vec<RaindexOrder>, ApiError> {

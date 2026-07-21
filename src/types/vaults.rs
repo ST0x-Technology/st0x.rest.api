@@ -7,6 +7,9 @@ use utoipa::{IntoParams, ToSchema};
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultsQueryParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "owner")]
     #[param(required = true)]
     #[param(example = "0x1234567890abcdef1234567890abcdef12345678")]
@@ -59,6 +62,8 @@ pub struct VaultOrderRef {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultPositionResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xabcdef")]
     pub id: String,
     #[schema(example = "123")]
@@ -97,6 +102,8 @@ pub struct VaultsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultTotalResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     pub token: VaultTotalTokenResponse,
     #[schema(example = "42000000000000000000")]
     pub total_balance: String,

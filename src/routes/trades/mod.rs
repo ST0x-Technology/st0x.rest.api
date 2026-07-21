@@ -19,7 +19,7 @@ use rain_orderbook_common::raindex_client::trades::{
     GetTradesByOrderHashesFilters, GetTradesFilters, GetTradesTokenFilter, OrderHashes,
     RaindexTrade, RaindexTradesByOrderHashResult, RaindexTradesListResult,
 };
-use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
+use rain_orderbook_common::raindex_client::types::{ChainIds, PaginationParams, TimeFilter};
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::serde::json::Json;
 use rocket::Route;
@@ -29,10 +29,15 @@ pub(crate) type TradeWrapRatioMap = HashMap<(Address, u64), WrapRatioValue>;
 
 #[async_trait]
 pub(crate) trait TradesDataSource: Send + Sync {
-    async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError>;
+    async fn get_trades_by_tx(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        tx_hash: B256,
+    ) -> Result<RaindexTradesListResult, ApiError>;
 
     async fn get_trades_for_owner(
         &self,
+        chain_ids: Option<Vec<u32>>,
         owner: Address,
         pagination: PaginationParams,
         time_filter: TimeFilter,
@@ -40,6 +45,7 @@ pub(crate) trait TradesDataSource: Send + Sync {
 
     async fn get_trades_for_token(
         &self,
+        chain_ids: Option<Vec<u32>>,
         token: Address,
         page: u16,
         page_size: u16,
@@ -48,6 +54,7 @@ pub(crate) trait TradesDataSource: Send + Sync {
 
     async fn get_trades_for_taker(
         &self,
+        chain_ids: Option<Vec<u32>>,
         taker: Address,
         page: u16,
         page_size: u16,
@@ -56,6 +63,7 @@ pub(crate) trait TradesDataSource: Send + Sync {
 
     async fn get_trades_by_order_hashes(
         &self,
+        chain_ids: Option<Vec<u32>>,
         order_hashes: Vec<B256>,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesByOrderHashResult, ApiError>;
@@ -75,9 +83,13 @@ pub(crate) struct RaindexTradesDataSource<'a> {
 
 #[async_trait]
 impl TradesDataSource for RaindexTradesDataSource<'_> {
-    async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError> {
+    async fn get_trades_by_tx(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        tx_hash: B256,
+    ) -> Result<RaindexTradesListResult, ApiError> {
         self.client
-            .get_trades_for_transaction(None, None, tx_hash)
+            .get_trades_for_transaction(chain_ids.map(ChainIds), None, tx_hash)
             .await
             .map_err(|e| match e {
                 RaindexError::TransactionIndexingTimeout { tx_hash, attempts } => {
@@ -94,6 +106,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
 
     async fn get_trades_for_owner(
         &self,
+        chain_ids: Option<Vec<u32>>,
         owner: Address,
         pagination: PaginationParams,
         time_filter: TimeFilter,
@@ -105,7 +118,12 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades(None, Some(filters), pagination.page, pagination.page_size)
+            .get_trades(
+                chain_ids.map(ChainIds),
+                Some(filters),
+                pagination.page,
+                pagination.page_size,
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for owner");
@@ -115,6 +133,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
 
     async fn get_trades_for_token(
         &self,
+        chain_ids: Option<Vec<u32>>,
         token: Address,
         page: u16,
         page_size: u16,
@@ -130,7 +149,12 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades(None, Some(filters), Some(page), Some(page_size))
+            .get_trades(
+                chain_ids.map(ChainIds),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for token");
@@ -140,6 +164,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
 
     async fn get_trades_for_taker(
         &self,
+        chain_ids: Option<Vec<u32>>,
         taker: Address,
         page: u16,
         page_size: u16,
@@ -152,7 +177,12 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades(None, Some(filters), Some(page), Some(page_size))
+            .get_trades(
+                chain_ids.map(ChainIds),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for taker");
@@ -162,6 +192,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
 
     async fn get_trades_by_order_hashes(
         &self,
+        chain_ids: Option<Vec<u32>>,
         order_hashes: Vec<B256>,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
@@ -171,7 +202,11 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades_by_order_hashes(None, OrderHashes(order_hashes), Some(filters))
+            .get_trades_by_order_hashes(
+                chain_ids.map(ChainIds),
+                OrderHashes(order_hashes),
+                Some(filters),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades by order hashes");
@@ -388,4 +423,8 @@ pub fn routes() -> Vec<Route> {
         get_by_taker::get_trades_by_taker,
         get_by_address::get_trades_by_address
     ]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }

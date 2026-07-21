@@ -14,6 +14,8 @@ pub enum SwapDenomination {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -28,6 +30,8 @@ pub struct SwapQuoteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -47,6 +51,8 @@ pub struct SwapQuoteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
@@ -73,6 +79,8 @@ pub enum SwapCalldataMode {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataV2Request {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
@@ -93,6 +101,8 @@ pub struct SwapCalldataV2Request {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57")]
     pub to: Address,
     #[schema(value_type = String, example = "0xabcdef...")]
