@@ -44,3 +44,4 @@ url = "2"
 [dev-dependencies]
 tracing-test = "0.2"
 tempfile = "3"
+raindex_test_fixtures = { path = "lib/rain.orderbook/crates/test_fixtures" }

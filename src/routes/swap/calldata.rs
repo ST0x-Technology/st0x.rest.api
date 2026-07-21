@@ -211,6 +211,9 @@ async fn process_swap_calldata_build(
 }
 
 #[cfg(test)]
+mod oracle_integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
