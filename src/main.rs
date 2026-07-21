@@ -541,11 +541,37 @@ mod tests {
         assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
         assert_eq!(
             swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SwapCalldataV2Request"
+            "#/components/schemas/SwapCalldataV2RequestBody"
         );
         assert_eq!(
             schemas["SwapCalldataMode"]["enum"],
             serde_json::json!(["buyUpTo", "spendExact", "spendUpTo"])
+        );
+        assert_eq!(
+            swap_calldata_v2_path["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/SwapCalldataV2Response"
+        );
+        assert_eq!(
+            schemas["SwapCalldataV2RequestBody"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/SwapCalldataV2PriceCapRequest" },
+                { "$ref": "#/components/schemas/SwapCalldataV2SlippageRequest" }
+            ])
+        );
+        assert!(
+            schemas["SwapCalldataV2PriceCapRequest"]["allOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("priceCap")))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("slippageBps")))
+        );
+        assert!(
+            schemas["SwapCalldataV2Response"]["allOf"][1]["properties"]["resolvedPriceCap"]
+                .is_object()
         );
     }
 

@@ -486,16 +486,21 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         output_token: output_address,
         mode: SwapCalldataMode::BuyUpTo,
         amount: "10".to_string(),
-        price_cap: "3".to_string(),
+        price_cap: Some("3".to_string()),
+        slippage_bps: None,
         denomination: crate::types::swap::SwapDenomination::Wrapped,
     };
     let mut v2_response = process_swap_calldata_v2(&data_source, v2_request)
         .await
         .unwrap();
-    embed_and_validate_attribution(&mut v2_response, &attribution_state.signer, &v2_attribution)
-        .await
-        .unwrap();
-    let v2_decoded = takeOrders4Call::abi_decode(&v2_response.data).unwrap();
+    embed_and_validate_attribution(
+        &mut v2_response.calldata,
+        &attribution_state.signer,
+        &v2_attribution,
+    )
+    .await
+    .unwrap();
+    let v2_decoded = takeOrders4Call::abi_decode(&v2_response.calldata.data).unwrap();
     let v2_context = &v2_decoded.config.orders[0].signedContext[1];
     assert_eq!(v2_context.context[1], v2_attribution.api_key_hash);
 

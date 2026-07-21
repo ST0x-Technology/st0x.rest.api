@@ -91,20 +91,21 @@ curl -X POST https://api.st0x.io/v2/swap/calldata \
     "outputToken": "0x4200000000000000000000000000000000000006",
     "mode": "spendExact",
     "amount": "2500.0",
-    "priceCap": "2600.0",
+    "slippageBps": 50,
     "denomination": "wrapped"
   }'
 ```
 
-| Field          | Type   | Description                                                                                                                                                         |
-| -------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `taker`        | string | Your wallet address that will execute the transaction                                                                                                               |
-| `inputToken`   | string | Wrapped/orderbook token address you are selling                                                                                                                     |
-| `outputToken`  | string | Wrapped/orderbook token address you want to receive                                                                                                                 |
-| `mode`         | string | Swap mode. One of `"buyUpTo"`, `"spendExact"`, or `"spendUpTo"`                                                                                                     |
-| `amount`       | string | Target amount in the selected `denomination`. For `buyUpTo`, this is output amount. For `spendExact` and `spendUpTo`, this is input amount                          |
-| `priceCap`     | string | Maximum input-token amount you are willing to spend per 1 output token, in the selected `denomination`                                                              |
-| `denomination` | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `amount` and `priceCap` as unwrapped display values for wrapped ST0x/ERC4626 tokens. |
+| Field          | Type   | Description                                                                                                                                                                                  |
+| -------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `taker`        | string | Your wallet address that will execute the transaction                                                                                                                                        |
+| `inputToken`   | string | Wrapped/orderbook token address you are selling                                                                                                                                              |
+| `outputToken`  | string | Wrapped/orderbook token address you want to receive                                                                                                                                          |
+| `mode`         | string | Swap mode. One of `"buyUpTo"`, `"spendExact"`, or `"spendUpTo"`                                                                                                                              |
+| `amount`       | string | Target amount in the selected `denomination`. For `buyUpTo`, this is output amount. For `spendExact` and `spendUpTo`, this is input amount                                                   |
+| `priceCap`     | string | Optional explicit maximum input per output. Provide exactly one of `priceCap` or `slippageBps`                                                                                               |
+| `slippageBps`  | number | Optional tolerance from 1 to 5000 basis points. The API uses SDK quotes and simulations to resolve the final price cap. Provide exactly one of `priceCap` or `slippageBps`                   |
+| `denomination` | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `amount`, explicit `priceCap`, and returned `resolvedPriceCap` as unwrapped display values for wrapped tokens |
 
 Mode behavior:
 
@@ -114,9 +115,11 @@ Mode behavior:
 | `spendExact` | Input-token amount to spend  | Spend exactly `amount`; fails if not fillable   |
 | `spendUpTo`  | Maximum input-token to spend | Spend up to `amount`; partial fills are allowed |
 
-Set `priceCap` slightly above the quote price to allow for price movement. For
-example, when selling USDC for WETH, `"priceCap": "2600"` means the swap will
-not pay more than 2600 USDC per 1 WETH.
+With `slippageBps`, the API asks the SDK to quote the available orders, applies
+the tolerance to the worst selected fill price, and passes the resolved cap back
+into SDK calldata generation. No orderbook walking is required in the client.
+Alternatively, provide `priceCap` directly; for example, `"priceCap": "2600"`
+means the swap will not pay more than 2600 USDC per 1 WETH.
 
 ### Legacy: V1 Output-Targeted Calldata
 
@@ -163,7 +166,8 @@ endpoint does not translate unwrapped asset addresses.
 
 ### Response
 
-The response always includes all fields, but the content depends on whether your
+The following examples show the v2 response. V1 returns the same transaction and
+approval fields without `resolvedPriceCap`. The content depends on whether your
 `taker` address has sufficient token approvals.
 
 **If approvals are needed**, `data` is empty and `approvals` contains the
@@ -176,6 +180,7 @@ required transactions:
   "value": "0x0",
   "estimatedInput": "2500.0",
   "denomination": "wrapped",
+  "resolvedPriceCap": "2512.5",
   "approvals": [
     {
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -198,18 +203,20 @@ the swap calldata:
   "value": "0x0",
   "estimatedInput": "2500.0",
   "denomination": "wrapped",
+  "resolvedPriceCap": "2512.5",
   "approvals": []
 }
 ```
 
-| Field            | Type   | Description                                                                                                                                                                                    |
-| ---------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `to`             | string | Contract address to send the transaction to                                                                                                                                                    |
-| `data`           | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed                                                                                                                        |
-| `value`          | string | Native token value to send (usually `"0x0"`)                                                                                                                                                   |
-| `estimatedInput` | string | Expected input amount in the requested `denomination` when calldata is ready. When approvals are needed, this is the input-token approval amount/cap required before calldata can be generated |
-| `denomination`   | string | Denomination used for `estimatedInput`                                                                                                                                                         |
-| `approvals`      | array  | Token approvals needed — if non-empty, approve first then call this endpoint again                                                                                                             |
+| Field              | Type   | Description                                                                                                                                                                                    |
+| ------------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to`               | string | Contract address to send the transaction to                                                                                                                                                    |
+| `data`             | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed                                                                                                                        |
+| `value`            | string | Native token value to send (usually `"0x0"`)                                                                                                                                                   |
+| `estimatedInput`   | string | Expected input amount in the requested `denomination` when calldata is ready. When approvals are needed, this is the input-token approval amount/cap required before calldata can be generated |
+| `denomination`     | string | Denomination used for `estimatedInput`                                                                                                                                                         |
+| `approvals`        | array  | Token approvals needed — if non-empty, approve first then call this endpoint again                                                                                                             |
+| `resolvedPriceCap` | string | V2 only. Final cap in the requested denomination. If approvals are required, send this value as `priceCap` on the follow-up request to keep the original limit fixed                           |
 
 Approval entries always describe the actual on-chain approval requirements in
 wrapped/orderbook token units. They are not converted or relabeled when
@@ -258,8 +265,10 @@ CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
     "outputToken": "0x4200000000000000000000000000000000000006",
     "mode": "buyUpTo",
     "amount": "1.0",
-    "priceCap": "2600.0"
+    "slippageBps": 50
   }')
+
+RESOLVED_PRICE_CAP=$(echo "$CALLDATA" | jq -r '.resolvedPriceCap')
 
 # 3. Check if approvals are needed
 #    The first response only contains approvals — "data" will be empty ("0x").
@@ -281,7 +290,7 @@ if [ "$APPROVALS" != "[]" ]; then
       "outputToken": "0x4200000000000000000000000000000000000006",
       "mode": "buyUpTo",
       "amount": "1.0",
-      "priceCap": "2600.0"
+      "priceCap": "'"$RESOLVED_PRICE_CAP"'"
     }')
 fi
 

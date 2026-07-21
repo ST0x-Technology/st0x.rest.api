@@ -7,6 +7,7 @@ use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::swap::denomination::normalize_quote_amounts;
 use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
+use alloy::primitives::Address;
 use rain_math_float::Float;
 use rain_orderbook_common::take_orders::simulate_buy_over_candidates;
 use rocket::serde::json::Json;
@@ -98,7 +99,7 @@ async fn process_swap_quote(
     }
 
     let candidates = ds
-        .build_candidates_for_pair(&orders, req.input_token, req.output_token)
+        .build_candidates_for_pair(&orders, req.input_token, req.output_token, Address::ZERO)
         .await?;
 
     if candidates.is_empty() {
@@ -258,9 +259,10 @@ mod tests {
             orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
+            counterparty: alloy::primitives::Address,
         ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
             self.base
-                .build_candidates_for_pair(orders, input_token, output_token)
+                .build_candidates_for_pair(orders, input_token, output_token, counterparty)
                 .await
         }
 

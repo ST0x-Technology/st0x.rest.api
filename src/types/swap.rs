@@ -83,11 +83,62 @@ pub struct SwapCalldataV2Request {
     pub mode: SwapCalldataMode,
     #[schema(example = "100")]
     pub amount: String,
+    /// Explicit price cap. Provide exactly one of `priceCap` or `slippageBps`.
     #[schema(example = "2600")]
-    pub price_cap: String,
+    pub price_cap: Option<String>,
+    /// Optional slippage tolerance resolved from SDK quotes. Provide exactly
+    /// one of `priceCap` or `slippageBps`.
+    #[schema(example = 50, minimum = 1, maximum = 5000)]
+    pub slippage_bps: Option<u16>,
     #[serde(default)]
     #[schema(example = "wrapped", default = "wrapped")]
     pub denomination: SwapDenomination,
+}
+
+/// OpenAPI-only request shape that encodes the runtime requirement to provide
+/// exactly one price limit. Rocket deserializes [`SwapCalldataV2Request`] so it
+/// can return a descriptive 400 for both-or-neither requests.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum SwapCalldataV2RequestBody {
+    PriceCap(SwapCalldataV2PriceCapRequest),
+    Slippage(SwapCalldataV2SlippageRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapCalldataV2RequestCommon {
+    #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub taker: Address,
+    #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
+    pub input_token: Address,
+    #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
+    pub output_token: Address,
+    #[schema(example = "spendExact")]
+    pub mode: SwapCalldataMode,
+    #[schema(example = "100")]
+    pub amount: String,
+    #[serde(default)]
+    #[schema(example = "wrapped", default = "wrapped")]
+    pub denomination: SwapDenomination,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapCalldataV2PriceCapRequest {
+    #[serde(flatten)]
+    pub request: SwapCalldataV2RequestCommon,
+    #[schema(example = "2600")]
+    pub price_cap: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapCalldataV2SlippageRequest {
+    #[serde(flatten)]
+    pub request: SwapCalldataV2RequestCommon,
+    #[schema(example = 50, minimum = 1, maximum = 5000)]
+    pub slippage_bps: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -104,4 +155,15 @@ pub struct SwapCalldataResponse {
     #[schema(example = "wrapped")]
     pub denomination: SwapDenomination,
     pub approvals: Vec<Approval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapCalldataV2Response {
+    #[serde(flatten)]
+    pub calldata: SwapCalldataResponse,
+    /// Final price cap in the requested denomination. Reuse this value as
+    /// `priceCap` after approvals.
+    #[schema(example = "2613")]
+    pub resolved_price_cap: String,
 }
