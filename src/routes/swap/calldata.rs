@@ -1,5 +1,6 @@
 use super::{RaindexSwapDataSource, SwapDataSource};
 use crate::app_state::ApplicationState;
+use crate::attribution::{attribution_message_hash, Attribution, AttributionSigner};
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
@@ -10,7 +11,9 @@ use crate::routes::swap::denomination::{
 use crate::types::swap::{
     SwapCalldataMode, SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request,
 };
-use alloy::primitives::Address;
+use alloy::primitives::{keccak256, Address, Bytes, Signature};
+use alloy::sol_types::{SolCall, SolValue};
+use rain_orderbook_bindings::IRaindexV6::takeOrders4Call;
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
 use rocket::serde::json::Json;
@@ -36,7 +39,7 @@ use tracing::Instrument;
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
@@ -44,6 +47,7 @@ pub async fn post_swap_calldata(
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
+    let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
     async move {
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
@@ -52,7 +56,10 @@ pub async fn post_swap_calldata(
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_calldata(&ds, req).await?;
+        let mut response = process_swap_calldata(&ds, req).await?;
+        drop(raindex);
+        embed_and_validate_attribution(&mut response, &app_state.attribution.signer, &attribution)
+            .await?;
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -78,7 +85,7 @@ pub async fn post_swap_calldata(
 #[post("/calldata", data = "<request>")]
 pub async fn post_swap_calldata_v2(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
@@ -86,6 +93,7 @@ pub async fn post_swap_calldata_v2(
     request: Json<SwapCalldataV2Request>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     let req = request.into_inner();
+    let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
     async move {
         tracing::info!(
             mode = ?req.mode,
@@ -98,11 +106,134 @@ pub async fn post_swap_calldata_v2(
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_calldata_v2(&ds, req).await?;
+        let mut response = process_swap_calldata_v2(&ds, req).await?;
+        drop(raindex);
+        embed_and_validate_attribution(&mut response, &app_state.attribution.signer, &attribution)
+            .await?;
         Ok(Json(response))
     }
     .instrument(span.0)
     .await
+}
+
+async fn embed_and_validate_attribution(
+    response: &mut SwapCalldataResponse,
+    signer: &AttributionSigner,
+    attribution: &Attribution,
+) -> Result<(), ApiError> {
+    if !response.approvals.is_empty() || response.data.is_empty() {
+        return validate_attribution_calldata(response, signer.address(), attribution);
+    }
+
+    let mut decoded = takeOrders4Call::abi_decode(&response.data).map_err(|error| {
+        tracing::error!(
+            %error,
+            api_key_hash = %attribution.api_key_hash,
+            "failed to decode generated takeOrders4 calldata for attribution"
+        );
+        ApiError::Internal("generated swap calldata is missing attribution".into())
+    })?;
+    for order_config in &mut decoded.config.orders {
+        let order_hash = keccak256(order_config.order.abi_encode());
+        let context = signer
+            .sign_context(attribution, order_hash)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    %error,
+                    %order_hash,
+                    api_key_hash = %attribution.api_key_hash,
+                    "failed to sign REST attribution context"
+                );
+                ApiError::Internal("failed to sign swap calldata attribution".into())
+            })?;
+        order_config.signedContext.push(context);
+    }
+    response.data = Bytes::from(decoded.abi_encode());
+
+    validate_attribution_calldata(response, signer.address(), attribution)
+}
+
+fn validate_attribution_calldata(
+    response: &SwapCalldataResponse,
+    signer_address: Address,
+    attribution: &Attribution,
+) -> Result<(), ApiError> {
+    if !response.approvals.is_empty() {
+        if !response.data.is_empty() {
+            tracing::error!(
+                api_key_hash = %attribution.api_key_hash,
+                "swap response unexpectedly contains approvals and executable calldata"
+            );
+            return Err(ApiError::Internal(
+                "generated swap calldata has an invalid state".into(),
+            ));
+        }
+        tracing::info!(
+            api_key_hash = %attribution.api_key_hash,
+            "swap calldata requires approval; executable attribution is not expected"
+        );
+        return Ok(());
+    }
+
+    if response.data.is_empty() {
+        tracing::error!(
+            api_key_hash = %attribution.api_key_hash,
+            "swap response contains neither approvals nor executable calldata"
+        );
+        return Err(ApiError::Internal(
+            "generated swap calldata is missing attribution".into(),
+        ));
+    }
+    let decoded = takeOrders4Call::abi_decode(&response.data).map_err(|error| {
+        tracing::error!(
+            %error,
+            api_key_hash = %attribution.api_key_hash,
+            "failed to decode generated takeOrders4 calldata for attribution validation"
+        );
+        ApiError::Internal("generated swap calldata is missing attribution".into())
+    })?;
+    if decoded.config.orders.is_empty() {
+        tracing::error!(
+            api_key_hash = %attribution.api_key_hash,
+            "generated takeOrders4 calldata contains no orders"
+        );
+        return Err(ApiError::Internal(
+            "generated swap calldata is missing attribution".into(),
+        ));
+    }
+
+    for order_config in &decoded.config.orders {
+        let order_hash = keccak256(order_config.order.abi_encode());
+        let expected_context = attribution.context_for_order(order_hash);
+        let mut matching_attribution = order_config.signedContext.iter().filter(|context| {
+            context.signer == signer_address && context.context.as_slice() == expected_context
+        });
+        let first_match = matching_attribution.next();
+        let has_duplicate = matching_attribution.next().is_some();
+        let signature_is_valid = if let Some(context) = first_match {
+            let context_hash = attribution_message_hash(&expected_context);
+            Signature::try_from(context.signature.as_ref())
+                .and_then(|signature| signature.recover_address_from_msg(context_hash.as_slice()))
+                .is_ok_and(|recovered| recovered == signer_address)
+        } else {
+            false
+        };
+        if first_match.is_none() || has_duplicate || !signature_is_valid {
+            tracing::error!(
+                %order_hash,
+                api_key_hash = %attribution.api_key_hash,
+                signer = %signer_address,
+                duplicate_attribution_context = has_duplicate,
+                "generated order is missing its exact REST attribution context"
+            );
+            return Err(ApiError::Internal(
+                "generated swap calldata is missing attribution".into(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -209,6 +340,9 @@ async fn process_swap_calldata_build(
     let response = ds.get_calldata(take_req).await?;
     normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
 }
+
+#[cfg(all(test, feature = "oracle-integration-tests"))]
+mod oracle_integration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -472,6 +606,22 @@ mod tests {
         assert_eq!(result.approvals.len(), 1);
         assert_eq!(result.approvals[0].token, USDC);
         assert_eq!(result.approvals[0].spender, ORDERBOOK);
+    }
+
+    #[rocket::async_test]
+    async fn test_approval_response_does_not_require_executable_attribution() {
+        let state = crate::attribution::AttributionState::new(
+            crate::attribution::AttributionSigner::from_hex_key(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        );
+        let attribution = state.for_api_key("customer-key", TAKER);
+        let mut response = approval_response();
+
+        embed_and_validate_attribution(&mut response, &state.signer, &attribution)
+            .await
+            .unwrap();
     }
 
     #[rocket::async_test]

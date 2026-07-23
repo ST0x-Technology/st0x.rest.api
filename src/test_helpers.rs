@@ -87,7 +87,13 @@ impl TestClientBuilder {
             crate::registry_artifact::RegistryArtifactStore::new(private_registry_path);
         let response_caches =
             crate::cache::RouteResponseCaches::new(100, std::time::Duration::from_secs(10));
-        let app_state = crate::app_state::ApplicationState::new(artifact_store, response_caches);
+        let attribution_signer = crate::attribution::AttributionSigner::from_hex_key(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .expect("test attribution signer");
+        let attribution = crate::attribution::AttributionState::new(attribution_signer);
+        let app_state =
+            crate::app_state::ApplicationState::new(artifact_store, response_caches, attribution);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
         let rocket = crate::rocket(
             pool,

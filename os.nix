@@ -39,6 +39,8 @@ let
         User = "st0x-rest-api";
         Group = "st0x";
         ExecStart = "${path} serve --config /etc/st0x-rest-api/config.toml";
+        LoadCredential =
+          [ "attribution-signer:${env.dataDir}/secrets/attribution-signer" ];
         Restart = "always";
         RestartSec = 5;
         ReadWritePaths = [ "/mnt/data" ];
@@ -211,6 +213,7 @@ in {
   systemd.tmpfiles.rules = [
     "d ${env.dataDir} 0775 root st0x -"
     "d ${env.dataDir}/logs 0775 root st0x -"
+    "d ${env.dataDir}/secrets 0700 root root -"
   ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 

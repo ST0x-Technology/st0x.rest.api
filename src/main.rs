@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod app_state;
+mod attribution;
 mod auth;
 mod cache;
 mod catchers;
@@ -53,6 +54,34 @@ enum StartupError {
     InvalidMethod(String),
     #[error("CORS configuration failed: {0}")]
     Cors(#[from] rocket_cors::Error),
+}
+
+const ATTRIBUTION_SIGNER_CREDENTIAL: &str = "attribution-signer";
+
+fn load_attribution_signer_key() -> Result<String, String> {
+    if let Ok(key) = std::env::var("ST0X_GATING_SIGNER_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Ok(key.to_string());
+        }
+    }
+
+    let credentials_directory = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
+        "ST0X_GATING_SIGNER_KEY or a systemd attribution-signer credential is required".to_string()
+    })?;
+    let credential_path =
+        std::path::Path::new(&credentials_directory).join(ATTRIBUTION_SIGNER_CREDENTIAL);
+    let key = std::fs::read_to_string(&credential_path).map_err(|error| {
+        format!(
+            "failed to read attribution signer credential {}: {error}",
+            credential_path.display()
+        )
+    })?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("attribution signer credential is empty".to_string());
+    }
+    Ok(key.to_string())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -398,8 +427,33 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let app_state =
-                app_state::ApplicationState::new(registry_artifact_store, response_caches);
+            let attribution_key = match load_attribution_signer_key() {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::error!(%error, "failed to load attribution signer key");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let attribution_signer =
+                match attribution::AttributionSigner::from_hex_key(&attribution_key) {
+                    Ok(signer) => signer,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to initialize attribution signer");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
+            tracing::info!(
+                signer = %attribution_signer.address(),
+                "attribution signer loaded"
+            );
+            let attribution_state = attribution::AttributionState::new(attribution_signer);
+            let app_state = app_state::ApplicationState::new(
+                registry_artifact_store,
+                response_caches,
+                attribution_state,
+            );
 
             let rocket = match rocket(
                 pool,

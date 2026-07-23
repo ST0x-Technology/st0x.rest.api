@@ -60,13 +60,36 @@ jobs:
         run: |
           host_key=$(nix eval --raw --file keys.nix keys.host)
           echo "$HOST_IP $host_key" > ~/.ssh/known_hosts
+      - name: Install attribution signer credential
+        env:
+          ST0X_GATING_SIGNER_KEY: ${{ secrets.ST0X_GATING_SIGNER_KEY }}
+        run: |
+          if [ -z "$ST0X_GATING_SIGNER_KEY" ]; then
+            echo "ST0X_GATING_SIGNER_KEY secret is required" >&2
+            exit 1
+          fi
+          printf '%s\n' "$ST0X_GATING_SIGNER_KEY" | ssh "root@$HOST_IP" \
+            'install -d -m 700 /mnt/data/st0x-rest-api/secrets && umask 077 && tee /mnt/data/st0x-rest-api/secrets/.attribution-signer.tmp >/dev/null && test -s /mnt/data/st0x-rest-api/secrets/.attribution-signer.tmp && mv /mnt/data/st0x-rest-api/secrets/.attribution-signer.tmp /mnt/data/st0x-rest-api/secrets/attribution-signer'
+      - name: Check attribution credential unit
+        if: (inputs.deploy_scope || 'service') == 'service'
+        run: |
+          if ssh "root@$HOST_IP" 'systemctl cat rest-api.service 2>/dev/null | grep -q attribution-signer'; then
+            echo "NEEDS_ATTRIBUTION_SYSTEM_DEPLOY=false" >> "$GITHUB_ENV"
+          else
+            echo "NEEDS_ATTRIBUTION_SYSTEM_DEPLOY=true" >> "$GITHUB_ENV"
+          fi
       - run: ./prep.sh
+      - name: Deploy attribution credential system prerequisite
+        if: (inputs.deploy_scope || 'service') == 'service' && env.NEEDS_ATTRIBUTION_SYSTEM_DEPLOY == 'true'
+        run: nix run .#deployNixos
       - name: Deploy service
         if: (inputs.deploy_scope || 'service') == 'service'
         run: nix run .#deployService -- rest-api
       - name: Deploy system
         if: (inputs.deploy_scope || 'service') == 'system'
-        run: nix run .#deployNixos
+        run: |
+          nix run .#deployNixos
+          ssh "root@$HOST_IP" 'systemctl try-restart rest-api.service'
       - name: Deploy system and service
         if: (inputs.deploy_scope || 'service') == 'all'
         run: nix run .#deployAll

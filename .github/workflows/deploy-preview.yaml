@@ -120,8 +120,30 @@ jobs:
           else
             ssh-keyscan -H "$HOST_IP" > ~/.ssh/known_hosts
           fi
+      - name: Install preview attribution signer credential
+        env:
+          ST0X_GATING_SIGNER_KEY: ${{ secrets.ST0X_GATING_SIGNER_KEY }}
+        run: |
+          if [ -z "$ST0X_GATING_SIGNER_KEY" ]; then
+            echo "ST0X_GATING_SIGNER_KEY secret is required" >&2
+            exit 1
+          fi
+          printf '%s\n' "$ST0X_GATING_SIGNER_KEY" | ssh "root@$HOST_IP" \
+            'install -d -m 700 /mnt/data/st0x-rest-api-preview/secrets && umask 077 && tee /mnt/data/st0x-rest-api-preview/secrets/.attribution-signer.tmp >/dev/null && test -s /mnt/data/st0x-rest-api-preview/secrets/.attribution-signer.tmp && mv /mnt/data/st0x-rest-api-preview/secrets/.attribution-signer.tmp /mnt/data/st0x-rest-api-preview/secrets/attribution-signer'
+      - name: Check preview attribution credential unit
+        if: (inputs.deploy_scope || 'service') == 'service'
+        run: |
+          if ssh "root@$HOST_IP" 'systemctl cat rest-api.service 2>/dev/null | grep -q attribution-signer'; then
+            echo "NEEDS_ATTRIBUTION_SYSTEM_DEPLOY=false" >> "$GITHUB_ENV"
+          else
+            echo "NEEDS_ATTRIBUTION_SYSTEM_DEPLOY=true" >> "$GITHUB_ENV"
+          fi
       # Prepare local build artifacts used by deploy-rs.
       - run: ./prep.sh
+      - name: Deploy preview attribution credential system prerequisite
+        if: (inputs.deploy_scope || 'service') == 'service' && env.NEEDS_ATTRIBUTION_SYSTEM_DEPLOY == 'true'
+        timeout-minutes: 60
+        run: nix run .#deployPreviewNixos
       - name: Deploy preview service
         if: (inputs.deploy_scope || 'service') == 'service'
         timeout-minutes: 60
@@ -129,7 +151,9 @@ jobs:
       - name: Deploy preview system
         if: (inputs.deploy_scope || 'service') == 'system'
         timeout-minutes: 60
-        run: nix run .#deployPreviewNixos
+        run: |
+          nix run .#deployPreviewNixos
+          ssh "root@$HOST_IP" 'systemctl try-restart rest-api.service'
       - name: Deploy preview system and service
         if: (inputs.deploy_scope || 'service') == 'all'
         timeout-minutes: 60

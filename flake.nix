@@ -94,7 +94,7 @@
             name = "rs-test";
             body = ''
               set -euxo pipefail
-              cargo test --workspace
+              cargo test --workspace --features oracle-integration-tests
             '';
           };
           inherit (infraPkgs)

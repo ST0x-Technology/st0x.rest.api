@@ -3,6 +3,11 @@ name = "st0x_rest_api"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# The full-EVM calldata regression fixture is intentionally excluded from
+# production builds and enabled explicitly by CI and the rs-test command.
+oracle-integration-tests = ["dep:raindex_test_fixtures"]
+
 [dependencies]
 rocket = { version = "0.5.1", features = ["json"] }
 rocket_cors = "0.6"
@@ -40,6 +45,7 @@ rain-erc = { git = "https://github.com/rainlanguage/rain.erc", rev = "755b0bf5ca
 rain-math-float = "0.1.7"
 wasm-bindgen = "=0.2.122"
 url = "2"
+raindex_test_fixtures = { path = "lib/rain.orderbook/crates/test_fixtures", optional = true }
 
 [dev-dependencies]
 tracing-test = "0.2"
