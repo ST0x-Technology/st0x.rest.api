@@ -93,3 +93,30 @@ jobs:
       - name: Deploy system and service
         if: (inputs.deploy_scope || 'service') == 'all'
         run: nix run .#deployAll
+      - name: Verify attribution-enabled service
+        run: |
+          invocation_id=$(ssh "root@$HOST_IP" \
+            'systemctl show --property=InvocationID --value rest-api.service')
+          if [[ ! "$invocation_id" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "Unable to identify the deployed rest-api invocation" >&2
+            exit 1
+          fi
+
+          for _ in $(seq 1 30); do
+            if ssh "root@$HOST_IP" \
+              "journalctl _SYSTEMD_INVOCATION_ID=$invocation_id --no-pager | grep -Fq 'attribution signer loaded'" \
+              && curl --fail --silent --max-time 3 \
+                https://api.st0x.io/health >/dev/null \
+              && ssh "root@$HOST_IP" \
+                'systemctl is-active --quiet rest-api.service'; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          ssh "root@$HOST_IP" \
+            'systemctl status rest-api.service --no-pager' || true
+          ssh "root@$HOST_IP" \
+            "journalctl _SYSTEMD_INVOCATION_ID=$invocation_id --no-pager" || true
+          echo "Attribution-enabled service verification timed out" >&2
+          exit 1

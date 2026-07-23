@@ -198,6 +198,12 @@ in {
 
   environment.etc."st0x-rest-api/config.toml".source = env.configFile;
 
+  # Preserve the D-Bus implementation already running in production. Switching
+  # implementations requires a reboot and blocks an otherwise safe deployment.
+  services.dbus = lib.mkIf (env.name == "prod") {
+    implementation = "dbus";
+  };
+
   services.logrotate = {
     enable = true;
     settings."${env.dataDir}/logs/*.log" = {
