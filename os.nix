@@ -208,18 +208,6 @@ in {
     implementation = "dbus";
   };
 
-  services.logrotate = {
-    enable = true;
-    settings."${env.dataDir}/logs/*.log" = {
-      su = "root st0x";
-      rotate = 14;
-      weekly = true;
-      compress = true;
-      missingok = true;
-      notifempty = true;
-    };
-  };
-
   systemd.tmpfiles.rules = [
     "d ${env.dataDir} 0775 root st0x -"
     "d ${env.dataDir}/logs 0775 root st0x -"
