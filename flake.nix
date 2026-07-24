@@ -38,6 +38,8 @@
         configFile = ./config/prod.toml;
         dataDir = "/mnt/data/st0x-rest-api";
         dataVolumeName = "st0x-rest-api-data";
+        posthogHost = "https://eu.i.posthog.com";
+        posthogProjectToken = "phc_G9J1fkYy3hYegFjBpIbFKo9Y5vznggbYe7SLSD1jf0j";
       };
 
       nixosConfigurations.st0x-rest-api-preview = mkNixosConfiguration {

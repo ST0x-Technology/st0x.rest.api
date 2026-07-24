@@ -33,6 +33,10 @@ let
       environment = {
         RUST_LOG =
           "st0x_rest_api=info,raindex_common=info,raindex_quote=info,rocket=warn,warn";
+      } // lib.optionalAttrs (env ? posthogHost) {
+        POSTHOG_HOST = env.posthogHost;
+      } // lib.optionalAttrs (env ? posthogProjectToken) {
+        POSTHOG_PROJECT_TOKEN = env.posthogProjectToken;
       };
 
       serviceConfig = {

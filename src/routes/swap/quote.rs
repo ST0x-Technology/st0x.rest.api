@@ -1,4 +1,5 @@
 use super::{RaindexSwapDataSource, SwapDataSource};
+use crate::analytics::{swap_quoted_event, Analytics};
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
@@ -30,17 +31,19 @@ use tracing::Instrument;
     )
 )]
 #[post("/quote", data = "<request>")]
+#[allow(clippy::too_many_arguments)] // Rocket handler: args are guards + managed state + body.
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
+    analytics: &State<Analytics>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
-    let req = request.into_inner();
     async move {
+        let req = request.into_inner();
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
@@ -48,11 +51,33 @@ pub async fn post_swap_quote(
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_quote(&ds, req).await?;
+        let response = handle_swap_quote(&ds, &key, analytics.inner(), req).await?;
+
         Ok(Json(response))
     }
     .instrument(span.0)
     .await
+}
+
+async fn handle_swap_quote(
+    ds: &dyn SwapDataSource,
+    key: &AuthenticatedKey,
+    analytics: &Analytics,
+    req: SwapQuoteRequest,
+) -> Result<SwapQuoteResponse, ApiError> {
+    let response = process_swap_quote(ds, req).await?;
+
+    analytics.capture(|| {
+        swap_quoted_event(
+            key,
+            response.input_token,
+            response.output_token,
+            serde_json::to_value(response.denomination).unwrap_or(serde_json::Value::Null),
+            &response,
+        )
+    });
+
+    Ok(response)
 }
 
 async fn process_swap_quote(
@@ -143,6 +168,8 @@ async fn process_swap_quote(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::{Analytics, RecordingSink};
+    use crate::auth::AuthenticatedKey;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
     use crate::types::swap::SwapDenomination;
@@ -151,9 +178,20 @@ mod tests {
     use async_trait::async_trait;
     use rocket::http::{ContentType, Status};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     const USDC: alloy::primitives::Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: alloy::primitives::Address = address!("4200000000000000000000000000000000000006");
+
+    fn test_key() -> AuthenticatedKey {
+        AuthenticatedKey {
+            id: 1,
+            key_id: "test-client".to_string(),
+            label: "Test client".to_string(),
+            owner: "test-owner".to_string(),
+            is_admin: false,
+        }
+    }
 
     fn quote_request(output_amount: &str) -> SwapQuoteRequest {
         SwapQuoteRequest {
@@ -265,6 +303,32 @@ mod tests {
         assert_eq!(result.estimated_output, "100");
         assert_eq!(result.estimated_input, "150");
         assert_eq!(result.estimated_io_ratio, "1.5");
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_captures_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let response = handle_swap_quote(&ds, &test_key(), &analytics, quote_request("100"))
+            .await
+            .expect("successful quote");
+
+        assert_eq!(response.estimated_input, "150");
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quoted")
+            .expect("swap_quoted event");
+        assert_eq!(event.distinct_id, "client:test-client");
+        assert_eq!(event.properties["estimated_input"], "150");
+        assert_eq!(event.properties["api_client_owner"], "test-owner");
     }
 
     #[rocket::async_test]

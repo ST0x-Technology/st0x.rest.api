@@ -1,4 +1,5 @@
 use super::{RaindexSwapDataSource, SwapDataSource};
+use crate::analytics::{swap_calldata_generated_event, Analytics, ApiVersion};
 use crate::app_state::ApplicationState;
 use crate::attribution::{attribution_message_hash, Attribution, AttributionSigner};
 use crate::auth::AuthenticatedKey;
@@ -37,29 +38,37 @@ use tracing::Instrument;
     )
 )]
 #[post("/calldata", data = "<request>")]
+#[allow(clippy::too_many_arguments)] // Rocket handler: args are guards + managed state + body.
 pub async fn post_swap_calldata(
     _global: GlobalRateLimit,
     key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
+    analytics: &State<Analytics>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
-    let req = request.into_inner();
-    let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
     async move {
+        let req = request.into_inner();
         tracing::info!(body = ?req, "request received");
+        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let mut response = process_swap_calldata(&ds, req).await?;
-        drop(raindex);
-        embed_and_validate_attribution(&mut response, &app_state.attribution.signer, &attribution)
-            .await?;
+        let response = handle_swap_calldata(
+            &ds,
+            &key,
+            analytics.inner(),
+            &app_state.attribution.signer,
+            &attribution,
+            req,
+        )
+        .await?;
+
         Ok(Json(response))
     }
     .instrument(span.0)
@@ -83,37 +92,120 @@ pub async fn post_swap_calldata(
     )
 )]
 #[post("/calldata", data = "<request>")]
+#[allow(clippy::too_many_arguments)] // Rocket handler: args are guards + managed state + body.
 pub async fn post_swap_calldata_v2(
     _global: GlobalRateLimit,
     key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
+    analytics: &State<Analytics>,
     span: TracingSpan,
     request: Json<SwapCalldataV2Request>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
-    let req = request.into_inner();
-    let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
     async move {
+        let req = request.into_inner();
         tracing::info!(
             mode = ?req.mode,
             denomination = ?req.denomination,
             "request received"
         );
+        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let mut response = process_swap_calldata_v2(&ds, req).await?;
-        drop(raindex);
-        embed_and_validate_attribution(&mut response, &app_state.attribution.signer, &attribution)
-            .await?;
+        let response = handle_swap_calldata_v2(
+            &ds,
+            &key,
+            analytics.inner(),
+            &app_state.attribution.signer,
+            &attribution,
+            req,
+        )
+        .await?;
+
         Ok(Json(response))
     }
     .instrument(span.0)
     .await
+}
+
+async fn handle_swap_calldata(
+    ds: &dyn SwapDataSource,
+    key: &AuthenticatedKey,
+    analytics: &Analytics,
+    signer: &AttributionSigner,
+    attribution: &Attribution,
+    req: SwapCalldataRequest,
+) -> Result<SwapCalldataResponse, ApiError> {
+    let analytics_context = analytics.is_enabled().then(|| {
+        (
+            req.taker,
+            req.input_token,
+            req.output_token,
+            serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        )
+    });
+    let mut response = process_swap_calldata(ds, req).await?;
+    embed_and_validate_attribution(&mut response, signer, attribution).await?;
+
+    if let Some((taker, input_token, output_token, denomination)) = analytics_context {
+        analytics.capture(|| {
+            swap_calldata_generated_event(
+                key,
+                taker,
+                input_token,
+                output_token,
+                denomination,
+                ApiVersion::V1,
+                None,
+                &response,
+            )
+        });
+    }
+
+    Ok(response)
+}
+
+async fn handle_swap_calldata_v2(
+    ds: &dyn SwapDataSource,
+    key: &AuthenticatedKey,
+    analytics: &Analytics,
+    signer: &AttributionSigner,
+    attribution: &Attribution,
+    req: SwapCalldataV2Request,
+) -> Result<SwapCalldataResponse, ApiError> {
+    let analytics_context = analytics.is_enabled().then(|| {
+        (
+            req.taker,
+            req.input_token,
+            req.output_token,
+            serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+            serde_json::to_value(req.mode).ok(),
+        )
+    });
+    let mut response = process_swap_calldata_v2(ds, req).await?;
+    embed_and_validate_attribution(&mut response, signer, attribution).await?;
+
+    if let Some((taker, input_token, output_token, denomination, mode)) = analytics_context {
+        analytics.capture(|| {
+            swap_calldata_generated_event(
+                key,
+                taker,
+                input_token,
+                output_token,
+                denomination,
+                ApiVersion::V2,
+                mode,
+                &response,
+            )
+        });
+    }
+
+    Ok(response)
 }
 
 async fn embed_and_validate_attribution(
@@ -347,6 +439,8 @@ mod oracle_integration_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::{Analytics, RecordingSink};
+    use crate::auth::AuthenticatedKey;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::TestClientBuilder;
     use crate::types::common::Approval;
@@ -364,6 +458,25 @@ mod tests {
     const ORDERBOOK: Address = address!("d2938e7c9fe3597f78832ce780feb61945c377d7");
     const WT_MSTR: Address = address!("Ff05e1BD696900DC6A52cA35cA61bB1024eDA8e2");
     const WT_COIN: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
+
+    fn test_key() -> AuthenticatedKey {
+        AuthenticatedKey {
+            id: 1,
+            key_id: "test-client".to_string(),
+            label: "Test client".to_string(),
+            owner: "test-owner".to_string(),
+            is_admin: false,
+        }
+    }
+
+    fn test_attribution_state() -> crate::attribution::AttributionState {
+        crate::attribution::AttributionState::new(
+            crate::attribution::AttributionSigner::from_hex_key(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .expect("test attribution signer"),
+        )
+    }
 
     fn calldata_request(output_amount: &str, max_ratio: &str) -> SwapCalldataRequest {
         SwapCalldataRequest {
@@ -589,6 +702,75 @@ mod tests {
     }
 
     #[rocket::async_test]
+    async fn test_handle_swap_calldata_captures_v1_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Ok(approval_response()),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let key = test_key();
+        let attribution_state = test_attribution_state();
+        let attribution = attribution_state.for_api_key(&key.key_id, TAKER);
+
+        handle_swap_calldata(
+            &ds,
+            &key,
+            &analytics,
+            &attribution_state.signer,
+            &attribution,
+            calldata_request("100", "2.5"),
+        )
+        .await
+        .expect("successful calldata");
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_calldata_generated")
+            .expect("swap_calldata_generated event");
+        assert_eq!(event.distinct_id, TAKER.to_string().to_lowercase());
+        assert_eq!(event.properties["api_version"], "v1");
+        assert!(event.properties.get("mode").is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_calldata_captures_v2_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Ok(approval_response()),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let key = test_key();
+        let attribution_state = test_attribution_state();
+        let attribution = attribution_state.for_api_key(&key.key_id, TAKER);
+
+        handle_swap_calldata_v2(
+            &ds,
+            &key,
+            &analytics,
+            &attribution_state.signer,
+            &attribution,
+            calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5"),
+        )
+        .await
+        .expect("successful calldata");
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_calldata_generated")
+            .expect("swap_calldata_generated event");
+        assert_eq!(event.properties["api_version"], "v2");
+        assert_eq!(event.properties["mode"], "spendExact");
+    }
+
+    #[rocket::async_test]
     async fn test_process_swap_calldata_needs_approval() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
@@ -610,12 +792,7 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_approval_response_does_not_require_executable_attribution() {
-        let state = crate::attribution::AttributionState::new(
-            crate::attribution::AttributionSigner::from_hex_key(
-                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-            )
-            .unwrap(),
-        );
+        let state = test_attribution_state();
         let attribution = state.for_api_key("customer-key", TAKER);
         let mut response = approval_response();
 

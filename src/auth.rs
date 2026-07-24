@@ -1,3 +1,4 @@
+use crate::analytics::Analytics;
 use crate::db::DbPool;
 use crate::error::ApiError;
 use crate::fairings::rate_limiter::CachedRateLimitInfo;
@@ -26,6 +27,18 @@ pub struct ApiKeyRow {
 
 pub struct AuthKeyId(pub Option<i64>);
 
+/// Attribution details for the calling API client, used by analytics.
+#[derive(Debug, Clone)]
+pub struct AuthClientInfo {
+    pub key_id: String,
+    pub label: String,
+    pub owner: String,
+}
+
+/// Request-local cache of the authenticated client, populated on successful auth so
+/// fairings (which have no `AuthenticatedKey`) can attribute analytics events.
+pub struct CachedAuthClient(pub Option<AuthClientInfo>);
+
 #[derive(Debug)]
 pub struct AuthenticatedKey {
     pub id: i64,
@@ -33,6 +46,17 @@ pub struct AuthenticatedKey {
     pub label: String,
     pub owner: String,
     pub is_admin: bool,
+}
+
+impl AuthenticatedKey {
+    /// Copy the client attribution fields needed by request analytics.
+    pub fn client_info(&self) -> AuthClientInfo {
+        AuthClientInfo {
+            key_id: self.key_id.clone(),
+            label: self.label.clone(),
+            owner: self.owner.clone(),
+        }
+    }
 }
 
 #[rocket::async_trait]
@@ -138,6 +162,18 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
         tracing::info!(key_id = %row.key_id, label = %row.label, "authenticated");
 
         req.local_cache(|| AuthKeyId(Some(row.id)));
+        if req
+            .rocket()
+            .state::<Analytics>()
+            .is_some_and(Analytics::is_enabled)
+        {
+            let client_info = AuthClientInfo {
+                key_id: row.key_id.clone(),
+                label: row.label.clone(),
+                owner: row.owner.clone(),
+            };
+            req.local_cache(|| CachedAuthClient(Some(client_info)));
+        }
 
         let rl = match req.rocket().state::<RateLimiter>() {
             Some(rl) => rl,

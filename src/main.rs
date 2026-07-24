@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate rocket;
 
+mod analytics;
 mod app_state;
 mod attribution;
 mod auth;
@@ -188,6 +189,7 @@ pub(crate) fn rocket(
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     app_state: app_state::ApplicationState,
+    analytics: analytics::Analytics,
     docs_dir: String,
     usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
@@ -202,6 +204,7 @@ pub(crate) fn rocket(
         .manage(rate_limiter)
         .manage(raindex_config)
         .manage(app_state)
+        .manage(analytics)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -220,6 +223,7 @@ pub(crate) fn rocket(
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger::new(usage_log_max_concurrency))
+        .attach(fairings::AnalyticsFairing)
         .attach(fairings::RateLimitHeadersFairing)
         .attach(cors))
 }
@@ -455,11 +459,14 @@ async fn main() {
                 attribution_state,
             );
 
+            let analytics = analytics::Analytics::from_env();
+
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
                 app_state,
+                analytics,
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
             ) {
