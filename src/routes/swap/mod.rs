@@ -6,7 +6,7 @@ mod slippage;
 use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::ApiError;
-use crate::types::swap::{SwapCalldataResponse, SwapDenomination};
+use crate::types::swap::{SwapCalldataMode, SwapCalldataResponse, SwapDenomination};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
     wrap_ratio_values_from_responses, WrapRatioValue,
@@ -21,7 +21,7 @@ use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rain_orderbook_common::take_orders::{
-    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate,
+    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate, TakeOrdersMode,
 };
 use rocket::Route;
 use std::collections::HashMap;
@@ -277,6 +277,16 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
     }
 }
 
+impl From<SwapCalldataMode> for TakeOrdersMode {
+    fn from(mode: SwapCalldataMode) -> Self {
+        match mode {
+            SwapCalldataMode::BuyUpTo => TakeOrdersMode::BuyUpTo,
+            SwapCalldataMode::SpendExact => TakeOrdersMode::SpendExact,
+            SwapCalldataMode::SpendUpTo => TakeOrdersMode::SpendUpTo,
+        }
+    }
+}
+
 pub use calldata::*;
 pub use quote::*;
 
@@ -285,7 +295,7 @@ pub fn routes() -> Vec<Route> {
 }
 
 pub fn routes_v2() -> Vec<Route> {
-    rocket::routes![calldata::post_swap_calldata_v2]
+    rocket::routes![quote::post_swap_quote_v2, calldata::post_swap_calldata_v2]
 }
 
 #[cfg(test)]

@@ -15,7 +15,8 @@ mod posthog;
 mod recording;
 
 pub(crate) use events::{
-    api_request_event, swap_calldata_generated_event, swap_quoted_event, ApiVersion,
+    api_request_event, swap_calldata_generated_event, swap_quoted_event, swap_quoted_v2_event,
+    ApiVersion,
 };
 pub(crate) use posthog::PostHogSink;
 #[cfg(test)]

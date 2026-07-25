@@ -46,6 +46,62 @@ pub struct SwapQuoteResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct SwapQuoteV2Request {
+    /// Optional taker used when building oracle-backed quote candidates.
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub taker: Option<Address>,
+    #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
+    pub input_token: Address,
+    #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
+    pub output_token: Address,
+    #[schema(example = "spendExact")]
+    pub mode: SwapCalldataMode,
+    #[schema(example = "100")]
+    pub amount: String,
+    /// Explicit price cap. Provide exactly one of `priceCap` or `slippageBps`.
+    #[schema(example = "2600")]
+    pub price_cap: Option<String>,
+    /// Optional slippage tolerance resolved from SDK quotes. Provide exactly
+    /// one of `priceCap` or `slippageBps`.
+    #[schema(example = 50, minimum = 1, maximum = 5000)]
+    pub slippage_bps: Option<u16>,
+    /// Optional input-per-output oracle ratio used to exclude candidate orders
+    /// more than 5% worse than the reference before resolving `slippageBps`.
+    #[schema(example = "2500")]
+    pub reference_io_ratio: Option<String>,
+    #[serde(default)]
+    #[schema(example = "wrapped", default = "wrapped")]
+    pub denomination: SwapDenomination,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapQuoteV2Response {
+    #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
+    pub input_token: Address,
+    #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
+    pub output_token: Address,
+    #[schema(example = "spendExact")]
+    pub mode: SwapCalldataMode,
+    #[schema(example = "100")]
+    pub amount: String,
+    #[schema(example = "wrapped")]
+    pub denomination: SwapDenomination,
+    #[schema(example = "100")]
+    pub estimated_input: String,
+    #[schema(example = "0.04")]
+    pub estimated_output: String,
+    #[schema(example = "2500")]
+    pub estimated_io_ratio: String,
+    /// Whether the requested amount was completely filled.
+    pub fully_filled: bool,
+    /// Final price cap in the requested denomination.
+    #[schema(example = "2512.5")]
+    pub resolved_price_cap: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SwapCalldataRequest {
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
@@ -90,6 +146,11 @@ pub struct SwapCalldataV2Request {
     /// one of `priceCap` or `slippageBps`.
     #[schema(example = 50, minimum = 1, maximum = 5000)]
     pub slippage_bps: Option<u16>,
+    /// Optional input-per-output oracle ratio used to exclude candidate orders
+    /// more than 5% worse than the reference before resolving `slippageBps`.
+    /// Only valid with `slippageBps` and uses the requested `denomination`.
+    #[schema(example = "2500")]
+    pub reference_io_ratio: Option<String>,
     #[serde(default)]
     #[schema(example = "wrapped", default = "wrapped")]
     pub denomination: SwapDenomination,
@@ -139,6 +200,10 @@ pub struct SwapCalldataV2SlippageRequest {
     pub request: SwapCalldataV2RequestCommon,
     #[schema(example = 50, minimum = 1, maximum = 5000)]
     pub slippage_bps: u16,
+    /// Optional input-per-output oracle ratio used to exclude candidate orders
+    /// more than 5% worse than the reference before resolving the price cap.
+    #[schema(example = "2500")]
+    pub reference_io_ratio: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -118,6 +118,7 @@ enum StartupRegistryError {
         routes::tokens::get_token_details_by_address,
         routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
+        routes::swap::post_swap_quote_v2,
         routes::swap::post_swap_calldata,
         routes::swap::post_swap_calldata_v2,
         routes::order::post_order_dca,
@@ -568,6 +569,10 @@ mod tests {
             schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["required"]
                 .as_array()
                 .is_some_and(|required| required.contains(&serde_json::json!("slippageBps")))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                .is_object()
         );
         assert!(
             schemas["SwapCalldataV2Response"]["allOf"][1]["properties"]["resolvedPriceCap"]

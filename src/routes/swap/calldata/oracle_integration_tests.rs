@@ -3,6 +3,7 @@ use crate::attribution::{
     address_to_b256, u64_to_b256, AttributionSigner, AttributionState, ATTRIBUTION_SCHEMA_VERSION,
 };
 use crate::cache::RouteResponseCaches;
+use crate::types::swap::SwapCalldataMode;
 use alloy::hex::encode_prefixed;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
@@ -486,13 +487,15 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         output_token: output_address,
         mode: SwapCalldataMode::BuyUpTo,
         amount: "10".to_string(),
-        price_cap: Some("3".to_string()),
-        slippage_bps: None,
+        price_cap: None,
+        slippage_bps: Some(50),
+        reference_io_ratio: Some("2".to_string()),
         denomination: crate::types::swap::SwapDenomination::Wrapped,
     };
     let mut v2_response = process_swap_calldata_v2(&data_source, v2_request)
         .await
         .unwrap();
+    assert_eq!(v2_response.resolved_price_cap, "2.01");
     embed_and_validate_attribution(
         &mut v2_response.calldata,
         &attribution_state.signer,
@@ -501,8 +504,23 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     .await
     .unwrap();
     let v2_decoded = takeOrders4Call::abi_decode(&v2_response.calldata.data).unwrap();
+    assert_eq!(v2_decoded.config.orders[0].signedContext.len(), 2);
+    let v2_oracle_context = &v2_decoded.config.orders[0].signedContext[0];
+    assert_eq!(v2_oracle_context.signer, oracle_signer_address);
+    assert_eq!(v2_oracle_context.context[0], oracle_context);
+    assert_eq!(v2_oracle_context.signature, oracle_signature);
     let v2_context = &v2_decoded.config.orders[0].signedContext[1];
     assert_eq!(v2_context.context[1], v2_attribution.api_key_hash);
+
+    local_evm
+        .send_transaction(WithOtherFields::new(
+            TransactionRequest::default()
+                .with_input(v2_response.calldata.data.clone())
+                .with_to(v2_response.calldata.to)
+                .with_from(owner),
+        ))
+        .await
+        .unwrap();
 
     let oracle_body = services.oracle_bodies.lock().unwrap()[0].clone();
     let oracle_request = <(OrderV4, U256, U256, Address)>::abi_decode(&oracle_body).unwrap();

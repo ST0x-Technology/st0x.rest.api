@@ -92,20 +92,22 @@ curl -X POST https://api.st0x.io/v2/swap/calldata \
     "mode": "spendExact",
     "amount": "2500.0",
     "slippageBps": 50,
+    "referenceIoRatio": "2500",
     "denomination": "wrapped"
   }'
 ```
 
-| Field          | Type   | Description                                                                                                                                                                                  |
-| -------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `taker`        | string | Your wallet address that will execute the transaction                                                                                                                                        |
-| `inputToken`   | string | Wrapped/orderbook token address you are selling                                                                                                                                              |
-| `outputToken`  | string | Wrapped/orderbook token address you want to receive                                                                                                                                          |
-| `mode`         | string | Swap mode. One of `"buyUpTo"`, `"spendExact"`, or `"spendUpTo"`                                                                                                                              |
-| `amount`       | string | Target amount in the selected `denomination`. For `buyUpTo`, this is output amount. For `spendExact` and `spendUpTo`, this is input amount                                                   |
-| `priceCap`     | string | Optional explicit maximum input per output. Provide exactly one of `priceCap` or `slippageBps`                                                                                               |
-| `slippageBps`  | number | Optional tolerance from 1 to 5000 basis points. The API uses SDK quotes and simulations to resolve the final price cap. Provide exactly one of `priceCap` or `slippageBps`                   |
-| `denomination` | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `amount`, explicit `priceCap`, and returned `resolvedPriceCap` as unwrapped display values for wrapped tokens |
+| Field              | Type   | Description                                                                                                                                                                                   |
+| ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `taker`            | string | Your wallet address that will execute the transaction                                                                                                                                         |
+| `inputToken`       | string | Wrapped/orderbook token address you are selling                                                                                                                                               |
+| `outputToken`      | string | Wrapped/orderbook token address you want to receive                                                                                                                                           |
+| `mode`             | string | Swap mode. One of `"buyUpTo"`, `"spendExact"`, or `"spendUpTo"`                                                                                                                               |
+| `amount`           | string | Target amount in the selected `denomination`. For `buyUpTo`, this is output amount. For `spendExact` and `spendUpTo`, this is input amount                                                    |
+| `priceCap`         | string | Optional explicit maximum input per output. Provide exactly one of `priceCap` or `slippageBps`                                                                                                |
+| `slippageBps`      | number | Optional tolerance from 1 to 5000 basis points. The API uses SDK quotes and simulations to resolve the final price cap. Provide exactly one of `priceCap` or `slippageBps`                    |
+| `referenceIoRatio` | string | Optional input-per-output oracle ratio used with `slippageBps`. Candidate orders more than 5% worse than this reference are excluded before the final slippage cap is resolved                |
+| `denomination`     | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `amount`, explicit `priceCap`, `referenceIoRatio`, and returned `resolvedPriceCap` as unwrapped display values |
 
 Mode behavior:
 
@@ -117,9 +119,11 @@ Mode behavior:
 
 With `slippageBps`, the API asks the SDK to quote the available orders, applies
 the tolerance to the worst selected fill price, and passes the resolved cap back
-into SDK calldata generation. No orderbook walking is required in the client.
-Alternatively, provide `priceCap` directly; for example, `"priceCap": "2600"`
-means the swap will not pay more than 2600 USDC per 1 WETH.
+into SDK calldata generation. When `referenceIoRatio` is supplied, the API first
+excludes candidates priced more than 5% above that reference. No orderbook
+walking is required in the client. Alternatively, provide `priceCap` directly;
+for example, `"priceCap": "2600"` means the swap will not pay more than 2600
+USDC per 1 WETH.
 
 ### Legacy: V1 Output-Targeted Calldata
 
@@ -180,7 +184,7 @@ required transactions:
   "value": "0x0",
   "estimatedInput": "2500.0",
   "denomination": "wrapped",
-  "resolvedPriceCap": "2512.5",
+  "resolvedPriceCap": "2613",
   "approvals": [
     {
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -203,7 +207,7 @@ the swap calldata:
   "value": "0x0",
   "estimatedInput": "2500.0",
   "denomination": "wrapped",
-  "resolvedPriceCap": "2512.5",
+  "resolvedPriceCap": "2613",
   "approvals": []
 }
 ```
