@@ -7,9 +7,9 @@ use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::swap::denomination::{
-    denormalize_calldata_price_cap, normalize_calldata_request_amount,
-    normalize_calldata_request_values, normalize_calldata_response, CalldataAmountNormalization,
-    CalldataRequestNormalization,
+    denormalize_calldata_price_cap, normalize_calldata_price_cap,
+    normalize_calldata_request_amount, normalize_calldata_request_values,
+    normalize_calldata_response, CalldataAmountNormalization, CalldataRequestNormalization,
 };
 use crate::types::swap::{
     SwapCalldataMode, SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request,
@@ -17,6 +17,7 @@ use crate::types::swap::{
 };
 use alloy::primitives::{keccak256, Address, Bytes, Signature};
 use alloy::sol_types::{SolCall, SolValue};
+use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::takeOrders4Call;
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
@@ -345,8 +346,14 @@ struct SwapCalldataBuildRequest {
 
 #[derive(Debug)]
 enum SwapCalldataPriceLimit {
-    Explicit { value: String, field: &'static str },
-    SlippageBps(u16),
+    Explicit {
+        value: String,
+        field: &'static str,
+    },
+    SlippageBps {
+        slippage_bps: u16,
+        reference_io_ratio: Option<String>,
+    },
 }
 
 struct SwapCalldataBuildResult {
@@ -376,15 +383,26 @@ impl TryFrom<SwapCalldataV2Request> for SwapCalldataBuildRequest {
     type Error = ApiError;
 
     fn try_from(req: SwapCalldataV2Request) -> Result<Self, Self::Error> {
-        let price_limit = match (req.price_cap, req.slippage_bps) {
-            (Some(value), None) => SwapCalldataPriceLimit::Explicit {
+        let price_limit = match (req.price_cap, req.slippage_bps, req.reference_io_ratio) {
+            (Some(value), None, None) => SwapCalldataPriceLimit::Explicit {
                 value,
                 field: "price_cap",
             },
-            (None, Some(slippage_bps @ 1..=5000)) => {
-                SwapCalldataPriceLimit::SlippageBps(slippage_bps)
+            (Some(_), None, Some(_)) => {
+                tracing::warn!(
+                    "swap calldata rejected because reference_io_ratio was provided without slippage_bps"
+                );
+                return Err(ApiError::BadRequest(
+                    "reference_io_ratio requires slippage_bps".into(),
+                ));
             }
-            (None, Some(_)) => {
+            (None, Some(slippage_bps @ 1..=5000), reference_io_ratio) => {
+                SwapCalldataPriceLimit::SlippageBps {
+                    slippage_bps,
+                    reference_io_ratio,
+                }
+            }
+            (None, Some(_), _) => {
                 tracing::warn!("swap calldata rejected for out-of-range slippage_bps");
                 return Err(ApiError::BadRequest(
                     "slippage_bps must be between 1 and 5000".into(),
@@ -465,7 +483,10 @@ async fn process_swap_calldata_build(
             .await?;
             (amount, price_cap, resolved_price_cap, wrap_ratios)
         }
-        SwapCalldataPriceLimit::SlippageBps(slippage_bps) => {
+        SwapCalldataPriceLimit::SlippageBps {
+            slippage_bps,
+            reference_io_ratio,
+        } => {
             let (amount, wrap_ratios) = normalize_calldata_request_amount(
                 ds,
                 CalldataAmountNormalization {
@@ -478,6 +499,27 @@ async fn process_swap_calldata_build(
                 },
             )
             .await?;
+            let reference_io_ratio = reference_io_ratio
+                .map(|reference_io_ratio| {
+                    normalize_calldata_price_cap(
+                        reference_io_ratio,
+                        "reference_io_ratio",
+                        req.denomination,
+                        req.input_token,
+                        req.output_token,
+                        &wrap_ratios,
+                    )
+                    .and_then(|reference_io_ratio| {
+                        Float::parse(reference_io_ratio).map_err(|error| {
+                            tracing::warn!(
+                                %error,
+                                "swap calldata rejected for invalid reference_io_ratio"
+                            );
+                            ApiError::BadRequest("invalid reference_io_ratio".into())
+                        })
+                    })
+                })
+                .transpose()?;
             let orders = ds
                 .get_orders_for_pair(req.input_token, req.output_token)
                 .await?;
@@ -494,6 +536,7 @@ async fn process_swap_calldata_build(
                 req.mode,
                 &amount,
                 slippage_bps,
+                reference_io_ratio,
             )?;
             let resolved_price_cap = denormalize_calldata_price_cap(
                 price_cap,
@@ -606,6 +649,7 @@ mod tests {
             amount: amount.to_string(),
             price_cap: Some(price_cap.to_string()),
             slippage_bps: None,
+            reference_io_ratio: None,
             denomination: SwapDenomination::Wrapped,
         }
     }
@@ -641,6 +685,7 @@ mod tests {
             amount: amount.to_string(),
             price_cap: Some(price_cap.to_string()),
             slippage_bps: None,
+            reference_io_ratio: None,
             denomination: SwapDenomination::Unwrapped,
         }
     }
@@ -658,6 +703,7 @@ mod tests {
             amount: amount.to_string(),
             price_cap: None,
             slippage_bps: Some(slippage_bps),
+            reference_io_ratio: None,
             denomination: SwapDenomination::Wrapped,
         }
     }
@@ -1038,6 +1084,20 @@ mod tests {
         assert_eq!(*captured_counterparty.lock().unwrap(), Some(TAKER));
     }
 
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_applies_reference_price_guard() {
+        let (ds, captured_request, _) = capture_slippage_ds(HashMap::new());
+        let mut request = slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50);
+        request.reference_io_ratio = Some("1".to_string());
+
+        let result = process_swap_calldata_v2(&ds, request).await;
+
+        assert!(
+            matches!(result, Err(ApiError::NotFound(message)) if message == "no liquidity found for this pair")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
     #[test]
     fn test_swap_calldata_v2_response_flattens_calldata_fields() {
         let response = serde_json::to_value(SwapCalldataV2Response {
@@ -1086,6 +1146,20 @@ mod tests {
 
         assert!(
             matches!(result, Err(ApiError::BadRequest(message)) if message == "provide exactly one of price_cap or slippage_bps")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_rejects_reference_ratio_without_slippage() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let mut request = calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5");
+        request.reference_io_ratio = Some("2".to_string());
+
+        let result = process_swap_calldata_v2(&ds, request).await;
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "reference_io_ratio requires slippage_bps")
         );
         no_take_orders_request_was_made(&captured_request);
     }

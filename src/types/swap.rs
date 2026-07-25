@@ -90,6 +90,11 @@ pub struct SwapCalldataV2Request {
     /// one of `priceCap` or `slippageBps`.
     #[schema(example = 50, minimum = 1, maximum = 5000)]
     pub slippage_bps: Option<u16>,
+    /// Optional input-per-output oracle ratio used to exclude candidate orders
+    /// more than 5% worse than the reference before resolving `slippageBps`.
+    /// Only valid with `slippageBps` and uses the requested `denomination`.
+    #[schema(example = "2500")]
+    pub reference_io_ratio: Option<String>,
     #[serde(default)]
     #[schema(example = "wrapped", default = "wrapped")]
     pub denomination: SwapDenomination,
@@ -139,6 +144,10 @@ pub struct SwapCalldataV2SlippageRequest {
     pub request: SwapCalldataV2RequestCommon,
     #[schema(example = 50, minimum = 1, maximum = 5000)]
     pub slippage_bps: u16,
+    /// Optional input-per-output oracle ratio used to exclude candidate orders
+    /// more than 5% worse than the reference before resolving the price cap.
+    #[schema(example = "2500")]
+    pub reference_io_ratio: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

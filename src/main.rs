@@ -570,6 +570,10 @@ mod tests {
                 .is_some_and(|required| required.contains(&serde_json::json!("slippageBps")))
         );
         assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                .is_object()
+        );
+        assert!(
             schemas["SwapCalldataV2Response"]["allOf"][1]["properties"]["resolvedPriceCap"]
                 .is_object()
         );
