@@ -10,7 +10,8 @@ use crate::routes::swap::denomination::{
     normalize_calldata_request_amount, normalize_quote_amounts, CalldataAmountNormalization,
 };
 use crate::types::swap::{
-    SwapQuoteRequest, SwapQuoteResponse, SwapQuoteV2Request, SwapQuoteV2Response,
+    SwapQuoteRequest, SwapQuoteResponse, SwapQuoteV2Request, SwapQuoteV2RequestBody,
+    SwapQuoteV2Response,
 };
 use alloy::primitives::Address;
 use rain_math_float::Float;
@@ -71,8 +72,10 @@ pub async fn post_swap_quote(
     post,
     path = "/v2/swap/quote",
     tag = "Swap",
+    summary = "Simulate a mode-based swap",
+    description = "Returns the SDK-backed executable-route simulation used by V2 calldata. Provide exactly one of priceCap or slippageBps. referenceIoRatio is an optional input-token-per-output-token guard that is valid only with slippageBps.",
     security(("basicAuth" = [])),
-    request_body = SwapQuoteV2Request,
+    request_body = SwapQuoteV2RequestBody,
     responses(
         (status = 200, description = "Mode-based swap quote", body = SwapQuoteV2Response),
         (status = 400, description = "Bad request", body = ApiErrorResponse),

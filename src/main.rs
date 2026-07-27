@@ -517,6 +517,7 @@ mod tests {
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
         let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+        let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
@@ -539,6 +540,30 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
+        assert_eq!(swap_quote_v2_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_quote_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SwapQuoteV2RequestBody"
+        );
+        assert_eq!(
+            schemas["SwapQuoteV2RequestBody"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/SwapQuoteV2PriceCapRequest" },
+                { "$ref": "#/components/schemas/SwapQuoteV2SlippageRequest" }
+            ])
+        );
+        assert!(
+            schemas["SwapQuoteV2SlippageRequest"]["allOf"][1]["properties"]["slippageBps"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert!(
+            schemas["SwapQuoteV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("input-token-per-output-token"))
+        );
         assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
         assert_eq!(
             swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
@@ -573,6 +598,18 @@ mod tests {
         assert!(
             schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
                 .is_object()
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["slippageBps"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("input-token-per-output-token"))
         );
         assert!(
             schemas["SwapCalldataV2Response"]["allOf"][1]["properties"]["resolvedPriceCap"]

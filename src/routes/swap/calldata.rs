@@ -83,6 +83,8 @@ pub async fn post_swap_calldata(
     post,
     path = "/v2/swap/calldata",
     tag = "Swap",
+    summary = "Build ready-to-send swap calldata",
+    description = "Builds SDK calldata for one executable route. Provide exactly one of priceCap or slippageBps. When approvals are returned, submit them and retry with the response's resolvedPriceCap as priceCap so the original limit remains fixed.",
     security(("basicAuth" = [])),
     request_body = SwapCalldataV2RequestBody,
     responses(
