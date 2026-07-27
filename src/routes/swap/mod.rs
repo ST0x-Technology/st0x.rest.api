@@ -1,11 +1,12 @@
 mod calldata;
 mod denomination;
 mod quote;
+mod slippage;
 
 use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::ApiError;
-use crate::types::swap::{SwapCalldataResponse, SwapDenomination};
+use crate::types::swap::{SwapCalldataMode, SwapCalldataResponse, SwapDenomination};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
     wrap_ratio_values_from_responses, WrapRatioValue,
@@ -16,10 +17,11 @@ use rain_orderbook_common::raindex_client::orders::{
     GetOrdersFilters, GetOrdersTokenFilter, RaindexOrder,
 };
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
+use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rain_orderbook_common::take_orders::{
-    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate,
+    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate, TakeOrdersMode,
 };
 use rocket::Route;
 use std::collections::HashMap;
@@ -43,6 +45,7 @@ pub(crate) trait SwapDataSource: Send + Sync {
         orders: &[RaindexOrder],
         input_token: Address,
         output_token: Address,
+        counterparty: Address,
     ) -> Result<Vec<TakeOrderCandidate>, ApiError>;
 
     async fn get_calldata(
@@ -62,6 +65,10 @@ pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
     pub pool: &'a DbPool,
+}
+
+fn swap_chain_ids() -> ChainIds {
+    ChainIds(vec![crate::CHAIN_ID])
 }
 
 fn swap_candidates_cache_key(
@@ -132,7 +139,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ..Default::default()
         };
         self.client
-            .get_orders(None, Some(filters), None, None)
+            .get_orders(Some(swap_chain_ids()), Some(filters), None, None)
             .await
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
@@ -146,6 +153,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         orders: &[RaindexOrder],
         input_token: Address,
         output_token: Address,
+        counterparty: Address,
     ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
         let fetch = || async {
             build_take_order_candidates_for_pair(
@@ -154,7 +162,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 output_token,
                 None,
                 None,
-                Address::ZERO,
+                counterparty,
                 &NoopInjector,
             )
             .await
@@ -164,7 +172,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             })
         };
 
-        if !self.caches.is_enabled() {
+        if !self.caches.is_enabled() || counterparty != Address::ZERO {
             return fetch().await;
         }
 
@@ -269,6 +277,16 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
     }
 }
 
+impl From<SwapCalldataMode> for TakeOrdersMode {
+    fn from(mode: SwapCalldataMode) -> Self {
+        match mode {
+            SwapCalldataMode::BuyUpTo => TakeOrdersMode::BuyUpTo,
+            SwapCalldataMode::SpendExact => TakeOrdersMode::SpendExact,
+            SwapCalldataMode::SpendUpTo => TakeOrdersMode::SpendUpTo,
+        }
+    }
+}
+
 pub use calldata::*;
 pub use quote::*;
 
@@ -277,12 +295,12 @@ pub fn routes() -> Vec<Route> {
 }
 
 pub fn routes_v2() -> Vec<Route> {
-    rocket::routes![calldata::post_swap_calldata_v2]
+    rocket::routes![quote::post_swap_quote_v2, calldata::post_swap_calldata_v2]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::swap_candidates_cache_key;
+    use super::{swap_candidates_cache_key, swap_chain_ids};
     use alloy::primitives::address;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use serde_json::json;
@@ -315,6 +333,11 @@ mod tests {
             ),
             swap_candidates_cache_key(&[order_b, order_a], input_token, output_token)
         );
+    }
+
+    #[test]
+    fn test_swap_orders_are_scoped_to_calldata_chain() {
+        assert_eq!(swap_chain_ids().0, vec![crate::CHAIN_ID]);
     }
 }
 
@@ -362,6 +385,7 @@ pub(crate) mod test_fixtures {
             _orders: &[RaindexOrder],
             _input_token: Address,
             _output_token: Address,
+            _counterparty: Address,
         ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
             Ok(self.candidates.clone())
         }

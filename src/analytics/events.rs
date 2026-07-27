@@ -6,7 +6,7 @@
 
 use super::AnalyticsEvent;
 use crate::auth::{AuthClientInfo, AuthenticatedKey};
-use crate::types::swap::{SwapCalldataResponse, SwapQuoteResponse};
+use crate::types::swap::{SwapCalldataResponse, SwapQuoteResponse, SwapQuoteV2Response};
 use alloy::primitives::Address;
 use serde_json::{Map, Value};
 
@@ -106,6 +106,54 @@ pub(crate) fn swap_quoted_event(
     props.insert(
         "estimated_io_ratio".to_string(),
         resp.estimated_io_ratio.clone().into(),
+    );
+    AnalyticsEvent {
+        event: "swap_quoted",
+        distinct_id: client_distinct_id(&info),
+        properties: props,
+    }
+}
+
+/// Mode-based swap quote event. Attributed to the client, with the optional
+/// taker deliberately omitted from analytics because this is still quote intent.
+pub(crate) fn swap_quoted_v2_event(
+    key: &AuthenticatedKey,
+    resp: &SwapQuoteV2Response,
+) -> AnalyticsEvent {
+    let info = key.client_info();
+    let mut props = base_props(&info);
+    props.insert(
+        "input_token".to_string(),
+        token_str(resp.input_token).into(),
+    );
+    props.insert(
+        "output_token".to_string(),
+        token_str(resp.output_token).into(),
+    );
+    props.insert(
+        "denomination".to_string(),
+        serde_json::to_value(resp.denomination).unwrap_or(Value::Null),
+    );
+    props.insert(
+        "mode".to_string(),
+        serde_json::to_value(resp.mode).unwrap_or(Value::Null),
+    );
+    props.insert(
+        "estimated_input".to_string(),
+        resp.estimated_input.clone().into(),
+    );
+    props.insert(
+        "estimated_output".to_string(),
+        resp.estimated_output.clone().into(),
+    );
+    props.insert(
+        "estimated_io_ratio".to_string(),
+        resp.estimated_io_ratio.clone().into(),
+    );
+    props.insert("fully_filled".to_string(), resp.fully_filled.into());
+    props.insert(
+        "resolved_price_cap".to_string(),
+        resp.resolved_price_cap.clone().into(),
     );
     AnalyticsEvent {
         event: "swap_quoted",

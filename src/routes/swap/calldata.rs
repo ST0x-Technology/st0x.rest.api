@@ -7,13 +7,17 @@ use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::swap::denomination::{
-    normalize_calldata_request_values, normalize_calldata_response, CalldataRequestNormalization,
+    denormalize_calldata_price_cap, normalize_calldata_price_cap,
+    normalize_calldata_request_amount, normalize_calldata_request_values,
+    normalize_calldata_response, CalldataAmountNormalization, CalldataRequestNormalization,
 };
 use crate::types::swap::{
-    SwapCalldataMode, SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request,
+    SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request, SwapCalldataV2RequestBody,
+    SwapCalldataV2Response,
 };
 use alloy::primitives::{keccak256, Address, Bytes, Signature};
 use alloy::sol_types::{SolCall, SolValue};
+use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::takeOrders4Call;
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
@@ -79,10 +83,12 @@ pub async fn post_swap_calldata(
     post,
     path = "/v2/swap/calldata",
     tag = "Swap",
+    summary = "Build ready-to-send swap calldata",
+    description = "Builds SDK calldata for one executable route. Provide exactly one of priceCap or slippageBps. When approvals are returned, submit them and retry with the response's resolvedPriceCap as priceCap so the original limit remains fixed.",
     security(("basicAuth" = [])),
-    request_body = SwapCalldataV2Request,
+    request_body = SwapCalldataV2RequestBody,
     responses(
-        (status = 200, description = "Swap calldata", body = SwapCalldataResponse),
+        (status = 200, description = "Swap calldata", body = SwapCalldataV2Response),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "No liquidity found", body = ApiErrorResponse),
@@ -102,7 +108,7 @@ pub async fn post_swap_calldata_v2(
     analytics: &State<Analytics>,
     span: TracingSpan,
     request: Json<SwapCalldataV2Request>,
-) -> Result<Json<SwapCalldataResponse>, ApiError> {
+) -> Result<Json<SwapCalldataV2Response>, ApiError> {
     async move {
         let req = request.into_inner();
         tracing::info!(
@@ -177,7 +183,7 @@ async fn handle_swap_calldata_v2(
     signer: &AttributionSigner,
     attribution: &Attribution,
     req: SwapCalldataV2Request,
-) -> Result<SwapCalldataResponse, ApiError> {
+) -> Result<SwapCalldataV2Response, ApiError> {
     let analytics_context = analytics.is_enabled().then(|| {
         (
             req.taker,
@@ -188,7 +194,7 @@ async fn handle_swap_calldata_v2(
         )
     });
     let mut response = process_swap_calldata_v2(ds, req).await?;
-    embed_and_validate_attribution(&mut response, signer, attribution).await?;
+    embed_and_validate_attribution(&mut response.calldata, signer, attribution).await?;
 
     if let Some((taker, input_token, output_token, denomination, mode)) = analytics_context {
         analytics.capture(|| {
@@ -200,7 +206,7 @@ async fn handle_swap_calldata_v2(
                 denomination,
                 ApiVersion::V2,
                 mode,
-                &response,
+                &response.calldata,
             )
         });
     }
@@ -336,9 +342,25 @@ struct SwapCalldataBuildRequest {
     mode: TakeOrdersMode,
     amount: String,
     amount_field: &'static str,
-    price_cap: String,
-    price_cap_field: &'static str,
+    price_limit: SwapCalldataPriceLimit,
     denomination: crate::types::swap::SwapDenomination,
+}
+
+#[derive(Debug)]
+enum SwapCalldataPriceLimit {
+    Explicit {
+        value: String,
+        field: &'static str,
+    },
+    SlippageBps {
+        slippage_bps: u16,
+        reference_io_ratio: Option<String>,
+    },
+}
+
+struct SwapCalldataBuildResult {
+    calldata: SwapCalldataResponse,
+    resolved_price_cap: String,
 }
 
 impl From<SwapCalldataRequest> for SwapCalldataBuildRequest {
@@ -350,36 +372,62 @@ impl From<SwapCalldataRequest> for SwapCalldataBuildRequest {
             mode: TakeOrdersMode::BuyUpTo,
             amount: req.output_amount,
             amount_field: "output_amount",
-            price_cap: req.maximum_io_ratio,
-            price_cap_field: "maximum_io_ratio",
+            price_limit: SwapCalldataPriceLimit::Explicit {
+                value: req.maximum_io_ratio,
+                field: "maximum_io_ratio",
+            },
             denomination: req.denomination,
         }
     }
 }
 
-impl From<SwapCalldataV2Request> for SwapCalldataBuildRequest {
-    fn from(req: SwapCalldataV2Request) -> Self {
-        Self {
+impl TryFrom<SwapCalldataV2Request> for SwapCalldataBuildRequest {
+    type Error = ApiError;
+
+    fn try_from(req: SwapCalldataV2Request) -> Result<Self, Self::Error> {
+        let price_limit = match (req.price_cap, req.slippage_bps, req.reference_io_ratio) {
+            (Some(value), None, None) => SwapCalldataPriceLimit::Explicit {
+                value,
+                field: "price_cap",
+            },
+            (Some(_), None, Some(_)) => {
+                tracing::warn!(
+                    "swap calldata rejected because reference_io_ratio was provided without slippage_bps"
+                );
+                return Err(ApiError::BadRequest(
+                    "reference_io_ratio requires slippage_bps".into(),
+                ));
+            }
+            (None, Some(slippage_bps @ 1..=5000), reference_io_ratio) => {
+                SwapCalldataPriceLimit::SlippageBps {
+                    slippage_bps,
+                    reference_io_ratio,
+                }
+            }
+            (None, Some(_), _) => {
+                tracing::warn!("swap calldata rejected for out-of-range slippage_bps");
+                return Err(ApiError::BadRequest(
+                    "slippage_bps must be between 1 and 5000".into(),
+                ));
+            }
+            _ => {
+                tracing::warn!("swap calldata rejected without exactly one price limit");
+                return Err(ApiError::BadRequest(
+                    "provide exactly one of price_cap or slippage_bps".into(),
+                ));
+            }
+        };
+
+        Ok(Self {
             taker: req.taker,
             input_token: req.input_token,
             output_token: req.output_token,
             mode: req.mode.into(),
             amount: req.amount,
             amount_field: "amount",
-            price_cap: req.price_cap,
-            price_cap_field: "price_cap",
+            price_limit,
             denomination: req.denomination,
-        }
-    }
-}
-
-impl From<SwapCalldataMode> for TakeOrdersMode {
-    fn from(mode: SwapCalldataMode) -> Self {
-        match mode {
-            SwapCalldataMode::BuyUpTo => TakeOrdersMode::BuyUpTo,
-            SwapCalldataMode::SpendExact => TakeOrdersMode::SpendExact,
-            SwapCalldataMode::SpendUpTo => TakeOrdersMode::SpendUpTo,
-        }
+        })
     }
 }
 
@@ -387,37 +435,121 @@ async fn process_swap_calldata(
     ds: &dyn SwapDataSource,
     req: SwapCalldataRequest,
 ) -> Result<SwapCalldataResponse, ApiError> {
-    process_swap_calldata_build(ds, req.into()).await
+    Ok(process_swap_calldata_build(ds, req.into()).await?.calldata)
 }
 
 async fn process_swap_calldata_v2(
     ds: &dyn SwapDataSource,
     req: SwapCalldataV2Request,
-) -> Result<SwapCalldataResponse, ApiError> {
-    process_swap_calldata_build(ds, req.into()).await
+) -> Result<SwapCalldataV2Response, ApiError> {
+    let result = process_swap_calldata_build(ds, req.try_into()?).await?;
+    Ok(SwapCalldataV2Response {
+        calldata: result.calldata,
+        resolved_price_cap: result.resolved_price_cap,
+    })
 }
 
 async fn process_swap_calldata_build(
     ds: &dyn SwapDataSource,
     req: SwapCalldataBuildRequest,
-) -> Result<SwapCalldataResponse, ApiError> {
+) -> Result<SwapCalldataBuildResult, ApiError> {
     ds.validate_supported_tokens(req.input_token, req.output_token)
         .await?;
 
-    let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
-        ds,
-        CalldataRequestNormalization {
-            denomination: req.denomination,
-            input_token: req.input_token,
-            output_token: req.output_token,
-            mode: req.mode,
-            amount: req.amount,
-            amount_field: req.amount_field,
-            price_cap: req.price_cap,
-            price_cap_field: req.price_cap_field,
-        },
-    )
-    .await?;
+    let (amount, price_cap, resolved_price_cap, wrap_ratios) = match req.price_limit {
+        SwapCalldataPriceLimit::Explicit { value, field } => {
+            let resolved_price_cap = value.clone();
+            let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
+                ds,
+                CalldataRequestNormalization {
+                    denomination: req.denomination,
+                    input_token: req.input_token,
+                    output_token: req.output_token,
+                    mode: req.mode,
+                    amount: req.amount,
+                    amount_field: req.amount_field,
+                    price_cap: value,
+                    price_cap_field: field,
+                },
+            )
+            .await?;
+            (amount, price_cap, resolved_price_cap, wrap_ratios)
+        }
+        SwapCalldataPriceLimit::SlippageBps {
+            slippage_bps,
+            reference_io_ratio,
+        } => {
+            let (amount, wrap_ratios) = normalize_calldata_request_amount(
+                ds,
+                CalldataAmountNormalization {
+                    denomination: req.denomination,
+                    input_token: req.input_token,
+                    output_token: req.output_token,
+                    mode: req.mode,
+                    amount: req.amount,
+                    amount_field: req.amount_field,
+                },
+            )
+            .await?;
+            let reference_io_ratio = reference_io_ratio
+                .map(|reference_io_ratio| {
+                    normalize_calldata_price_cap(
+                        reference_io_ratio,
+                        "reference_io_ratio",
+                        req.denomination,
+                        req.input_token,
+                        req.output_token,
+                        &wrap_ratios,
+                    )
+                    .and_then(|reference_io_ratio| {
+                        Float::parse(reference_io_ratio).map_err(|error| {
+                            tracing::warn!(
+                                %error,
+                                "swap calldata rejected for invalid reference_io_ratio"
+                            );
+                            ApiError::BadRequest("invalid reference_io_ratio".into())
+                        })
+                    })
+                })
+                .transpose()?;
+            let orders = ds
+                .get_orders_for_pair(req.input_token, req.output_token)
+                .await?;
+            if orders.is_empty() {
+                return Err(ApiError::NotFound(
+                    "no liquidity found for this pair".into(),
+                ));
+            }
+            let candidates = ds
+                .build_candidates_for_pair(&orders, req.input_token, req.output_token, req.taker)
+                .await?;
+            let price_cap = super::slippage::resolve_slippage_price_cap(
+                candidates,
+                req.mode,
+                &amount,
+                slippage_bps,
+                reference_io_ratio,
+            )?;
+            let resolved_price_cap = denormalize_calldata_price_cap(
+                price_cap,
+                req.denomination,
+                req.input_token,
+                req.output_token,
+                &wrap_ratios,
+            )?;
+            tracing::info!(
+                slippage_bps,
+                resolved_price_cap = %resolved_price_cap,
+                denomination = ?req.denomination,
+                "resolved swap slippage price cap"
+            );
+            let price_cap = price_cap.format().map_err(|error| {
+                tracing::error!(%error, "failed to format resolved slippage price cap");
+                ApiError::Internal("failed to resolve slippage".into())
+            })?;
+            (amount, price_cap, resolved_price_cap, wrap_ratios)
+        }
+    };
 
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
@@ -430,7 +562,12 @@ async fn process_swap_calldata_build(
     };
 
     let response = ds.get_calldata(take_req).await?;
-    normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
+    let calldata =
+        normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)?;
+    Ok(SwapCalldataBuildResult {
+        calldata,
+        resolved_price_cap,
+    })
 }
 
 #[cfg(all(test, feature = "oracle-integration-tests"))]
@@ -442,7 +579,7 @@ mod tests {
     use crate::analytics::{Analytics, RecordingSink};
     use crate::auth::AuthenticatedKey;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
-    use crate::test_helpers::TestClientBuilder;
+    use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
     use crate::types::common::Approval;
     use crate::types::swap::{SwapCalldataMode, SwapDenomination};
     use crate::wrap_ratio::WrapRatioValue;
@@ -458,6 +595,8 @@ mod tests {
     const ORDERBOOK: Address = address!("d2938e7c9fe3597f78832ce780feb61945c377d7");
     const WT_MSTR: Address = address!("Ff05e1BD696900DC6A52cA35cA61bB1024eDA8e2");
     const WT_COIN: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
+    type CapturedTakeOrdersRequest = Arc<Mutex<Option<TakeOrdersRequest>>>;
+    type CapturedCounterparty = Arc<Mutex<Option<Address>>>;
 
     fn test_key() -> AuthenticatedKey {
         AuthenticatedKey {
@@ -500,7 +639,9 @@ mod tests {
             output_token: WETH,
             mode,
             amount: amount.to_string(),
-            price_cap: price_cap.to_string(),
+            price_cap: Some(price_cap.to_string()),
+            slippage_bps: None,
+            reference_io_ratio: None,
             denomination: SwapDenomination::Wrapped,
         }
     }
@@ -534,8 +675,28 @@ mod tests {
             output_token,
             mode,
             amount: amount.to_string(),
-            price_cap: price_cap.to_string(),
+            price_cap: Some(price_cap.to_string()),
+            slippage_bps: None,
+            reference_io_ratio: None,
             denomination: SwapDenomination::Unwrapped,
+        }
+    }
+
+    fn slippage_v2_request(
+        mode: SwapCalldataMode,
+        amount: &str,
+        slippage_bps: u16,
+    ) -> SwapCalldataV2Request {
+        SwapCalldataV2Request {
+            taker: TAKER,
+            input_token: USDC,
+            output_token: WETH,
+            mode,
+            amount: amount.to_string(),
+            price_cap: None,
+            slippage_bps: Some(slippage_bps),
+            reference_io_ratio: None,
+            denomination: SwapDenomination::Wrapped,
         }
     }
 
@@ -577,20 +738,14 @@ mod tests {
     fn capture_ds(
         response: SwapCalldataResponse,
         wrap_ratios: HashMap<Address, WrapRatioValue>,
-    ) -> (
-        MockCalldataDataSource,
-        Arc<Mutex<Option<TakeOrdersRequest>>>,
-    ) {
+    ) -> (MockCalldataDataSource, CapturedTakeOrdersRequest) {
         capture_ds_with_wrap_result(response, Ok(wrap_ratios))
     }
 
     fn capture_ds_with_wrap_result(
         response: SwapCalldataResponse,
         wrap_ratios: Result<HashMap<Address, WrapRatioValue>, ApiError>,
-    ) -> (
-        MockCalldataDataSource,
-        Arc<Mutex<Option<TakeOrdersRequest>>>,
-    ) {
+    ) -> (MockCalldataDataSource, CapturedTakeOrdersRequest) {
         let captured_request = Arc::new(Mutex::new(None));
         (
             MockCalldataDataSource {
@@ -602,15 +757,43 @@ mod tests {
                 },
                 wrap_ratios,
                 captured_request: Arc::clone(&captured_request),
+                captured_counterparty: Arc::new(Mutex::new(None)),
             },
             captured_request,
+        )
+    }
+
+    fn capture_slippage_ds(
+        wrap_ratios: HashMap<Address, WrapRatioValue>,
+    ) -> (
+        MockCalldataDataSource,
+        CapturedTakeOrdersRequest,
+        CapturedCounterparty,
+    ) {
+        let captured_request = Arc::new(Mutex::new(None));
+        let captured_counterparty = Arc::new(Mutex::new(None));
+        (
+            MockCalldataDataSource {
+                base: MockSwapDataSource {
+                    supported_tokens: Ok(()),
+                    orders: Ok(vec![mock_order()]),
+                    candidates: vec![mock_candidate("100", "2")],
+                    calldata_result: Ok(ready_response()),
+                },
+                wrap_ratios: Ok(wrap_ratios),
+                captured_request: Arc::clone(&captured_request),
+                captured_counterparty: Arc::clone(&captured_counterparty),
+            },
+            captured_request,
+            captured_counterparty,
         )
     }
 
     struct MockCalldataDataSource {
         base: MockSwapDataSource,
         wrap_ratios: Result<HashMap<Address, WrapRatioValue>, ApiError>,
-        captured_request: Arc<Mutex<Option<TakeOrdersRequest>>>,
+        captured_request: CapturedTakeOrdersRequest,
+        captured_counterparty: CapturedCounterparty,
     }
 
     #[async_trait]
@@ -641,9 +824,11 @@ mod tests {
             orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
             input_token: Address,
             output_token: Address,
+            counterparty: Address,
         ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+            *self.captured_counterparty.lock().unwrap() = Some(counterparty);
             self.base
-                .build_candidates_for_pair(orders, input_token, output_token)
+                .build_candidates_for_pair(orders, input_token, output_token, counterparty)
                 .await
         }
 
@@ -672,12 +857,12 @@ mod tests {
     }
 
     fn captured_take_orders_request(
-        captured_request: &Arc<Mutex<Option<TakeOrdersRequest>>>,
+        captured_request: &CapturedTakeOrdersRequest,
     ) -> TakeOrdersRequest {
         captured_request.lock().unwrap().clone().unwrap()
     }
 
-    fn no_take_orders_request_was_made(captured_request: &Arc<Mutex<Option<TakeOrdersRequest>>>) {
+    fn no_take_orders_request_was_made(captured_request: &CapturedTakeOrdersRequest) {
         assert!(captured_request.lock().unwrap().is_none());
     }
 
@@ -834,8 +1019,9 @@ mod tests {
         assert_eq!(request.mode, TakeOrdersMode::SpendExact);
         assert_eq!(request.amount, "100");
         assert_eq!(request.price_cap, "2.5");
-        assert_eq!(result.estimated_input, "150");
-        assert_eq!(result.denomination, SwapDenomination::Wrapped);
+        assert_eq!(result.calldata.estimated_input, "150");
+        assert_eq!(result.calldata.denomination, SwapDenomination::Wrapped);
+        assert_eq!(result.resolved_price_cap, "2.5");
     }
 
     #[rocket::async_test]
@@ -852,7 +1038,8 @@ mod tests {
         assert_eq!(request.mode, TakeOrdersMode::SpendUpTo);
         assert_eq!(request.amount, "75");
         assert_eq!(request.price_cap, "3");
-        assert_eq!(result.denomination, SwapDenomination::Wrapped);
+        assert_eq!(result.calldata.denomination, SwapDenomination::Wrapped);
+        assert_eq!(result.resolved_price_cap, "3");
     }
 
     #[rocket::async_test]
@@ -869,7 +1056,119 @@ mod tests {
         assert_eq!(request.mode, TakeOrdersMode::BuyUpTo);
         assert_eq!(request.amount, "50");
         assert_eq!(request.price_cap, "2");
-        assert_eq!(result.denomination, SwapDenomination::Wrapped);
+        assert_eq!(result.calldata.denomination, SwapDenomination::Wrapped);
+        assert_eq!(result.resolved_price_cap, "2");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_resolves_optional_slippage() {
+        let (ds, captured_request, captured_counterparty) = capture_slippage_ds(HashMap::new());
+        let result = process_swap_calldata_v2(
+            &ds,
+            slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
+        )
+        .await
+        .unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.price_cap, "2.01");
+        assert_eq!(result.resolved_price_cap, "2.01");
+        assert_eq!(*captured_counterparty.lock().unwrap(), Some(TAKER));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_applies_reference_price_guard() {
+        let (ds, captured_request, _) = capture_slippage_ds(HashMap::new());
+        let mut request = slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50);
+        request.reference_io_ratio = Some("1".to_string());
+
+        let result = process_swap_calldata_v2(&ds, request).await;
+
+        assert!(
+            matches!(result, Err(ApiError::NotFound(message)) if message == "no liquidity found for this pair")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[test]
+    fn test_swap_calldata_v2_response_flattens_calldata_fields() {
+        let response = serde_json::to_value(SwapCalldataV2Response {
+            calldata: ready_response(),
+            resolved_price_cap: "2.01".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(response["to"], ORDERBOOK.to_string().to_lowercase());
+        assert_eq!(response["estimatedInput"], "150");
+        assert_eq!(response["resolvedPriceCap"], "2.01");
+        assert!(response.get("calldata").is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_denormalizes_resolved_slippage_cap() {
+        let (ds, captured_request, _) =
+            capture_slippage_ds(HashMap::from([(WT_COIN, wrap_ratio(WT_COIN, "4"))]));
+        let mut request = slippage_v2_request(SwapCalldataMode::BuyUpTo, "100", 50);
+        request.output_token = WT_COIN;
+        request.denomination = SwapDenomination::Unwrapped;
+
+        let result = process_swap_calldata_v2(&ds, request).await.unwrap();
+        let request = captured_take_orders_request(&captured_request);
+
+        assert_eq!(request.amount, "25");
+        assert_eq!(request.price_cap, "2.01");
+        assert_eq!(result.resolved_price_cap, "0.5025");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_requires_exactly_one_price_limit() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let mut request = calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5");
+        request.slippage_bps = Some(50);
+        let result = process_swap_calldata_v2(&ds, request).await;
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "provide exactly one of price_cap or slippage_bps")
+        );
+        no_take_orders_request_was_made(&captured_request);
+
+        let mut request = slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50);
+        request.slippage_bps = None;
+        let result = process_swap_calldata_v2(&ds, request).await;
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "provide exactly one of price_cap or slippage_bps")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_rejects_reference_ratio_without_slippage() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let mut request = calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5");
+        request.reference_io_ratio = Some("2".to_string());
+
+        let result = process_swap_calldata_v2(&ds, request).await;
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "reference_io_ratio requires slippage_bps")
+        );
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_rejects_slippage_out_of_range() {
+        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
+        let result = process_swap_calldata_v2(
+            &ds,
+            slippage_v2_request(SwapCalldataMode::SpendExact, "100", 5001),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "slippage_bps must be between 1 and 5000")
+        );
+        no_take_orders_request_was_made(&captured_request);
     }
 
     #[rocket::async_test]
@@ -950,8 +1249,9 @@ mod tests {
         assert_eq!(request.mode, TakeOrdersMode::SpendExact);
         assert_eq!(request.amount, "50");
         assert_eq!(request.price_cap, "1.25");
-        assert_eq!(result.estimated_input, "300");
-        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+        assert_eq!(result.calldata.estimated_input, "300");
+        assert_eq!(result.calldata.denomination, SwapDenomination::Unwrapped);
+        assert_eq!(result.resolved_price_cap, "2.5");
     }
 
     #[rocket::async_test]
@@ -971,8 +1271,9 @@ mod tests {
         assert_eq!(request.mode, TakeOrdersMode::BuyUpTo);
         assert_eq!(request.amount, "25");
         assert_eq!(request.price_cap, "10");
-        assert_eq!(result.estimated_input, "150");
-        assert_eq!(result.denomination, SwapDenomination::Unwrapped);
+        assert_eq!(result.calldata.estimated_input, "150");
+        assert_eq!(result.calldata.denomination, SwapDenomination::Unwrapped);
+        assert_eq!(result.resolved_price_cap, "2.5");
     }
 
     #[rocket::async_test]
