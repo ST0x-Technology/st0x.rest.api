@@ -1,7 +1,9 @@
+mod analytics_logger;
 pub(crate) mod rate_limiter;
 mod request_logger;
 mod usage_logger;
 
+pub use analytics_logger::AnalyticsFairing;
 pub(crate) use rate_limiter::GlobalRateLimit;
 pub use rate_limiter::RateLimitHeadersFairing;
 pub use rate_limiter::RateLimiter;

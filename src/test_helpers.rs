@@ -17,6 +17,7 @@ pub(crate) struct TestClientBuilder {
     raindex_config: Option<crate::raindex::RaindexProvider>,
     private_registry_path: Option<std::path::PathBuf>,
     database_url: Option<String>,
+    analytics: Option<crate::analytics::Analytics>,
 }
 
 impl TestClientBuilder {
@@ -27,11 +28,18 @@ impl TestClientBuilder {
             raindex_config: None,
             private_registry_path: None,
             database_url: None,
+            analytics: None,
         }
     }
 
     pub(crate) fn rate_limiter(mut self, rate_limiter: crate::fairings::RateLimiter) -> Self {
         self.rate_limiter = rate_limiter;
+        self
+    }
+
+    /// Override the analytics state managed by the test Rocket instance.
+    pub(crate) fn analytics(mut self, analytics: crate::analytics::Analytics) -> Self {
+        self.analytics = Some(analytics);
         self
     }
 
@@ -87,13 +95,23 @@ impl TestClientBuilder {
             crate::registry_artifact::RegistryArtifactStore::new(private_registry_path);
         let response_caches =
             crate::cache::RouteResponseCaches::new(100, std::time::Duration::from_secs(10));
-        let app_state = crate::app_state::ApplicationState::new(artifact_store, response_caches);
+        let attribution_signer = crate::attribution::AttributionSigner::from_hex_key(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .expect("test attribution signer");
+        let attribution = crate::attribution::AttributionState::new(attribution_signer);
+        let app_state =
+            crate::app_state::ApplicationState::new(artifact_store, response_caches, attribution);
+        let analytics = self
+            .analytics
+            .unwrap_or_else(crate::analytics::Analytics::disabled);
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
         let rocket = crate::rocket(
             pool,
             self.rate_limiter,
             shared_raindex,
             app_state,
+            analytics,
             docs_dir,
             2,
         )

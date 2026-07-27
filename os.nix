@@ -37,12 +37,18 @@ let
       environment = {
         RUST_LOG =
           "st0x_rest_api=info,raindex_common=info,raindex_quote=info,rocket=warn,warn";
+      } // lib.optionalAttrs (env ? posthogHost) {
+        POSTHOG_HOST = env.posthogHost;
+      } // lib.optionalAttrs (env ? posthogProjectToken) {
+        POSTHOG_PROJECT_TOKEN = env.posthogProjectToken;
       };
 
       serviceConfig = {
         User = "st0x-rest-api";
         Group = "st0x";
         ExecStart = "${path} serve --config /etc/st0x-rest-api/config.toml";
+        LoadCredential =
+          [ "attribution-signer:${env.dataDir}/secrets/attribution-signer" ];
         Restart = "always";
         RestartSec = 5;
         ReadWritePaths = [ "/mnt/data" ];
@@ -201,21 +207,16 @@ in {
 
   environment.etc."st0x-rest-api/config.toml".source = env.configFile;
 
-  services.logrotate = {
-    enable = true;
-    settings."${env.dataDir}/logs/*.log" = {
-      su = "root st0x";
-      rotate = 14;
-      weekly = true;
-      compress = true;
-      missingok = true;
-      notifempty = true;
-    };
+  # Preserve the D-Bus implementation already running in production. Switching
+  # implementations requires a reboot and blocks an otherwise safe deployment.
+  services.dbus = lib.mkIf (env.name == "prod") {
+    implementation = "dbus";
   };
 
   systemd.tmpfiles.rules = [
     "d ${env.dataDir} 0775 root st0x -"
     "d ${env.dataDir}/logs 0775 root st0x -"
+    "d ${env.dataDir}/secrets 0700 root root -"
   ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 

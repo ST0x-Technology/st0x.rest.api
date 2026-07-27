@@ -42,6 +42,8 @@
         # (reconcile-scrape-targets.sh in terraform/modules/observability) + the
         # tag:st0x-rest-api policy in terraform/tailscale/policy.hujson.
         tailnetHostname = "st0x-rest-api-nixos";
+        posthogHost = "https://eu.i.posthog.com";
+        posthogProjectToken = "phc_G9J1fkYy3hYegFjBpIbFKo9Y5vznggbYe7SLSD1jf0j";
       };
 
       nixosConfigurations.st0x-rest-api-preview = mkNixosConfiguration {
@@ -99,7 +101,7 @@
             name = "rs-test";
             body = ''
               set -euxo pipefail
-              cargo test --workspace
+              cargo test --workspace --features oracle-integration-tests
             '';
           };
           inherit (infraPkgs)

@@ -29,8 +29,8 @@ rec {
     # edit the secret) plus that droplet's own host key (to decrypt it at NixOS
     # activation). Used by secret/secrets.nix for the tailscale auth keys.
     service = {
-      prod = [ st0x-op host ];
-      preview = [ st0x-op host-preview ];
+      prod = [ st0x-op arda host ];
+      preview = [ st0x-op arda host-preview ];
     };
   };
 }

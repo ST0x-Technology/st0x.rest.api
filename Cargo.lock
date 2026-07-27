@@ -80,6 +80,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-json-rpc",
  "alloy-network",
+ "alloy-node-bindings",
  "alloy-provider",
  "alloy-rpc-client",
  "alloy-rpc-types",
@@ -290,6 +291,19 @@ dependencies = [
 
 [[package]]
 name = "alloy-hardforks"
+version = "0.2.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165210652f71dfc094b051602bafd691f506c54050a174b1cba18fb5ef706a3"
+dependencies = [
+ "alloy-chains",
+ "alloy-eip2124",
+ "alloy-primitives 1.6.0",
+ "auto_impl",
+ "dyn-clone",
+]
+
+[[package]]
+name = "alloy-hardforks"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83ba208044232d14d4adbfa77e57d6329f51bc1acc21f5667bb7db72d88a0831"
@@ -380,6 +394,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-node-bindings"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b2fda91b56bb08907cd44c5068130360e027e46a8c17612d386869fa7940be"
+dependencies = [
+ "alloy-genesis",
+ "alloy-hardforks 0.2.13",
+ "alloy-network",
+ "alloy-primitives 1.6.0",
+ "alloy-signer",
+ "alloy-signer-local",
+ "k256",
+ "libc",
+ "rand 0.8.5",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.12",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "alloy-primitives"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -465,8 +501,10 @@ dependencies = [
  "alloy-json-rpc",
  "alloy-network",
  "alloy-network-primitives",
+ "alloy-node-bindings",
  "alloy-primitives 1.6.0",
  "alloy-rpc-client",
+ "alloy-rpc-types-anvil",
  "alloy-rpc-types-eth",
  "alloy-signer",
  "alloy-sol-types 1.6.0",
@@ -545,6 +583,18 @@ checksum = "4faad925d3a669ffc15f43b3deec7fbdf2adeb28a4d6f9cf4bc661698c0f8f4b"
 dependencies = [
  "alloy-primitives 1.6.0",
  "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "alloy-serde",
+ "serde",
+]
+
+[[package]]
+name = "alloy-rpc-types-anvil"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47df51bedb3e6062cb9981187a51e86d0d64a4de66eb0855e9efe6574b044ddf"
+dependencies = [
+ "alloy-primitives 1.6.0",
  "alloy-rpc-types-eth",
  "alloy-serde",
  "serde",
@@ -2748,7 +2798,7 @@ checksum = "198b205ccbd3e54041e9a145374a6e170c71deb6d4c84dede8cd504a75694ad6"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
- "alloy-hardforks",
+ "alloy-hardforks 0.4.7",
  "alloy-primitives 1.6.0",
  "alloy-provider",
  "alloy-rpc-types",
@@ -5470,6 +5520,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "raindex_test_fixtures"
+version = "0.0.0-alpha.0"
+dependencies = [
+ "alloy",
+ "getrandom 0.2.16",
+ "rain-math-float",
+ "rainlang_test_fixtures",
+ "serde_json",
+]
+
+[[package]]
 name = "rainlang-eval"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5514,6 +5575,15 @@ dependencies = [
  "rainlang_dispair",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rainlang_test_fixtures"
+version = "0.0.0"
+source = "git+https://github.com/rainlanguage/rainlang?rev=580205d244a94097b06602ecda36faedf54d7775#580205d244a94097b06602ecda36faedf54d7775"
+dependencies = [
+ "alloy",
+ "getrandom 0.2.16",
 ]
 
 [[package]]
@@ -7232,6 +7302,7 @@ dependencies = [
  "raindex_bindings",
  "raindex_common",
  "raindex_js_api",
+ "raindex_test_fixtures",
  "rand 0.9.1",
  "reqwest 0.12.20",
  "reqwest 0.13.2",

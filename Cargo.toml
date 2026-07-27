@@ -3,6 +3,11 @@ name = "st0x_rest_api"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# The full-EVM calldata regression fixture is intentionally excluded from
+# production builds and enabled explicitly by CI and the rs-test command.
+oracle-integration-tests = ["dep:raindex_test_fixtures"]
+
 [dependencies]
 rocket = { version = "0.5.1", features = ["json"] }
 rocket_cors = "0.6"
@@ -55,6 +60,7 @@ url = { version = "2", features = ["serde"] }
 # pins reqwest 0.12, so bring a matching 0.12 in under a rename — the crate's
 # direct `reqwest` above is 0.13 and their client types would not otherwise unify.
 otlp-reqwest = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "gzip", "rustls-tls"] }
+raindex_test_fixtures = { path = "lib/rain.orderbook/crates/test_fixtures", optional = true }
 
 [dev-dependencies]
 tracing-test = "0.2"

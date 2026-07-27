@@ -18,10 +18,12 @@ let
   tfSecretVars = "infra/zz_secret.auto.tfvars";
   tfPlanFile = "infra/tfplan";
   previewVolumeAddr = "digitalocean_volume.preview_data[0]";
+  previewVolumeAttachmentAddr = "digitalocean_volume_attachment.preview_data[0]";
   previewVolumeId = "475f705e-54f8-11f1-9077-0a58ac129076";
   previewDropletAddr = "digitalocean_droplet.preview_nixos[0]";
   previewDropletId = "572288021";
   previewReservedIpAddr = "digitalocean_reserved_ip.preview_nixos[0]";
+  previewReservedIpAssignmentAddr = "digitalocean_reserved_ip_assignment.preview_nixos[0]";
   previewReservedIp = "138.197.53.151";
 
   parseIdentity = ''
@@ -150,9 +152,24 @@ let
     }
 
     terraform -chdir=infra init
-    import_if_needed '${previewVolumeAddr}' '${previewVolumeId}'
-    import_if_needed '${previewDropletAddr}' '${previewDropletId}' true
-    import_if_needed '${previewReservedIpAddr}' '${previewReservedIp}'
+
+    if [ "''${RESET_PREVIEW_STATE:-false}" = "true" ]; then
+      echo "Forgetting preview infrastructure from Terraform state before recreation"
+      for addr in \
+        '${previewReservedIpAssignmentAddr}' \
+        '${previewVolumeAttachmentAddr}' \
+        '${previewDropletAddr}' \
+        '${previewReservedIpAddr}' \
+        '${previewVolumeAddr}'; do
+        if terraform -chdir=infra state list | grep -Fxq "$addr"; then
+          terraform -chdir=infra state rm "$addr"
+        fi
+      done
+    else
+      import_if_needed '${previewVolumeAddr}' '${previewVolumeId}'
+      import_if_needed '${previewDropletAddr}' '${previewDropletId}' true
+      import_if_needed '${previewReservedIpAddr}' '${previewReservedIp}'
+    fi
 
     if [ "''${RECREATE_PREVIEW_HOST:-false}" = "true" ]; then
       terraform -chdir=infra plan \

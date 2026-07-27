@@ -1,7 +1,9 @@
 #[macro_use]
 extern crate rocket;
 
+mod analytics;
 mod app_state;
+mod attribution;
 mod auth;
 mod cache;
 mod catchers;
@@ -56,6 +58,34 @@ enum StartupError {
     Cors(#[from] rocket_cors::Error),
 }
 
+const ATTRIBUTION_SIGNER_CREDENTIAL: &str = "attribution-signer";
+
+fn load_attribution_signer_key() -> Result<String, String> {
+    if let Ok(key) = std::env::var("ST0X_GATING_SIGNER_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Ok(key.to_string());
+        }
+    }
+
+    let credentials_directory = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
+        "ST0X_GATING_SIGNER_KEY or a systemd attribution-signer credential is required".to_string()
+    })?;
+    let credential_path =
+        std::path::Path::new(&credentials_directory).join(ATTRIBUTION_SIGNER_CREDENTIAL);
+    let key = std::fs::read_to_string(&credential_path).map_err(|error| {
+        format!(
+            "failed to read attribution signer credential {}: {error}",
+            credential_path.display()
+        )
+    })?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("attribution signer credential is empty".to_string());
+    }
+    Ok(key.to_string())
+}
+
 #[derive(Debug, thiserror::Error)]
 enum StartupRegistryError {
     #[error("failed to read private registry artifact")]
@@ -89,6 +119,7 @@ enum StartupRegistryError {
         routes::tokens::get_token_details_by_address,
         routes::tokens::get_token_proofs,
         routes::swap::post_swap_quote,
+        routes::swap::post_swap_quote_v2,
         routes::swap::post_swap_calldata,
         routes::swap::post_swap_calldata_v2,
         routes::order::post_order_dca,
@@ -160,6 +191,7 @@ pub(crate) fn rocket(
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     app_state: app_state::ApplicationState,
+    analytics: analytics::Analytics,
     docs_dir: String,
     usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
@@ -174,6 +206,7 @@ pub(crate) fn rocket(
         .manage(rate_limiter)
         .manage(raindex_config)
         .manage(app_state)
+        .manage(analytics)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/swap", routes::swap::routes())
@@ -192,6 +225,7 @@ pub(crate) fn rocket(
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger::new(usage_log_max_concurrency))
+        .attach(fairings::AnalyticsFairing)
         .attach(fairings::RateLimitHeadersFairing)
         .attach(cors))
 }
@@ -406,14 +440,42 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let app_state =
-                app_state::ApplicationState::new(registry_artifact_store, response_caches);
+            let attribution_key = match load_attribution_signer_key() {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::error!(%error, "failed to load attribution signer key");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let attribution_signer =
+                match attribution::AttributionSigner::from_hex_key(&attribution_key) {
+                    Ok(signer) => signer,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to initialize attribution signer");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
+            tracing::info!(
+                signer = %attribution_signer.address(),
+                "attribution signer loaded"
+            );
+            let attribution_state = attribution::AttributionState::new(attribution_signer);
+            let app_state = app_state::ApplicationState::new(
+                registry_artifact_store,
+                response_caches,
+                attribution_state,
+            );
+
+            let analytics = analytics::Analytics::from_env();
 
             let rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
                 app_state,
+                analytics,
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
             ) {
@@ -463,6 +525,7 @@ mod tests {
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
         let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+        let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
@@ -485,14 +548,80 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
+        assert_eq!(swap_quote_v2_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_quote_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SwapQuoteV2RequestBody"
+        );
+        assert_eq!(
+            schemas["SwapQuoteV2RequestBody"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/SwapQuoteV2PriceCapRequest" },
+                { "$ref": "#/components/schemas/SwapQuoteV2SlippageRequest" }
+            ])
+        );
+        assert!(
+            schemas["SwapQuoteV2SlippageRequest"]["allOf"][1]["properties"]["slippageBps"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert!(
+            schemas["SwapQuoteV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("input-token-per-output-token"))
+        );
         assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
         assert_eq!(
             swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SwapCalldataV2Request"
+            "#/components/schemas/SwapCalldataV2RequestBody"
         );
         assert_eq!(
             schemas["SwapCalldataMode"]["enum"],
             serde_json::json!(["buyUpTo", "spendExact", "spendUpTo"])
+        );
+        assert_eq!(
+            swap_calldata_v2_path["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/SwapCalldataV2Response"
+        );
+        assert_eq!(
+            schemas["SwapCalldataV2RequestBody"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/SwapCalldataV2PriceCapRequest" },
+                { "$ref": "#/components/schemas/SwapCalldataV2SlippageRequest" }
+            ])
+        );
+        assert!(
+            schemas["SwapCalldataV2PriceCapRequest"]["allOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("priceCap")))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("slippageBps")))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                .is_object()
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["slippageBps"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("input-token-per-output-token"))
+        );
+        assert!(
+            schemas["SwapCalldataV2Response"]["allOf"][1]["properties"]["resolvedPriceCap"]
+                .is_object()
         );
     }
 
