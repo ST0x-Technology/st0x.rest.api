@@ -304,8 +304,9 @@ If the `approvals` array is **not empty**, send the approval transactions first:
 2. Wait for confirmation
 3. **Call the calldata endpoint again** with the first response's
    `resolvedPriceCap` as `priceCap`. Omit `slippageBps` and `referenceIoRatio`.
+   Preserve the original `denomination`, including when it is `"unwrapped"`.
    With approvals in place, the response will now contain the swap calldata
-   while preserving the original price limit
+   while preserving the original units and price limit
 
 ## Step 4: Execute the Swap
 
@@ -326,7 +327,8 @@ QUOTE=$(curl -s -X POST https://api.st0x.io/v2/swap/quote \
     "mode": "buyUpTo",
     "amount": "1.0",
     "slippageBps": 50,
-    "referenceIoRatio": "2500"
+    "referenceIoRatio": "2500",
+    "denomination": "wrapped"
   }')
 
 echo "$QUOTE" | jq '{estimatedInput, estimatedOutput, estimatedIoRatio, fullyFilled, resolvedPriceCap}'
@@ -342,7 +344,8 @@ CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
     "mode": "buyUpTo",
     "amount": "1.0",
     "slippageBps": 50,
-    "referenceIoRatio": "2500"
+    "referenceIoRatio": "2500",
+    "denomination": "wrapped"
   }')
 
 RESOLVED_PRICE_CAP=$(echo "$CALLDATA" | jq -r '.resolvedPriceCap')
@@ -367,7 +370,8 @@ if [ "$APPROVALS" != "[]" ]; then
       "outputToken": "0x4200000000000000000000000000000000000006",
       "mode": "buyUpTo",
       "amount": "1.0",
-      "priceCap": "'"$RESOLVED_PRICE_CAP"'"
+      "priceCap": "'"$RESOLVED_PRICE_CAP"'",
+      "denomination": "wrapped"
     }')
 fi
 
