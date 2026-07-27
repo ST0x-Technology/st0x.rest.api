@@ -15,10 +15,8 @@ rec {
     # Preview droplet SSH host public key. `host` above is the prod droplet's.
     # The preview box is reprovisioned dynamically and its host key is supplied
     # to deploys via the PREVIEW_SSH_HOST_KEY secret (see deploy-preview.yaml).
-    # TODO(dev handoff): replace with the preview droplet's real host key so
-    # `secret/tailscale-authkey-preview.age` can be encrypted to it — until then
-    # the preview auth-key secret cannot be created.
-    host-preview = "ssh-ed25519 REPLACE_WITH_PREVIEW_DROPLET_HOST_KEY";
+    host-preview =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINuFNiHYDYFtuxx01AHwL0IB3W069pJ7ser8NNwn1iSx";
   };
 
   roles = with keys; {
