@@ -85,8 +85,22 @@ impl Fairing for RequestLogger {
 
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
         let meta = req.local_cache(fallback_meta);
-        let duration_ms = meta.start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed = meta.start.elapsed();
+        let duration_ms = elapsed.as_secs_f64() * 1000.0;
         let status = res.status().code;
+
+        // Emit a request metric keyed by the matched route pattern (not the raw
+        // URI) so label cardinality stays bounded.
+        let endpoint = req
+            .route()
+            .map(|route| route.uri.to_string())
+            .unwrap_or_else(|| "unmatched".to_string());
+        crate::metrics::record_request(
+            req.method().as_str(),
+            &endpoint,
+            status,
+            elapsed.as_secs_f64(),
+        );
 
         meta.span.in_scope(|| {
             if status >= 500 {

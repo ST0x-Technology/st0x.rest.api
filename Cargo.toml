@@ -44,7 +44,22 @@ rain_orderbook_bindings = { package = "raindex_bindings", path = "lib/rain.order
 rain-erc = { git = "https://github.com/rainlanguage/rain.erc", rev = "755b0bf5cad18a2cc43a57be52298b6dadd96751" }
 rain-math-float = "0.1.7"
 wasm-bindgen = "=0.2.122"
-url = "2"
+
+# Observability: Prometheus metrics (pull) + OTLP logs/traces (push to the
+# self-hosted VictoriaMetrics/Logs/Traces stack over the tailnet).
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+opentelemetry = "0.30"
+opentelemetry-appender-tracing = "0.30"
+opentelemetry-otlp = { version = "0.30", features = ["logs", "trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "logs"] }
+tracing-opentelemetry = "0.31"
+url = { version = "2", features = ["serde"] }
+# OTLP's batch exporters run outside the tokio runtime and need reqwest::blocking
+# (an async client panics with "no reactor running"). opentelemetry-otlp 0.30
+# pins reqwest 0.12, so bring a matching 0.12 in under a rename — the crate's
+# direct `reqwest` above is 0.13 and their client types would not otherwise unify.
+otlp-reqwest = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "gzip", "rustls-tls"] }
 raindex_test_fixtures = { path = "lib/rain.orderbook/crates/test_fixtures", optional = true }
 
 [dev-dependencies]
