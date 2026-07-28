@@ -17,6 +17,12 @@ pub struct Config {
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,
     pub local_db_path: String,
+    #[serde(default)]
+    pub attribution_start_block: Option<u64>,
+    #[serde(default = "default_attribution_sync_interval_seconds")]
+    pub attribution_sync_interval_seconds: u64,
+    #[serde(default = "default_attribution_sync_batch_size")]
+    pub attribution_sync_batch_size: u32,
     /// OTLP export target. Absent ⇒ console + file logging only (no push to the
     /// observability stack). Non-secret plaintext (tailnet endpoints).
     #[serde(default)]
@@ -35,6 +41,14 @@ pub struct TelemetryConfig {
     pub environment: String,
     pub traces_endpoint: Url,
     pub logs_endpoint: Url,
+}
+
+fn default_attribution_sync_interval_seconds() -> u64 {
+    60
+}
+
+fn default_attribution_sync_batch_size() -> u32 {
+    250
 }
 
 impl Config {

@@ -4,7 +4,7 @@
 //! signed by the REST API so an off-chain indexer can attribute an executed
 //! transaction to the API key that requested its calldata.
 
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{keccak256, Address, Bytes, Signature, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer as AlloySigner;
 use rain_orderbook_bindings::IRaindexV6::SignedContextV1;
@@ -131,10 +131,33 @@ pub(crate) fn u64_to_b256(value: u64) -> B256 {
     B256::from(U256::from(value))
 }
 
+pub(crate) fn verify_signed_attribution(
+    signed_context: &SignedContextV1,
+    expected_signer: Address,
+    taker: Address,
+    order_hash: B256,
+) -> Option<B256> {
+    if signed_context.signer != expected_signer {
+        return None;
+    }
+    let context: [B256; ATTRIBUTION_CONTEXT_WORDS] =
+        signed_context.context.clone().try_into().ok()?;
+    if context[0] != u64_to_b256(ATTRIBUTION_SCHEMA_VERSION)
+        || context[2] != address_to_b256(taker)
+        || context[3] != order_hash
+    {
+        return None;
+    }
+    let signature = Signature::try_from(signed_context.signature.as_ref()).ok()?;
+    let hash = attribution_message_hash(&context);
+    let recovered = signature.recover_address_from_msg(hash.as_slice()).ok()?;
+    (recovered == expected_signer).then_some(context[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, Signature};
+    use alloy::primitives::address;
 
     const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const TEST_ADDRESS: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
@@ -182,6 +205,10 @@ mod tests {
                 .recover_address_from_msg(context_hash.as_slice())
                 .unwrap(),
             signer.address()
+        );
+        assert_eq!(
+            verify_signed_attribution(&signed, signer.address(), attribution.taker, order_hash),
+            Some(attribution.api_key_hash)
         );
     }
 }

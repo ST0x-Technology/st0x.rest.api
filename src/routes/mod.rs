@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod attribution_admin;
 pub mod health;
 pub mod order;
 pub mod orders;

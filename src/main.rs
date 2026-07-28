@@ -4,6 +4,7 @@ extern crate rocket;
 mod analytics;
 mod app_state;
 mod attribution;
+mod attribution_reporting;
 mod auth;
 mod cache;
 mod catchers;
@@ -132,6 +133,8 @@ enum StartupRegistryError {
         routes::vaults::get_vaults,
         routes::vaults::get_vault_totals,
         routes::admin::put_registry,
+        routes::attribution_admin::get_attributed_executions,
+        routes::attribution_admin::get_attribution_volume,
         routes::trades::get_by_tx::get_trades_by_tx,
         routes::trades::get_by_order_hashes::get_trades_by_order_hashes,
         routes::trades::get_by_token::get_trades_by_token,
@@ -217,6 +220,7 @@ pub(crate) fn rocket(
         .mount("/v1/trades", routes::trades::routes())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
+        .mount("/admin/attribution", routes::attribution_admin::routes())
         .mount("/docs", FileServer::new(docs_dir, options))
         .mount(
             "/",
@@ -461,6 +465,7 @@ async fn main() {
                 signer = %attribution_signer.address(),
                 "attribution signer loaded"
             );
+            let attribution_signer_address = attribution_signer.address();
             let attribution_state = attribution::AttributionState::new(attribution_signer);
             let app_state = app_state::ApplicationState::new(
                 registry_artifact_store,
@@ -470,7 +475,8 @@ async fn main() {
 
             let analytics = analytics::Analytics::from_env();
 
-            let rocket = match rocket(
+            let attribution_pool = pool.clone();
+            let mut rocket = match rocket(
                 pool,
                 rate_limiter,
                 shared_raindex,
@@ -486,6 +492,25 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+
+            if let Some(start_block) = cfg.attribution_start_block {
+                tracing::info!(
+                    start_block,
+                    interval_seconds = cfg.attribution_sync_interval_seconds,
+                    batch_size = cfg.attribution_sync_batch_size,
+                    "confirmed trade attribution worker enabled"
+                );
+                rocket = rocket.attach(attribution_reporting::AttributionWorker::new(
+                    attribution_pool,
+                    std::path::PathBuf::from(&cfg.local_db_path),
+                    attribution_signer_address,
+                    start_block,
+                    std::time::Duration::from_secs(cfg.attribution_sync_interval_seconds.max(1)),
+                    cfg.attribution_sync_batch_size,
+                ));
+            } else {
+                tracing::info!("confirmed trade attribution worker disabled");
+            }
 
             if let Err(e) = rocket.launch().await {
                 tracing::error!(error = %e, "Rocket launch failed");
@@ -641,6 +666,48 @@ mod tests {
             .any(|parameter| parameter["name"] == "activity_limit"));
     }
 
+    #[test]
+    fn test_openapi_documents_attribution_query_names() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+        let execution_parameters = openapi["paths"]["/admin/attribution/executions"]["get"]
+            ["parameters"]
+            .as_array()
+            .expect("parameters is an array");
+        let execution_names: Vec<&str> = execution_parameters
+            .iter()
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert!(execution_names.contains(&"apiKeyHash"));
+        assert!(execution_names.contains(&"transactionHash"));
+        assert!(execution_names.contains(&"beforeBlock"));
+        assert!(execution_names.contains(&"beforeLogIndex"));
+        assert!(execution_names.contains(&"beforeTradeId"));
+        assert!(!execution_names.contains(&"api_key_hash"));
+
+        let volume_parameters = openapi["paths"]["/admin/attribution/volume"]["get"]["parameters"]
+            .as_array()
+            .expect("parameters is an array");
+        let volume_names: Vec<&str> = volume_parameters
+            .iter()
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert!(volume_names.contains(&"limit"));
+        assert!(volume_names.contains(&"afterApiKeyHash"));
+        assert!(volume_names.contains(&"afterChainId"));
+        assert!(volume_names.contains(&"afterInputToken"));
+        assert!(volume_names.contains(&"afterOutputToken"));
+
+        let schemas = &openapi["components"]["schemas"];
+        assert_eq!(
+            schemas["AttributedExecution"]["properties"]["apiKeyLabel"]["description"],
+            "API key identity captured when this execution was attributed."
+        );
+        assert_eq!(
+            schemas["AttributionVolume"]["properties"]["apiKeyLabel"]["description"],
+            "Latest known identity for this API key hash, rather than an execution-time snapshot."
+        );
+    }
+
     fn test_config(
         registry_url: String,
         private_registry_path: std::path::PathBuf,
@@ -662,6 +729,9 @@ mod tests {
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
             telemetry: None,
+            attribution_start_block: None,
+            attribution_sync_interval_seconds: 60,
+            attribution_sync_batch_size: 250,
         }
     }
 
