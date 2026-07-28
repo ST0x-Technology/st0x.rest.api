@@ -4,12 +4,80 @@ use rocket::response::Responder;
 use rocket::serde::json::Json;
 use rocket::{Request, Response};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use utoipa::ToSchema;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiErrorCode {
+    BadRequest,
+    UnprocessableEntity,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    InternalError,
+    RateLimited,
+    NotYetIndexed,
+    SwapUnsupportedToken,
+    SwapNoLiquidity,
+    SwapQuoteFailed,
+    SwapPreflightFailed,
+    SwapCalldataFailed,
+    OrdersQueryFailed,
+    UpstreamUnavailable,
+}
+
+impl ApiErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BadRequest => "BAD_REQUEST",
+            Self::UnprocessableEntity => "UNPROCESSABLE_ENTITY",
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::Forbidden => "FORBIDDEN",
+            Self::NotFound => "NOT_FOUND",
+            Self::InternalError => "INTERNAL_ERROR",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::NotYetIndexed => "NOT_YET_INDEXED",
+            Self::SwapUnsupportedToken => "SWAP_UNSUPPORTED_TOKEN",
+            Self::SwapNoLiquidity => "SWAP_NO_LIQUIDITY",
+            Self::SwapQuoteFailed => "SWAP_QUOTE_FAILED",
+            Self::SwapPreflightFailed => "SWAP_PREFLIGHT_FAILED",
+            Self::SwapCalldataFailed => "SWAP_CALLDATA_FAILED",
+            Self::OrdersQueryFailed => "ORDERS_QUERY_FAILED",
+            Self::UpstreamUnavailable => "UPSTREAM_UNAVAILABLE",
+        }
+    }
+
+    pub const fn status(self) -> Status {
+        match self {
+            Self::BadRequest | Self::SwapUnsupportedToken | Self::SwapPreflightFailed => {
+                Status::BadRequest
+            }
+            Self::UnprocessableEntity => Status::UnprocessableEntity,
+            Self::Unauthorized => Status::Unauthorized,
+            Self::Forbidden => Status::Forbidden,
+            Self::NotFound | Self::SwapNoLiquidity => Status::NotFound,
+            Self::RateLimited => Status::TooManyRequests,
+            Self::NotYetIndexed => Status::Accepted,
+            Self::OrdersQueryFailed => Status::BadGateway,
+            Self::UpstreamUnavailable => Status::ServiceUnavailable,
+            Self::InternalError | Self::SwapQuoteFailed | Self::SwapCalldataFailed => {
+                Status::InternalServerError
+            }
+        }
+    }
+}
+
+impl fmt::Display for ApiErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiErrorDetail {
     #[schema(example = "BAD_REQUEST")]
-    pub code: String,
+    pub code: ApiErrorCode,
     #[schema(example = "Something went wrong")]
     pub message: String,
 }
@@ -41,15 +109,16 @@ pub enum ApiError {
 
 impl<'r> Responder<'r, 'static> for ApiError {
     fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let (status, code, message) = match &self {
-            ApiError::BadRequest(msg) => (Status::BadRequest, "BAD_REQUEST", msg.clone()),
-            ApiError::Unauthorized(msg) => (Status::Unauthorized, "UNAUTHORIZED", msg.clone()),
-            ApiError::Forbidden(msg) => (Status::Forbidden, "FORBIDDEN", msg.clone()),
-            ApiError::NotFound(msg) => (Status::NotFound, "NOT_FOUND", msg.clone()),
-            ApiError::Internal(msg) => (Status::InternalServerError, "INTERNAL_ERROR", msg.clone()),
-            ApiError::RateLimited(msg) => (Status::TooManyRequests, "RATE_LIMITED", msg.clone()),
-            ApiError::NotYetIndexed(msg) => (Status::Accepted, "NOT_YET_INDEXED", msg.clone()),
+        let (code, message) = match &self {
+            ApiError::BadRequest(msg) => (ApiErrorCode::BadRequest, msg.clone()),
+            ApiError::Unauthorized(msg) => (ApiErrorCode::Unauthorized, msg.clone()),
+            ApiError::Forbidden(msg) => (ApiErrorCode::Forbidden, msg.clone()),
+            ApiError::NotFound(msg) => (ApiErrorCode::NotFound, msg.clone()),
+            ApiError::Internal(msg) => (ApiErrorCode::InternalError, msg.clone()),
+            ApiError::RateLimited(msg) => (ApiErrorCode::RateLimited, msg.clone()),
+            ApiError::NotYetIndexed(msg) => (ApiErrorCode::NotYetIndexed, msg.clone()),
         };
+        let status = code.status();
         let span = request_span_for(req);
         span.in_scope(|| {
             if status.code >= 500 {
@@ -59,7 +128,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
                     error_message = %message,
                     "request failed"
                 );
-            } else if matches!(self, ApiError::NotYetIndexed(_)) {
+            } else if code == ApiErrorCode::NotYetIndexed {
                 tracing::info!(
                     status = status.code,
                     code = %code,
@@ -79,10 +148,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
         let request_id = request_id_for(req);
         let body = ApiErrorResponse {
             request_id,
-            error: ApiErrorDetail {
-                code: code.to_string(),
-                message,
-            },
+            error: ApiErrorDetail { code, message },
         };
         let json_response = match Json(body).respond_to(req) {
             Ok(r) => r,
@@ -94,7 +160,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
         let mut response = Response::build_from(json_response)
             .status(status)
             .finalize();
-        if matches!(self, ApiError::RateLimited(_)) {
+        if code == ApiErrorCode::RateLimited {
             response.set_header(Header::new("Retry-After", "60"));
         }
         Ok(response)
@@ -104,6 +170,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fairings::RequestLogger;
     use rocket::local::blocking::Client;
 
     #[get("/bad-request")]
@@ -122,12 +189,13 @@ mod tests {
     fn internal() -> Result<(), ApiError> {
         Err(ApiError::Internal("something broke".into()))
     }
-
     fn error_client() -> Client {
-        let rocket = rocket::build().mount(
-            "/",
-            rocket::routes![bad_request, unauthorized, not_found, internal],
-        );
+        let rocket = rocket::build()
+            .mount(
+                "/",
+                rocket::routes![bad_request, unauthorized, not_found, internal],
+            )
+            .attach(RequestLogger);
         Client::tracked(rocket).expect("valid rocket instance")
     }
 
@@ -140,9 +208,14 @@ mod tests {
     ) {
         let response = client.get(path).dispatch();
         assert_eq!(response.status().code, expected_status);
+        let request_id = response
+            .headers()
+            .get_one("X-Request-Id")
+            .expect("request id response header")
+            .to_string();
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().unwrap()).unwrap();
-        assert!(body["request_id"].is_string());
+        assert_eq!(body["request_id"], request_id);
         assert_eq!(body["error"]["code"], expected_code);
         assert_eq!(body["error"]["message"], expected_message);
     }
@@ -175,5 +248,21 @@ mod tests {
             "INTERNAL_ERROR",
             "something broke",
         );
+    }
+
+    #[test]
+    fn test_catalog_serializes_stable_codes() {
+        let cases = [
+            (ApiErrorCode::BadRequest, "\"BAD_REQUEST\""),
+            (ApiErrorCode::SwapQuoteFailed, "\"SWAP_QUOTE_FAILED\""),
+            (
+                ApiErrorCode::UpstreamUnavailable,
+                "\"UPSTREAM_UNAVAILABLE\"",
+            ),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(serde_json::to_string(&code).unwrap(), expected);
+        }
     }
 }

@@ -1,4 +1,4 @@
-use crate::error::{ApiErrorDetail, ApiErrorResponse};
+use crate::error::{ApiErrorCode, ApiErrorDetail, ApiErrorResponse};
 use crate::fairings::{request_id_for, request_span_for};
 use rocket::http::Header;
 use rocket::response::Responder;
@@ -16,7 +16,7 @@ pub fn bad_request(req: &Request<'_>) -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "BAD_REQUEST".to_string(),
+            code: ApiErrorCode::BadRequest,
             message: "The request was invalid or malformed".to_string(),
         },
     })
@@ -30,7 +30,7 @@ pub fn unauthorized(req: &Request<'_>) -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "UNAUTHORIZED".to_string(),
+            code: ApiErrorCode::Unauthorized,
             message: "Missing or invalid credentials".to_string(),
         },
     })
@@ -44,7 +44,7 @@ pub fn forbidden(req: &Request<'_>) -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "FORBIDDEN".to_string(),
+            code: ApiErrorCode::Forbidden,
             message: "Insufficient permissions".to_string(),
         },
     })
@@ -58,7 +58,7 @@ pub fn not_found(req: &Request<'_>) -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "NOT_FOUND".to_string(),
+            code: ApiErrorCode::NotFound,
             message: "The requested resource was not found".to_string(),
         },
     })
@@ -72,7 +72,7 @@ pub fn unprocessable_entity(req: &Request<'_>) -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "UNPROCESSABLE_ENTITY".to_string(),
+            code: ApiErrorCode::UnprocessableEntity,
             message: "Request body could not be parsed".to_string(),
         },
     })
@@ -96,7 +96,7 @@ pub fn too_many_requests(req: &Request<'_>) -> RateLimitedResponse {
     RateLimitedResponse(Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "RATE_LIMITED".to_string(),
+            code: ApiErrorCode::RateLimited,
             message: "Too many requests, please try again later".to_string(),
         },
     }))
@@ -110,7 +110,7 @@ pub fn internal_server_error(req: &Request<'_>) -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         request_id: request_id_for(req),
         error: ApiErrorDetail {
-            code: "INTERNAL_ERROR".to_string(),
+            code: ApiErrorCode::InternalError,
             message: "Internal server error".to_string(),
         },
     })
