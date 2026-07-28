@@ -3,7 +3,7 @@ use crate::analytics::{swap_quoted_event, swap_quoted_v2_event, Analytics};
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::swap::denomination::{
     denormalize_calldata_price_cap, normalize_calldata_price_cap,
@@ -37,6 +37,7 @@ use tracing::Instrument;
         (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
@@ -159,24 +160,25 @@ async fn process_swap_quote(
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
     ds.validate_supported_tokens(req.input_token, req.output_token)
-        .await?;
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let orders = ds
         .get_orders_for_pair(req.input_token, req.output_token)
-        .await?;
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
 
     if orders.is_empty() {
-        return Err(ApiError::NotFound(
-            "no liquidity found for this pair".into(),
-        ));
+        return Err(no_liquidity_error());
     }
 
     let candidates = ds
         .build_candidates_for_pair(&orders, req.input_token, req.output_token, Address::ZERO)
-        .await?;
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     if candidates.is_empty() {
-        return Err(ApiError::NotFound("no valid quotes available".into()));
+        return Err(no_liquidity_error());
     }
 
     let buy_target = Float::parse(req.output_amount.clone()).map_err(|e| {
@@ -186,16 +188,16 @@ async fn process_swap_quote(
 
     let price_cap = Float::max_positive_value().map_err(|e| {
         tracing::error!(error = %e, "failed to create price cap");
-        ApiError::Internal("failed to create price cap".into())
+        quote_failed_error()
     })?;
 
     let sim = simulate_buy_over_candidates(candidates, buy_target, price_cap).map_err(|e| {
         tracing::error!(error = %e, "failed to simulate swap");
-        ApiError::Internal("failed to simulate swap".into())
+        quote_failed_error()
     })?;
 
     if sim.legs.is_empty() {
-        return Err(ApiError::NotFound("no valid quotes available".into()));
+        return Err(no_liquidity_error());
     }
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
@@ -206,26 +208,27 @@ async fn process_swap_quote(
         sim.total_input,
         sim.total_output,
     )
-    .await?;
+    .await
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let blended_ratio = estimated_input.div(estimated_output).map_err(|e| {
         tracing::error!(error = %e, "failed to compute blended ratio");
-        ApiError::Internal("failed to compute ratio".into())
+        quote_failed_error()
     })?;
 
     let formatted_output = estimated_output.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated output");
-        ApiError::Internal("failed to format estimated output".into())
+        quote_failed_error()
     })?;
 
     let formatted_input = estimated_input.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated input");
-        ApiError::Internal("failed to format estimated input".into())
+        quote_failed_error()
     })?;
 
     let formatted_ratio = blended_ratio.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format ratio");
-        ApiError::Internal("failed to format ratio".into())
+        quote_failed_error()
     })?;
 
     Ok(SwapQuoteResponse {
@@ -244,7 +247,8 @@ async fn process_swap_quote_v2(
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
     ds.validate_supported_tokens(req.input_token, req.output_token)
-        .await?;
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let mode: TakeOrdersMode = req.mode.into();
     let (amount, wrap_ratios) = normalize_calldata_request_amount(
@@ -258,17 +262,17 @@ async fn process_swap_quote_v2(
             amount_field: "amount",
         },
     )
-    .await?;
+    .await
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
     let parsed_mode =
         ParsedTakeOrdersMode::parse(mode, &amount).map_err(super::map_raindex_error)?;
 
     let orders = ds
         .get_orders_for_pair(req.input_token, req.output_token)
-        .await?;
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
     if orders.is_empty() {
-        return Err(ApiError::NotFound(
-            "no liquidity found for this pair".into(),
-        ));
+        return Err(no_liquidity_error());
     }
 
     let candidates = ds
@@ -278,9 +282,10 @@ async fn process_swap_quote_v2(
             req.output_token,
             req.taker.unwrap_or(Address::ZERO),
         )
-        .await?;
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
     if candidates.is_empty() {
-        return Err(ApiError::NotFound("no valid quotes available".into()));
+        return Err(no_liquidity_error());
     }
 
     let price_cap = match (
@@ -366,20 +371,19 @@ async fn process_swap_quote_v2(
     };
     let fully_filled = achieved_amount.eq(target_amount).map_err(|error| {
         tracing::error!(%error, "failed to compare swap quote fill amount");
-        ApiError::Internal("failed to calculate quote".into())
+        quote_failed_error()
     })?;
     if is_exact_mode && !fully_filled {
         let requested = target_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format requested quote amount");
-            ApiError::Internal("failed to calculate quote".into())
+            quote_failed_error()
         })?;
         let available = achieved_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format available quote amount");
-            ApiError::Internal("failed to calculate quote".into())
+            quote_failed_error()
         })?;
-        return Err(ApiError::NotFound(format!(
-            "insufficient liquidity: requested {requested}, available {available}"
-        )));
+        tracing::warn!(%requested, %available, "insufficient executable liquidity");
+        return Err(no_liquidity_error());
     }
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
@@ -390,10 +394,11 @@ async fn process_swap_quote_v2(
         simulation.total_input,
         simulation.total_output,
     )
-    .await?;
+    .await
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
     let estimated_io_ratio = estimated_input.div(estimated_output).map_err(|error| {
         tracing::error!(%error, "failed to compute v2 swap quote ratio");
-        ApiError::Internal("failed to compute ratio".into())
+        quote_failed_error()
     })?;
     let resolved_price_cap = denormalize_calldata_price_cap(
         price_cap,
@@ -401,12 +406,13 @@ async fn process_swap_quote_v2(
         req.input_token,
         req.output_token,
         &wrap_ratios,
-    )?;
+    )
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let format_estimate = |value: Float, label: &str| {
         value.format().map_err(|error| {
             tracing::error!(%error, label, "failed to format v2 swap quote");
-            ApiError::Internal(format!("failed to format {label}"))
+            quote_failed_error()
         })
     };
 
@@ -422,6 +428,34 @@ async fn process_swap_quote_v2(
         fully_filled,
         resolved_price_cap,
     })
+}
+
+fn no_liquidity_error() -> ApiError {
+    ApiError::coded(
+        ApiErrorCode::SwapNoLiquidity,
+        "no executable liquidity is available for this pair",
+    )
+}
+
+fn quote_failed_error() -> ApiError {
+    ApiError::coded(
+        ApiErrorCode::SwapQuoteFailed,
+        "the swap quote could not be generated",
+    )
+}
+
+fn map_quote_boundary_error(error: ApiError, fallback_code: ApiErrorCode) -> ApiError {
+    if matches!(error, ApiError::Coded { .. } | ApiError::BadRequest(_)) {
+        return error;
+    }
+    tracing::error!(%error, code = %fallback_code, "swap quote boundary failed");
+    match fallback_code {
+        ApiErrorCode::OrdersQueryFailed => ApiError::coded(
+            fallback_code,
+            "the order source could not serve this request",
+        ),
+        _ => quote_failed_error(),
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +507,13 @@ mod tests {
             reference_io_ratio: None,
             denomination: SwapDenomination::Wrapped,
         }
+    }
+
+    fn assert_error_code<T>(result: Result<T, ApiError>, expected: ApiErrorCode) {
+        assert!(matches!(
+            result,
+            Err(ApiError::Coded { code, .. }) if code == expected
+        ));
     }
 
     fn unwrapped_quote_request(
@@ -703,8 +744,7 @@ mod tests {
         let result =
             process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendExact, "8")).await;
 
-        assert!(matches!(result, Err(ApiError::NotFound(message))
-                if message.contains("requested 8, available 6")));
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
@@ -1007,7 +1047,7 @@ mod tests {
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
-        assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
@@ -1019,7 +1059,7 @@ mod tests {
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
-        assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no valid quotes")));
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
@@ -1043,23 +1083,34 @@ mod tests {
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
-        assert!(matches!(result, Err(ApiError::Internal(_))));
+        assert_error_code(result, ApiErrorCode::OrdersQueryFailed);
     }
 
     #[rocket::async_test]
     async fn test_process_swap_quote_rejects_unsupported_tokens() {
         let ds = MockSwapDataSource {
-            supported_tokens: Err(ApiError::BadRequest(
-                "unsupported token for this API".into(),
+            supported_tokens: Err(ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
             )),
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
-        assert!(
-            matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
-        );
+        assert_error_code(result, ApiErrorCode::SwapUnsupportedToken);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_registry_failure_is_not_retryable() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("invalid local registry".into())),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapQuoteFailed);
     }
 
     #[rocket::async_test]
@@ -1087,6 +1138,9 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_json::<ApiErrorResponse>().await.unwrap();
+        assert_eq!(body.error.code, ApiErrorCode::SwapUnsupportedToken);
+        assert!(!body.request_id.is_empty());
     }
 
     #[rocket::async_test]

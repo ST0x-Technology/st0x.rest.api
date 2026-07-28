@@ -533,7 +533,11 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     let error = process_swap_calldata(&data_source, request)
         .await
         .unwrap_err();
-    assert!(
-        matches!(error, ApiError::NotFound(message) if message == "no liquidity found for this pair")
-    );
+    assert!(matches!(
+        error,
+        ApiError::Coded {
+            code: ApiErrorCode::SwapNoLiquidity,
+            ..
+        }
+    ));
 }

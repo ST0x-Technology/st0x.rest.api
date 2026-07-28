@@ -37,25 +37,30 @@ dependency errors remain in structured logs.
 | 429         | `RATE_LIMITED`         | Too many requests — see [Rate Limiting](./rate-limiting.md)   |
 | 500         | `INTERNAL_ERROR`       | Unexpected server error                                       |
 
-### Reserved trade-flow codes
+### Trade-flow codes
 
-The following stable codes are reserved by the error contract. Individual trade
-endpoints begin emitting them as their failure boundaries are migrated;
-consumers must continue to handle the generic fallback codes during rollout.
+Swap and token-order endpoints emit the following stable codes at understood
+failure boundaries. Consumers should still handle generic fallback codes for
+unexpected failures outside those boundaries.
 
-| HTTP Status | Code                     | Description                                    |
-| ----------- | ------------------------ | ---------------------------------------------- |
-| 400         | `SWAP_UNSUPPORTED_TOKEN` | One or both swap tokens are unsupported        |
-| 400         | `SWAP_PREFLIGHT_FAILED`  | Swap preflight rejected the proposed execution |
-| 404         | `SWAP_NO_LIQUIDITY`      | No executable liquidity is available           |
-| 500         | `SWAP_QUOTE_FAILED`      | Quote generation failed unexpectedly           |
-| 500         | `SWAP_CALLDATA_FAILED`   | Calldata generation failed unexpectedly        |
-| 502         | `ORDERS_QUERY_FAILED`    | The order source could not serve the request   |
-| 503         | `UPSTREAM_UNAVAILABLE`   | A required upstream dependency is unavailable  |
+| HTTP Status | Code                     | Description                                   |
+| ----------- | ------------------------ | --------------------------------------------- |
+| 400         | `SWAP_UNSUPPORTED_TOKEN` | One or both swap tokens are unsupported       |
+| 404         | `SWAP_NO_LIQUIDITY`      | No executable liquidity is available          |
+| 500         | `SWAP_QUOTE_FAILED`      | Quote generation failed unexpectedly          |
+| 500         | `SWAP_CALLDATA_FAILED`   | Calldata generation failed unexpectedly       |
+| 502         | `ORDERS_QUERY_FAILED`    | The order source could not serve the request  |
+| 503         | `UPSTREAM_UNAVAILABLE`   | A required upstream dependency is unavailable |
+
+`SWAP_PREFLIGHT_FAILED` is reserved for a future typed preflight rejection
+boundary. The current Raindex dependency combines execution rejections with
+provider failures in one error variant, so the API conservatively emits
+`SWAP_CALLDATA_FAILED` instead of presenting ambiguous failures as HTTP 400.
 
 Domain codes are assigned at the boundary where the failure is understood.
-Internal dependency errors are logged with the same code and `request_id`; raw
-dependency details are not returned in domain-coded response bodies.
+Detailed dependency logs and the coded response event share the same
+`request_id`; raw dependency details are not returned in domain-coded response
+bodies.
 
 ## Examples
 

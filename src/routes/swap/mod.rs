@@ -5,7 +5,7 @@ mod slippage;
 
 use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorCode};
 use crate::types::swap::{SwapCalldataMode, SwapCalldataResponse, SwapDenomination};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
@@ -20,6 +20,7 @@ use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
+use rain_orderbook_common::rpc_client::RpcClientError;
 use rain_orderbook_common::take_orders::{
     build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate, TakeOrdersMode,
 };
@@ -101,7 +102,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     ) -> Result<(), ApiError> {
         let tokens = self.client.get_all_tokens().map_err(|e| {
             tracing::error!(error = %e, "failed to retrieve curated tokens");
-            ApiError::Internal("failed to retrieve curated tokens".into())
+            ApiError::Internal("failed to read the token registry".into())
         })?;
 
         let input_supported = tokens.values().any(|token| token.address == input_token);
@@ -119,8 +120,9 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             output_supported,
             "swap request rejected for unsupported curated tokens"
         );
-        Err(ApiError::BadRequest(
-            "unsupported token for this API".into(),
+        Err(ApiError::coded(
+            ApiErrorCode::SwapUnsupportedToken,
+            "one or both swap tokens are unsupported",
         ))
     }
 
@@ -144,7 +146,10 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders for pair");
-                ApiError::Internal("failed to query orders".into())
+                ApiError::coded(
+                    ApiErrorCode::OrdersQueryFailed,
+                    "the order source could not serve this request",
+                )
             })
     }
 
@@ -168,7 +173,10 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to build order candidates");
-                ApiError::Internal("failed to build order candidates".into())
+                ApiError::coded(
+                    ApiErrorCode::SwapQuoteFailed,
+                    "the swap quote could not be generated",
+                )
             })
         };
 
@@ -215,7 +223,10 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         } else if let Some(take_orders_info) = result.take_orders_info() {
             let expected_sell = take_orders_info.expected_sell().format().map_err(|e| {
                 tracing::error!(error = %e, "failed to format expected sell");
-                ApiError::Internal("failed to format expected sell".into())
+                ApiError::coded(
+                    ApiErrorCode::SwapCalldataFailed,
+                    "swap calldata could not be generated",
+                )
             })?;
             Ok(SwapCalldataResponse {
                 to: take_orders_info.raindex(),
@@ -226,8 +237,10 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 approvals: vec![],
             })
         } else {
-            Err(ApiError::Internal(
-                "unexpected calldata result state".into(),
+            tracing::error!("calldata provider returned an unexpected result state");
+            Err(ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
             ))
         }
     }
@@ -241,7 +254,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             .get_all_tokens()
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to retrieve curated tokens");
-                ApiError::Internal("failed to retrieve curated tokens".into())
+                ApiError::Internal("failed to read the token registry".into())
             })?
             .into_values()
             .collect();
@@ -256,7 +269,10 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
     match &e {
         RaindexError::NoLiquidity | RaindexError::InsufficientLiquidity { .. } => {
             tracing::warn!(error = %e, "no liquidity found");
-            ApiError::NotFound("no liquidity found for this pair".into())
+            ApiError::coded(
+                ApiErrorCode::SwapNoLiquidity,
+                "no executable liquidity is available for this pair",
+            )
         }
         RaindexError::SameTokenPair
         | RaindexError::NonPositiveAmount
@@ -264,15 +280,39 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
         | RaindexError::FromHexError(_)
         | RaindexError::Float(_) => {
             tracing::warn!(error = %e, "invalid request parameters");
-            ApiError::BadRequest(e.to_string())
+            ApiError::BadRequest("invalid swap parameters".into())
+        }
+        RaindexError::RaindexSubgraphClientError(_) => {
+            tracing::error!(error = %e, "order source failed during calldata generation");
+            ApiError::coded(
+                ApiErrorCode::OrdersQueryFailed,
+                "the order source could not serve this request",
+            )
+        }
+        RaindexError::RpcClientError(
+            RpcClientError::Transport(_)
+            | RpcClientError::RpcError { .. }
+            | RpcClientError::RateLimited { .. },
+        ) => {
+            tracing::error!(error = %e, "RPC unavailable during calldata generation");
+            ApiError::coded(
+                ApiErrorCode::UpstreamUnavailable,
+                "a required chain data provider is temporarily unavailable",
+            )
         }
         RaindexError::PreflightError(_) => {
-            tracing::warn!(error = %e, "preflight simulation failed");
-            ApiError::BadRequest(e.to_readable_msg())
+            tracing::error!(error = %e, "preflight failed without a typed failure category");
+            ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            )
         }
         _ => {
             tracing::error!(error = %e, "calldata generation failed");
-            ApiError::Internal("failed to generate calldata".into())
+            ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            )
         }
     }
 }
@@ -300,9 +340,12 @@ pub fn routes_v2() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use super::{swap_candidates_cache_key, swap_chain_ids};
+    use super::{map_raindex_error, swap_candidates_cache_key, swap_chain_ids};
+    use crate::error::{ApiError, ApiErrorCode};
     use alloy::primitives::address;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
+    use rain_orderbook_common::raindex_client::RaindexError;
+    use rain_orderbook_common::rpc_client::RpcClientError;
     use serde_json::json;
 
     fn mock_order(chain_id: u32, order_hash: &str) -> RaindexOrder {
@@ -338,6 +381,59 @@ mod tests {
     #[test]
     fn test_swap_orders_are_scoped_to_calldata_chain() {
         assert_eq!(swap_chain_ids().0, vec![crate::CHAIN_ID]);
+    }
+
+    #[test]
+    fn test_raindex_no_liquidity_maps_to_stable_code() {
+        assert!(matches!(
+            map_raindex_error(RaindexError::NoLiquidity),
+            ApiError::Coded {
+                code: ApiErrorCode::SwapNoLiquidity,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_ambiguous_raindex_preflight_maps_to_server_failure() {
+        let error = map_raindex_error(RaindexError::PreflightError(
+            "sensitive rpc detail".to_string(),
+        ));
+        assert!(matches!(
+            error,
+            ApiError::Coded {
+                code: ApiErrorCode::SwapCalldataFailed,
+                public_message: "swap calldata could not be generated",
+            }
+        ));
+    }
+
+    #[test]
+    fn test_typed_rpc_failure_maps_to_upstream_unavailable() {
+        let error = map_raindex_error(RaindexError::RpcClientError(RpcClientError::RpcError {
+            message: "sensitive rpc detail".to_string(),
+        }));
+        assert!(matches!(
+            error,
+            ApiError::Coded {
+                code: ApiErrorCode::UpstreamUnavailable,
+                public_message: "a required chain data provider is temporarily unavailable",
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rpc_configuration_failure_is_not_retryable() {
+        let error = map_raindex_error(RaindexError::RpcClientError(RpcClientError::Config {
+            message: "bad local config".to_string(),
+        }));
+        assert!(matches!(
+            error,
+            ApiError::Coded {
+                code: ApiErrorCode::SwapCalldataFailed,
+                ..
+            }
+        ));
     }
 }
 

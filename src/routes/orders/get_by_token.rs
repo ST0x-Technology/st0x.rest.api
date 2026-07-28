@@ -6,7 +6,7 @@ use super::{
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{Denomination, ValidatedAddress};
 use crate::types::orders::{OrderSide, OrderState, OrdersByTokenParams, OrdersListResponse};
@@ -55,7 +55,14 @@ pub(crate) async fn process_get_orders_by_token(
         .min(MAX_PAGE_SIZE);
     let (orders, total_count) = ds
         .get_orders_list(filters, Some(page_num), Some(effective_page_size))
-        .await?;
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, code = %ApiErrorCode::OrdersQueryFailed, "orders-by-token query failed");
+            ApiError::coded(
+                ApiErrorCode::OrdersQueryFailed,
+                "the order source could not serve this request",
+            )
+        })?;
 
     tracing::info!(
         quoted_orders = orders.len(),
@@ -91,6 +98,7 @@ pub(crate) async fn process_get_orders_by_token(
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -279,7 +287,13 @@ mod tests {
         let result =
             process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
                 .await;
-        assert!(matches!(result, Err(ApiError::Internal(_))));
+        assert!(matches!(
+            result,
+            Err(ApiError::Coded {
+                code: ApiErrorCode::OrdersQueryFailed,
+                ..
+            })
+        ));
     }
 
     #[rocket::async_test]

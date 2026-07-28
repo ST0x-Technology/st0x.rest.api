@@ -105,6 +105,20 @@ pub enum ApiError {
     RateLimited(String),
     #[error("Not yet indexed: {0}")]
     NotYetIndexed(String),
+    #[error("{code}: {public_message}")]
+    Coded {
+        code: ApiErrorCode,
+        public_message: &'static str,
+    },
+}
+
+impl ApiError {
+    pub fn coded(code: ApiErrorCode, public_message: &'static str) -> Self {
+        Self::Coded {
+            code,
+            public_message,
+        }
+    }
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
@@ -117,6 +131,10 @@ impl<'r> Responder<'r, 'static> for ApiError {
             ApiError::Internal(msg) => (ApiErrorCode::InternalError, msg.clone()),
             ApiError::RateLimited(msg) => (ApiErrorCode::RateLimited, msg.clone()),
             ApiError::NotYetIndexed(msg) => (ApiErrorCode::NotYetIndexed, msg.clone()),
+            ApiError::Coded {
+                code,
+                public_message,
+            } => (*code, (*public_message).to_string()),
         };
         let status = code.status();
         let span = request_span_for(req);
@@ -172,6 +190,7 @@ mod tests {
     use super::*;
     use crate::fairings::RequestLogger;
     use rocket::local::blocking::Client;
+    use tracing_test::traced_test;
 
     #[get("/bad-request")]
     fn bad_request() -> Result<(), ApiError> {
@@ -189,11 +208,19 @@ mod tests {
     fn internal() -> Result<(), ApiError> {
         Err(ApiError::Internal("something broke".into()))
     }
+    #[get("/coded")]
+    fn coded() -> Result<(), ApiError> {
+        Err(ApiError::coded(
+            ApiErrorCode::SwapNoLiquidity,
+            "no executable liquidity",
+        ))
+    }
+
     fn error_client() -> Client {
         let rocket = rocket::build()
             .mount(
                 "/",
-                rocket::routes![bad_request, unauthorized, not_found, internal],
+                rocket::routes![bad_request, unauthorized, not_found, internal, coded],
             )
             .attach(RequestLogger);
         Client::tracked(rocket).expect("valid rocket instance")
@@ -250,6 +277,20 @@ mod tests {
         );
     }
 
+    #[traced_test]
+    #[test]
+    fn test_coded_error_uses_catalog_status_and_code() {
+        let client = error_client();
+        assert_error_response(
+            &client,
+            "/coded",
+            404,
+            "SWAP_NO_LIQUIDITY",
+            "no executable liquidity",
+        );
+        assert!(logs_contain("SWAP_NO_LIQUIDITY"));
+    }
+
     #[test]
     fn test_catalog_serializes_stable_codes() {
         let cases = [
@@ -263,6 +304,29 @@ mod tests {
 
         for (code, expected) in cases {
             assert_eq!(serde_json::to_string(&code).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_trade_catalog_uses_expected_http_statuses() {
+        let cases = [
+            (ApiErrorCode::SwapUnsupportedToken, Status::BadRequest),
+            (ApiErrorCode::SwapPreflightFailed, Status::BadRequest),
+            (ApiErrorCode::SwapNoLiquidity, Status::NotFound),
+            (ApiErrorCode::SwapQuoteFailed, Status::InternalServerError),
+            (
+                ApiErrorCode::SwapCalldataFailed,
+                Status::InternalServerError,
+            ),
+            (ApiErrorCode::OrdersQueryFailed, Status::BadGateway),
+            (
+                ApiErrorCode::UpstreamUnavailable,
+                Status::ServiceUnavailable,
+            ),
+        ];
+
+        for (code, expected_status) in cases {
+            assert_eq!(code.status(), expected_status);
         }
     }
 }

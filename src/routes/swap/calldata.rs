@@ -4,7 +4,7 @@ use crate::app_state::ApplicationState;
 use crate::attribution::{attribution_message_hash, Attribution, AttributionSigner};
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::swap::denomination::{
     denormalize_calldata_price_cap, normalize_calldata_price_cap,
@@ -39,6 +39,8 @@ use tracing::Instrument;
         (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 503, description = "Required upstream unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
@@ -95,6 +97,8 @@ pub async fn post_swap_calldata(
         (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 503, description = "Required upstream unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
@@ -454,7 +458,8 @@ async fn process_swap_calldata_build(
     req: SwapCalldataBuildRequest,
 ) -> Result<SwapCalldataBuildResult, ApiError> {
     ds.validate_supported_tokens(req.input_token, req.output_token)
-        .await?;
+        .await
+        .map_err(map_calldata_boundary_error)?;
 
     let (amount, price_cap, resolved_price_cap, wrap_ratios) = match req.price_limit {
         SwapCalldataPriceLimit::Explicit { value, field } => {
@@ -472,7 +477,8 @@ async fn process_swap_calldata_build(
                     price_cap_field: field,
                 },
             )
-            .await?;
+            .await
+            .map_err(map_calldata_boundary_error)?;
             (amount, price_cap, resolved_price_cap, wrap_ratios)
         }
         SwapCalldataPriceLimit::SlippageBps {
@@ -490,7 +496,8 @@ async fn process_swap_calldata_build(
                     amount_field: req.amount_field,
                 },
             )
-            .await?;
+            .await
+            .map_err(map_calldata_boundary_error)?;
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
@@ -514,29 +521,34 @@ async fn process_swap_calldata_build(
                 .transpose()?;
             let orders = ds
                 .get_orders_for_pair(req.input_token, req.output_token)
-                .await?;
+                .await
+                .map_err(map_calldata_boundary_error)?;
             if orders.is_empty() {
-                return Err(ApiError::NotFound(
-                    "no liquidity found for this pair".into(),
+                return Err(ApiError::coded(
+                    ApiErrorCode::SwapNoLiquidity,
+                    "no executable liquidity is available for this pair",
                 ));
             }
             let candidates = ds
                 .build_candidates_for_pair(&orders, req.input_token, req.output_token, req.taker)
-                .await?;
+                .await
+                .map_err(map_calldata_boundary_error)?;
             let price_cap = super::slippage::resolve_slippage_price_cap(
                 candidates,
                 req.mode,
                 &amount,
                 slippage_bps,
                 reference_io_ratio,
-            )?;
+            )
+            .map_err(map_calldata_boundary_error)?;
             let resolved_price_cap = denormalize_calldata_price_cap(
                 price_cap,
                 req.denomination,
                 req.input_token,
                 req.output_token,
                 &wrap_ratios,
-            )?;
+            )
+            .map_err(map_calldata_boundary_error)?;
             tracing::info!(
                 slippage_bps,
                 resolved_price_cap = %resolved_price_cap,
@@ -545,7 +557,10 @@ async fn process_swap_calldata_build(
             );
             let price_cap = price_cap.format().map_err(|error| {
                 tracing::error!(%error, "failed to format resolved slippage price cap");
-                ApiError::Internal("failed to resolve slippage".into())
+                ApiError::coded(
+                    ApiErrorCode::SwapCalldataFailed,
+                    "swap calldata could not be generated",
+                )
             })?;
             (amount, price_cap, resolved_price_cap, wrap_ratios)
         }
@@ -561,13 +576,35 @@ async fn process_swap_calldata_build(
         price_cap,
     };
 
-    let response = ds.get_calldata(take_req).await?;
+    let response = ds
+        .get_calldata(take_req)
+        .await
+        .map_err(map_calldata_boundary_error)?;
     let calldata =
-        normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)?;
+        normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
+            .map_err(map_calldata_boundary_error)?;
     Ok(SwapCalldataBuildResult {
         calldata,
         resolved_price_cap,
     })
+}
+
+fn map_calldata_boundary_error(error: ApiError) -> ApiError {
+    if matches!(error, ApiError::Coded { .. } | ApiError::BadRequest(_)) {
+        return error;
+    }
+    if matches!(error, ApiError::NotFound(_)) {
+        tracing::warn!(%error, code = %ApiErrorCode::SwapNoLiquidity, "swap calldata found no executable liquidity");
+        return ApiError::coded(
+            ApiErrorCode::SwapNoLiquidity,
+            "no executable liquidity is available for this pair",
+        );
+    }
+    tracing::error!(%error, code = %ApiErrorCode::SwapCalldataFailed, "swap calldata boundary failed");
+    ApiError::coded(
+        ApiErrorCode::SwapCalldataFailed,
+        "swap calldata could not be generated",
+    )
 }
 
 #[cfg(all(test, feature = "oracle-integration-tests"))]
@@ -626,6 +663,13 @@ mod tests {
             maximum_io_ratio: max_ratio.to_string(),
             denomination: SwapDenomination::Wrapped,
         }
+    }
+
+    fn assert_error_code<T>(result: Result<T, ApiError>, expected: ApiErrorCode) {
+        assert!(matches!(
+            result,
+            Err(ApiError::Coded { code, .. }) if code == expected
+        ));
     }
 
     fn calldata_v2_request(
@@ -1084,9 +1128,7 @@ mod tests {
 
         let result = process_swap_calldata_v2(&ds, request).await;
 
-        assert!(
-            matches!(result, Err(ApiError::NotFound(message)) if message == "no liquidity found for this pair")
-        );
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
         no_take_orders_request_was_made(&captured_request);
     }
 
@@ -1433,9 +1475,7 @@ mod tests {
             process_swap_calldata(&ds, unwrapped_calldata_request(WT_MSTR, WETH, "100", "2.5"))
                 .await;
 
-        assert!(
-            matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read wrap ratios")
-        );
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
         no_take_orders_request_was_made(&captured_request);
     }
 
@@ -1449,9 +1489,7 @@ mod tests {
             process_swap_calldata(&ds, unwrapped_calldata_request(USDC, WT_MSTR, "100", "2.5"))
                 .await;
 
-        assert!(
-            matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read wrapped token ratio")
-        );
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
         no_take_orders_request_was_made(&captured_request);
     }
 
@@ -1470,9 +1508,7 @@ mod tests {
 
         let request = captured_take_orders_request(&captured_request);
         assert_eq!(request.price_cap, "1.25");
-        assert!(
-            matches!(result, Err(ApiError::Internal(msg)) if msg == "failed to read estimated_input")
-        );
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
     }
 
     #[test]
@@ -1502,12 +1538,13 @@ mod tests {
             supported_tokens: Ok(()),
             orders: Ok(vec![]),
             candidates: vec![],
-            calldata_result: Err(ApiError::NotFound(
-                "no liquidity found for this pair".into(),
+            calldata_result: Err(ApiError::coded(
+                ApiErrorCode::SwapNoLiquidity,
+                "no executable liquidity is available for this pair",
             )),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
-        assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
@@ -1531,23 +1568,34 @@ mod tests {
             calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
-        assert!(matches!(result, Err(ApiError::Internal(_))));
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
     }
 
     #[rocket::async_test]
     async fn test_process_swap_calldata_rejects_unsupported_tokens() {
         let ds = MockSwapDataSource {
-            supported_tokens: Err(ApiError::BadRequest(
-                "unsupported token for this API".into(),
+            supported_tokens: Err(ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
             )),
             orders: Ok(vec![]),
             candidates: vec![],
             calldata_result: Ok(ready_response()),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
-        assert!(
-            matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
-        );
+        assert_error_code(result, ApiErrorCode::SwapUnsupportedToken);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_registry_failure_is_not_retryable() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("invalid local registry".into())),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+        let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
     }
 
     #[rocket::async_test]
@@ -1587,6 +1635,9 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_json::<ApiErrorResponse>().await.unwrap();
+        assert_eq!(body.error.code, ApiErrorCode::SwapUnsupportedToken);
+        assert!(!body.request_id.is_empty());
     }
 
     #[rocket::async_test]
