@@ -1,30 +1,24 @@
 //! Background attribution of confirmed trades indexed by the local Raindex database.
 
-use crate::attribution::{
-    compute_api_key_hash, verify_signed_attribution, ATTRIBUTION_CONTEXT_WORDS,
-};
-use crate::db::DbPool;
+use crate::attribution::{compute_api_key_hash, verify_signed_attribution};
+use crate::db::{attribution as attribution_db, DbPool};
 use alloy::primitives::{Address, Bytes, B256};
 use rain_orderbook_bindings::IRaindexV6::SignedContextV1;
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::{Orbit, Rocket};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{FromRow, SqlitePool};
+use source::{BatchCursor, IndexedSignedContext, IndexedTrade, SyncTarget};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-const SUPPORTED_RAINDEX_SCHEMA_VERSION: u32 = 5;
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const _: () = assert!(
-    rain_orderbook_app_settings::local_db_manifest::DB_SCHEMA_VERSION
-        == SUPPORTED_RAINDEX_SCHEMA_VERSION,
-    "Raindex local database schema changed; review the attribution queries"
-);
+pub(crate) mod report;
+mod source;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AttributionWorker {
@@ -68,7 +62,7 @@ impl Fairing for AttributionWorker {
     }
 
     async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
-        if let Err(error) = record_attribution_signer(&self.app_pool, self.signer).await {
+        if let Err(error) = attribution_db::record_signer(&self.app_pool, self.signer).await {
             tracing::error!(%error, "failed to record current attribution signer at startup");
         }
         let worker = self.clone();
@@ -83,8 +77,7 @@ impl Fairing for AttributionWorker {
                         tracing::info!("attribution worker shutting down");
                         break;
                     }
-                    _ = interval.tick() => {
-                    }
+                    _ = interval.tick() => {}
                 }
 
                 let sync = run_sync_iteration(&worker);
@@ -127,7 +120,7 @@ async fn finish_worker_task(mut handle: JoinHandle<()>, timeout: Duration) {
 }
 
 async fn run_sync_iteration(worker: &AttributionWorker) {
-    match open_raindex_pool(&worker.raindex_db_path).await {
+    match source::open_pool(&worker.raindex_db_path).await {
         Ok(source_pool) => {
             let result = process_available_trades(
                 &worker.app_pool,
@@ -160,88 +153,6 @@ pub(crate) enum AttributionReportingError {
     StartBlockOverflow,
 }
 
-async fn open_raindex_pool(path: &Path) -> Result<SqlitePool, sqlx::Error> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .read_only(true)
-        .busy_timeout(Duration::from_secs(5));
-    SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-}
-
-#[derive(Debug, FromRow)]
-struct SyncTarget {
-    chain_id: i64,
-    raindex_address: String,
-    last_indexed_block: i64,
-}
-
-#[derive(Debug, FromRow)]
-struct CursorRow {
-    start_block: i64,
-    last_block: i64,
-    last_log_index: i64,
-    last_trade_id: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct IndexedContextRow {
-    chain_id: i64,
-    raindex_address: String,
-    trade_id: String,
-    transaction_hash: String,
-    log_index: i64,
-    block_number: i64,
-    block_timestamp: i64,
-    transaction_sender: String,
-    order_hash: String,
-    input_token: String,
-    input_delta: String,
-    output_token: String,
-    output_delta: String,
-    context_index: Option<i64>,
-    context_value: Option<String>,
-    value_0: Option<String>,
-    value_1: Option<String>,
-    value_2: Option<String>,
-    value_3: Option<String>,
-    value_count: i64,
-}
-
-#[derive(Debug)]
-struct IndexedTrade {
-    chain_id: i64,
-    raindex_address: String,
-    trade_id: String,
-    transaction_hash: String,
-    log_index: i64,
-    block_number: i64,
-    block_timestamp: i64,
-    transaction_sender: String,
-    order_hash: String,
-    input_token: String,
-    input_delta: String,
-    output_token: String,
-    output_delta: String,
-    contexts: Vec<IndexedSignedContext>,
-}
-
-#[derive(Debug)]
-struct IndexedSignedContext {
-    encoded_signer_and_signature: String,
-    values: [String; ATTRIBUTION_CONTEXT_WORDS],
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct ApiKeyIdentity {
-    id: i64,
-    key_id: String,
-    label: String,
-    owner: String,
-}
-
 pub(crate) async fn process_available_trades(
     app_pool: &DbPool,
     source_pool: &SqlitePool,
@@ -251,33 +162,21 @@ pub(crate) async fn process_available_trades(
 ) -> Result<u64, AttributionReportingError> {
     let start_block =
         i64::try_from(start_block).map_err(|_| AttributionReportingError::StartBlockOverflow)?;
-    record_attribution_signer(app_pool, signer).await?;
-    let targets = sqlx::query_as::<_, SyncTarget>(
-        "SELECT chain_id, raindex_address, last_block AS last_indexed_block \
-         FROM target_watermarks WHERE chain_id = ? ORDER BY raindex_address",
-    )
-    .bind(i64::from(crate::CHAIN_ID))
-    .fetch_all(source_pool)
-    .await?;
-    snapshot_current_api_keys(app_pool).await?;
-    let identities = load_api_key_identities(app_pool).await?;
-    let identity_by_hash: HashMap<B256, ApiKeyIdentity> = identities
+    attribution_db::record_signer(app_pool, signer).await?;
+    let targets = source::list_targets(source_pool, crate::CHAIN_ID).await?;
+    attribution_db::snapshot_current_api_keys(app_pool).await?;
+    let identities = attribution_db::load_api_key_identities(app_pool).await?;
+    let identity_by_hash: HashMap<B256, attribution_db::ApiKeyIdentity> = identities
         .into_iter()
         .map(|identity| (compute_api_key_hash(&identity.key_id), identity))
         .collect();
 
     let mut attributed_count = 0;
-    let trusted_signers = load_attribution_signers(app_pool).await?;
+    let trusted_signers = attribution_db::load_signers(app_pool).await?;
     for mut target in targets {
         let mut source_transaction = source_pool.begin().await?;
-        let Some(last_indexed_block) = sqlx::query_scalar::<_, i64>(
-            "SELECT last_block FROM target_watermarks \
-             WHERE chain_id = ? AND raindex_address = ?",
-        )
-        .bind(target.chain_id)
-        .bind(&target.raindex_address)
-        .fetch_optional(&mut *source_transaction)
-        .await?
+        let Some(last_indexed_block) =
+            source::refresh_watermark(&mut source_transaction, &target).await?
         else {
             source_transaction.commit().await?;
             continue;
@@ -298,105 +197,6 @@ pub(crate) async fn process_available_trades(
     Ok(attributed_count)
 }
 
-async fn load_api_key_identities(app_pool: &DbPool) -> Result<Vec<ApiKeyIdentity>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeyIdentity>(
-        "SELECT api_key_database_id AS id, api_key_id AS key_id, \
-                api_key_label AS label, api_key_owner AS owner \
-         FROM attribution_api_keys ORDER BY api_key_id",
-    )
-    .fetch_all(app_pool)
-    .await
-}
-
-async fn snapshot_current_api_keys(app_pool: &DbPool) -> Result<(), sqlx::Error> {
-    let identities = sqlx::query_as::<_, ApiKeyIdentity>(
-        "SELECT id, key_id, label, owner FROM api_keys ORDER BY id",
-    )
-    .fetch_all(app_pool)
-    .await?;
-    let mut transaction = app_pool.begin().await?;
-    for identity in identities {
-        upsert_api_key_identity(&mut transaction, &identity).await?;
-    }
-    transaction.commit().await
-}
-
-async fn upsert_api_key_identity(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    identity: &ApiKeyIdentity,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO attribution_api_keys (\
-            api_key_hash, api_key_database_id, api_key_id, api_key_label, api_key_owner\
-         ) VALUES (?, ?, ?, ?, ?) \
-         ON CONFLICT(api_key_hash) DO UPDATE SET \
-            api_key_database_id = excluded.api_key_database_id, \
-            api_key_id = excluded.api_key_id, \
-            api_key_label = excluded.api_key_label, \
-            api_key_owner = excluded.api_key_owner, \
-            updated_at = datetime('now') \
-         WHERE api_key_database_id IS NOT excluded.api_key_database_id \
-            OR api_key_id IS NOT excluded.api_key_id \
-            OR api_key_label IS NOT excluded.api_key_label \
-            OR api_key_owner IS NOT excluded.api_key_owner",
-    )
-    .bind(compute_api_key_hash(&identity.key_id).to_string())
-    .bind(identity.id)
-    .bind(&identity.key_id)
-    .bind(&identity.label)
-    .bind(&identity.owner)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
-}
-
-pub(crate) async fn snapshot_api_key(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    id: i64,
-    key_id: &str,
-    label: &str,
-    owner: &str,
-) -> Result<(), sqlx::Error> {
-    upsert_api_key_identity(
-        transaction,
-        &ApiKeyIdentity {
-            id,
-            key_id: key_id.to_string(),
-            label: label.to_string(),
-            owner: owner.to_string(),
-        },
-    )
-    .await
-}
-
-async fn record_attribution_signer(app_pool: &DbPool, signer: Address) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO attribution_signers (address) VALUES (?) \
-         ON CONFLICT(address) DO NOTHING",
-    )
-    .bind(signer.to_string())
-    .execute(app_pool)
-    .await?;
-    Ok(())
-}
-
-async fn load_attribution_signers(app_pool: &DbPool) -> Result<Vec<Address>, sqlx::Error> {
-    let values: Vec<String> =
-        sqlx::query_scalar("SELECT address FROM attribution_signers ORDER BY first_seen_at")
-            .fetch_all(app_pool)
-            .await?;
-    Ok(values
-        .into_iter()
-        .filter_map(|value| match Address::from_str(&value) {
-            Ok(address) => Some(address),
-            Err(error) => {
-                tracing::error!(%error, address = %value, "invalid trusted attribution signer");
-                None
-            }
-        })
-        .collect())
-}
-
 async fn process_target(
     app_pool: &DbPool,
     source_transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -404,48 +204,41 @@ async fn process_target(
     configured_start_block: i64,
     batch_size: u32,
     target: &SyncTarget,
-    identities: &HashMap<B256, ApiKeyIdentity>,
+    identities: &HashMap<B256, attribution_db::ApiKeyIdentity>,
 ) -> Result<u64, AttributionReportingError> {
     // The cursor read, attributed-trade upserts, and cursor update share one transaction.
     // A concurrent worker therefore cannot commit a cursor derived from stale progress.
     let mut transaction = app_pool.begin().await?;
-    let mut stored_cursor = sqlx::query_as::<_, CursorRow>(
-        "SELECT start_block, last_block, last_log_index, last_trade_id \
-         FROM attribution_sync_cursors WHERE chain_id = ? AND raindex_address = ?",
-    )
-    .bind(target.chain_id)
-    .bind(&target.raindex_address)
-    .fetch_optional(&mut *transaction)
-    .await?;
+    let mut stored_cursor =
+        attribution_db::load_cursor(&mut transaction, target.chain_id, &target.raindex_address)
+            .await?;
 
     let start_block_reset = stored_cursor
         .as_ref()
         .is_some_and(|cursor| cursor.start_block != configured_start_block);
     if start_block_reset {
-        reset_target_start_block(&mut transaction, target, configured_start_block).await?;
+        attribution_db::reset_target(
+            &mut transaction,
+            target.chain_id,
+            &target.raindex_address,
+            configured_start_block,
+        )
+        .await?;
         stored_cursor = None;
     }
-    let cursor = stored_cursor;
-    let last_block = cursor.as_ref().map_or(0, |cursor| cursor.last_block);
-    let last_log_index = cursor.as_ref().map_or(-1, |cursor| cursor.last_log_index);
-    let last_trade_id = cursor
-        .as_ref()
-        .map_or_else(String::new, |cursor| cursor.last_trade_id.clone());
-    let has_cursor = cursor.is_some();
-    let mut attributed_count = 0;
-
-    let rows = fetch_batch(
+    let batch_cursor = stored_cursor.as_ref().map(|cursor| BatchCursor {
+        block: cursor.last_block,
+        log_index: cursor.last_log_index,
+        trade_id: &cursor.last_trade_id,
+    });
+    let trades = source::fetch_batch(
         source_transaction,
         target,
         configured_start_block,
-        has_cursor,
-        last_block,
-        last_log_index,
-        &last_trade_id,
+        batch_cursor,
         batch_size,
     )
     .await?;
-    let trades = group_context_rows(rows);
     // Raindex materializes all derived rows through a target's watermark before advancing
     // target_watermarks in the same source transaction. Because this function rereads the
     // watermark and the rows from one source snapshot, a partial batch proves that every
@@ -463,70 +256,47 @@ async fn process_target(
         )
     };
 
-    for trade in &trades {
+    let mut attributed_trades = Vec::with_capacity(trades.len());
+    for trade in trades {
         let Some(api_key_hash) = trade
             .contexts
             .iter()
-            .find_map(|context| verify_context(context, trade, trusted_signers))
+            .find_map(|context| verify_context(context, &trade, trusted_signers))
         else {
             continue;
         };
-        let identity = identities.get(&api_key_hash);
-        sqlx::query(
-            "INSERT INTO attributed_trades (\
-                    chain_id, raindex_address, indexed_trade_id, transaction_hash, log_index, \
-                    block_number, block_timestamp, order_hash, taker, api_key_hash, \
-                    api_key_database_id, api_key_id, api_key_label, api_key_owner, \
-                    input_token, input_amount, \
-                    output_token, output_amount\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT(chain_id, raindex_address, indexed_trade_id) DO UPDATE SET \
-                    api_key_database_id = excluded.api_key_database_id, \
-                    api_key_id = excluded.api_key_id, \
-                    api_key_label = excluded.api_key_label, \
-                    api_key_owner = excluded.api_key_owner, \
-                    updated_at = datetime('now')",
-        )
-        .bind(trade.chain_id)
-        .bind(&trade.raindex_address)
-        .bind(&trade.trade_id)
-        .bind(&trade.transaction_hash)
-        .bind(trade.log_index)
-        .bind(trade.block_number)
-        .bind(trade.block_timestamp)
-        .bind(&trade.order_hash)
-        .bind(&trade.transaction_sender)
-        .bind(api_key_hash.to_string())
-        .bind(identity.map(|value| value.id))
-        .bind(identity.map(|value| value.key_id.as_str()))
-        .bind(identity.map(|value| value.label.as_str()))
-        .bind(identity.map(|value| value.owner.as_str()))
-        .bind(&trade.input_token)
-        .bind(&trade.input_delta)
-        .bind(&trade.output_token)
-        .bind(&trade.output_delta)
-        .execute(&mut *transaction)
-        .await?;
-        attributed_count += 1;
+        attributed_trades.push(attribution_db::NewAttributedTrade {
+            chain_id: trade.chain_id,
+            raindex_address: trade.raindex_address,
+            indexed_trade_id: trade.trade_id,
+            transaction_hash: trade.transaction_hash,
+            log_index: trade.log_index,
+            block_number: trade.block_number,
+            block_timestamp: trade.block_timestamp,
+            order_hash: trade.order_hash,
+            taker: trade.transaction_sender,
+            api_key_hash,
+            identity: identities.get(&api_key_hash),
+            input_token: trade.input_token,
+            input_amount: trade.input_delta,
+            output_token: trade.output_token,
+            output_amount: trade.output_delta,
+        });
     }
-    sqlx::query(
-        "INSERT INTO attribution_sync_cursors (\
-                chain_id, raindex_address, start_block, last_block, last_log_index, last_trade_id\
-             ) VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(chain_id, raindex_address) DO UPDATE SET \
-                start_block = excluded.start_block, \
-                last_block = excluded.last_block, \
-                last_log_index = excluded.last_log_index, \
-                last_trade_id = excluded.last_trade_id, \
-                updated_at = datetime('now')",
+    let attributed_count = u64::try_from(attributed_trades.len())
+        .map_err(|_| sqlx::Error::Protocol("attributed trade count does not fit u64".into()))?;
+    attribution_db::store_batch(
+        &mut transaction,
+        target.chain_id,
+        &target.raindex_address,
+        configured_start_block,
+        attribution_db::CursorPosition {
+            block: next_cursor.0,
+            log_index: next_cursor.1,
+            trade_id: &next_cursor.2,
+        },
+        &attributed_trades,
     )
-    .bind(target.chain_id)
-    .bind(&target.raindex_address)
-    .bind(configured_start_block)
-    .bind(next_cursor.0)
-    .bind(next_cursor.1)
-    .bind(&next_cursor.2)
-    .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
 
@@ -548,145 +318,6 @@ async fn process_target(
         );
     }
     Ok(attributed_count)
-}
-
-async fn reset_target_start_block(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    target: &SyncTarget,
-    configured_start_block: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM attributed_trades \
-         WHERE chain_id = ? AND raindex_address = ? AND block_number < ?",
-    )
-    .bind(target.chain_id)
-    .bind(&target.raindex_address)
-    .bind(configured_start_block)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query("DELETE FROM attribution_sync_cursors WHERE chain_id = ? AND raindex_address = ?")
-        .bind(target.chain_id)
-        .bind(&target.raindex_address)
-        .execute(&mut **transaction)
-        .await?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn fetch_batch(
-    source_transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    target: &SyncTarget,
-    start_block: i64,
-    has_cursor: bool,
-    last_block: i64,
-    last_log_index: i64,
-    last_trade_id: &str,
-    batch_size: u32,
-) -> Result<Vec<IndexedContextRow>, sqlx::Error> {
-    sqlx::query_as::<_, IndexedContextRow>(
-        "WITH batch AS (\
-            SELECT chain_id, raindex_address, trade_id, transaction_hash, log_index, \
-                   block_number, block_timestamp, transaction_sender, order_hash, \
-                   input_token, input_delta, output_token, output_delta \
-            FROM derived_trades \
-            WHERE trade_kind = 'take' \
-              AND chain_id = ? AND raindex_address = ? \
-              AND block_number >= ? AND block_number <= ? \
-              AND (? = 0 OR block_number > ? \
-                   OR (block_number = ? AND log_index > ?) \
-                   OR (block_number = ? AND log_index = ? AND trade_id > ?)) \
-            ORDER BY block_number, log_index, trade_id \
-            LIMIT ?\
-         ) \
-         SELECT b.*, c.context_index, c.context_value, \
-                MAX(CASE WHEN v.value_index = 0 THEN v.value END) AS value_0, \
-                MAX(CASE WHEN v.value_index = 1 THEN v.value END) AS value_1, \
-                MAX(CASE WHEN v.value_index = 2 THEN v.value END) AS value_2, \
-                MAX(CASE WHEN v.value_index = 3 THEN v.value END) AS value_3, \
-                COUNT(v.value_index) AS value_count \
-         FROM batch b \
-         LEFT JOIN take_order_contexts c \
-           ON c.chain_id = b.chain_id \
-          AND c.raindex_address = b.raindex_address \
-          AND c.transaction_hash = b.transaction_hash \
-          AND c.log_index = b.log_index \
-         LEFT JOIN context_values v \
-           ON v.chain_id = c.chain_id \
-          AND v.raindex_address = c.raindex_address \
-          AND v.transaction_hash = c.transaction_hash \
-          AND v.log_index = c.log_index \
-          AND v.context_index = c.context_index \
-         GROUP BY b.chain_id, b.raindex_address, b.trade_id, b.transaction_hash, b.log_index, \
-                  b.block_number, b.block_timestamp, b.transaction_sender, b.order_hash, \
-                  b.input_token, b.input_delta, b.output_token, b.output_delta, \
-                  c.context_index, c.context_value \
-         ORDER BY b.block_number, b.log_index, b.trade_id, c.context_index",
-    )
-    .bind(target.chain_id)
-    .bind(&target.raindex_address)
-    .bind(start_block)
-    .bind(target.last_indexed_block)
-    .bind(has_cursor)
-    .bind(last_block)
-    .bind(last_block)
-    .bind(last_log_index)
-    .bind(last_block)
-    .bind(last_log_index)
-    .bind(last_trade_id)
-    .bind(i64::from(batch_size))
-    .fetch_all(&mut **source_transaction)
-    .await
-}
-
-fn group_context_rows(rows: Vec<IndexedContextRow>) -> Vec<IndexedTrade> {
-    let mut trades: Vec<IndexedTrade> = Vec::new();
-    for row in rows {
-        let is_new_trade = trades.last().is_none_or(|trade| {
-            trade.chain_id != row.chain_id
-                || trade.raindex_address != row.raindex_address
-                || trade.trade_id != row.trade_id
-        });
-        if is_new_trade {
-            trades.push(IndexedTrade {
-                chain_id: row.chain_id,
-                raindex_address: row.raindex_address.clone(),
-                trade_id: row.trade_id.clone(),
-                transaction_hash: row.transaction_hash.clone(),
-                log_index: row.log_index,
-                block_number: row.block_number,
-                block_timestamp: row.block_timestamp,
-                transaction_sender: row.transaction_sender.clone(),
-                order_hash: row.order_hash.clone(),
-                input_token: row.input_token.clone(),
-                input_delta: row.input_delta.clone(),
-                output_token: row.output_token.clone(),
-                output_delta: row.output_delta.clone(),
-                contexts: Vec::new(),
-            });
-        }
-
-        let values = match (
-            row.value_0,
-            row.value_1,
-            row.value_2,
-            row.value_3,
-            row.value_count,
-        ) {
-            (Some(v0), Some(v1), Some(v2), Some(v3), 4) => Some([v0, v1, v2, v3]),
-            _ => None,
-        };
-        if row.context_index.is_some() {
-            if let (Some(context_value), Some(values), Some(trade)) =
-                (row.context_value, values, trades.last_mut())
-            {
-                trade.contexts.push(IndexedSignedContext {
-                    encoded_signer_and_signature: context_value,
-                    values,
-                });
-            }
-        }
-    }
-    trades
 }
 
 fn verify_context(
@@ -736,6 +367,7 @@ mod tests {
     use crate::attribution::{Attribution, AttributionSigner};
     use alloy::primitives::address;
     use rain_math_float::Float;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::NamedTempFile;
 

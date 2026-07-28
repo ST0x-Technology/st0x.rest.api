@@ -1,16 +1,15 @@
+use crate::attribution_reporting::report as attribution_report;
 use crate::auth::AdminKey;
-use crate::db::DbPool;
+use crate::db::{attribution as attribution_db, DbPool};
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use alloy::primitives::{Address, B256};
-use futures::TryStreamExt;
 use rain_math_float::Float;
 use rocket::form::FromForm;
 use rocket::serde::json::Json;
 use rocket::{Route, State};
 use serde::Serialize;
-use sqlx::{FromRow, QueryBuilder, Sqlite};
-use std::ops::{Add, Sub};
+use std::ops::Sub;
 use std::str::FromStr;
 use tracing::Instrument;
 use utoipa::{IntoParams, ToSchema};
@@ -137,80 +136,12 @@ pub struct AttributionVolumeCursor {
     pub after_output_token: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct AttributedTradeRow {
-    indexed_trade_id: String,
-    chain_id: i64,
-    raindex_address: String,
-    transaction_hash: String,
-    log_index: i64,
-    block_number: i64,
-    block_timestamp: i64,
-    order_hash: String,
-    taker: String,
-    api_key_hash: String,
-    api_key_database_id: Option<i64>,
-    api_key_id: Option<String>,
-    api_key_label: Option<String>,
-    api_key_owner: Option<String>,
-    input_token: String,
-    input_amount: String,
-    output_token: String,
-    output_amount: String,
-}
-
-#[derive(Debug, FromRow)]
-struct AttributionVolumeRow {
-    chain_id: i64,
-    api_key_hash: String,
-    api_key_database_id: Option<i64>,
-    api_key_id: Option<String>,
-    api_key_label: Option<String>,
-    api_key_owner: Option<String>,
-    input_token: String,
-    input_amount: String,
-    output_token: String,
-    output_amount: String,
-}
-
-#[derive(Debug)]
-struct VolumeGroup {
-    key: VolumeKey,
-    api_key_database_id: Option<i64>,
-    api_key_id: Option<String>,
-    api_key_label: Option<String>,
-    api_key_owner: Option<String>,
-    accumulator: VolumeAccumulator,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct VolumeKey {
-    api_key_hash: String,
-    chain_id: i64,
-    input_token: String,
-    output_token: String,
-}
-
-#[derive(Debug)]
-struct VolumeAccumulator {
-    trade_count: u64,
-    total_input: Float,
-    total_output: Float,
-}
-
-struct ExecutionCursorFilter<'a> {
-    block: i64,
-    log_index: i64,
-    trade_id: &'a str,
-}
-
 struct VolumeCursorFilter {
     api_key_hash: String,
     chain_id: i64,
     input_token: String,
     output_token: String,
 }
-
 #[utoipa::path(
     get,
     path = "/admin/attribution/executions",
@@ -337,48 +268,28 @@ async fn query_attributed_trades(
     start_block: Option<u64>,
     end_block: Option<u64>,
     transaction_hash: Option<&str>,
-    cursor: Option<&ExecutionCursorFilter<'_>>,
+    cursor: Option<&attribution_db::ExecutionCursor<'_>>,
     limit: u32,
-) -> Result<Vec<AttributedTradeRow>, ApiError> {
+) -> Result<Vec<attribution_db::AttributedTradeRow>, ApiError> {
     let start_block = optional_sqlite_integer(start_block, "startBlock")?;
     let end_block = optional_sqlite_integer(end_block, "endBlock")?;
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT indexed_trade_id, chain_id, raindex_address, transaction_hash, log_index, block_number, \
-                block_timestamp, order_hash, taker, api_key_hash, api_key_database_id, api_key_id, \
-                api_key_label, api_key_owner, input_token, input_amount, output_token, output_amount \
-         FROM attributed_trades WHERE 1 = 1",
-    );
-    push_filters(
-        &mut query,
-        api_key_hash,
-        start_block,
-        end_block,
-        transaction_hash,
-    );
-    if let Some(cursor) = cursor {
-        query
-            .push(" AND (block_number < ")
-            .push_bind(cursor.block)
-            .push(" OR (block_number = ")
-            .push_bind(cursor.block)
-            .push(" AND log_index < ")
-            .push_bind(cursor.log_index)
-            .push(") OR (block_number = ")
-            .push_bind(cursor.block)
-            .push(" AND log_index = ")
-            .push_bind(cursor.log_index)
-            .push(" AND indexed_trade_id < ")
-            .push_bind(cursor.trade_id)
-            .push("))");
-    }
-    query
-        .push(" ORDER BY block_number DESC, log_index DESC, indexed_trade_id DESC LIMIT ")
-        .push_bind(i64::from(limit));
-    query
-        .build_query_as::<AttributedTradeRow>()
-        .fetch_all(pool)
-        .await
-        .map_err(query_error)
+    attribution_db::list_attributed_trades(
+        pool,
+        attribution_db::AttributionFilter {
+            api_key_hash,
+            start_block,
+            end_block,
+            transaction_hash,
+        },
+        cursor.map(|cursor| attribution_db::ExecutionCursor {
+            block: cursor.block,
+            log_index: cursor.log_index,
+            trade_id: cursor.trade_id,
+        }),
+        limit,
+    )
+    .await
+    .map_err(query_error)
 }
 
 async fn aggregate_volume(
@@ -391,172 +302,58 @@ async fn aggregate_volume(
 ) -> Result<(Vec<AttributionVolume>, Option<AttributionVolumeCursor>), ApiError> {
     let start_block = optional_sqlite_integer(start_block, "startBlock")?;
     let end_block = optional_sqlite_integer(end_block, "endBlock")?;
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT trades.chain_id, trades.api_key_hash, \
-                identity.api_key_database_id, identity.api_key_id, \
-                identity.api_key_label, identity.api_key_owner, \
-                trades.input_token, trades.input_amount, \
-                trades.output_token, trades.output_amount \
-         FROM attributed_trades AS trades \
-         LEFT JOIN attribution_api_keys AS identity \
-           ON identity.api_key_hash = trades.api_key_hash \
-         WHERE 1 = 1",
-    );
-    if let Some(api_key_hash) = api_key_hash {
-        query
-            .push(" AND trades.api_key_hash = ")
-            .push_bind(api_key_hash);
-    }
-    if let Some(start_block) = start_block {
-        query
-            .push(" AND trades.block_number >= ")
-            .push_bind(start_block);
-    }
-    if let Some(end_block) = end_block {
-        query
-            .push(" AND trades.block_number <= ")
-            .push_bind(end_block);
-    }
-    if let Some(cursor) = cursor {
-        push_volume_cursor(&mut query, cursor);
-    }
-    query.push(
-        " ORDER BY trades.api_key_hash, trades.chain_id, \
-                   trades.input_token, trades.output_token",
-    );
-
-    let mut rows = query.build_query_as::<AttributionVolumeRow>().fetch(pool);
-    let mut groups = Vec::<VolumeGroup>::with_capacity(limit as usize);
-    let mut has_more = false;
-    while let Some(row) = rows.try_next().await.map_err(query_error)? {
-        let input = parse_float(&row.input_amount)?;
-        let signed_output = parse_float(&row.output_amount)?;
-        let output = Float::zero()
-            .and_then(|zero| zero.sub(signed_output))
-            .map_err(float_error)?;
-        let key = VolumeKey {
-            api_key_hash: row.api_key_hash,
-            chain_id: row.chain_id,
-            input_token: row.input_token,
-            output_token: row.output_token,
-        };
-        if let Some(group) = groups.last_mut().filter(|group| group.key == key) {
-            group.accumulator.trade_count += 1;
-            group.accumulator.total_input = group
-                .accumulator
-                .total_input
-                .add(input)
-                .map_err(float_error)?;
-            group.accumulator.total_output = group
-                .accumulator
-                .total_output
-                .add(output)
-                .map_err(float_error)?;
-        } else if groups.len() < limit as usize {
-            groups.push(VolumeGroup {
-                key,
-                api_key_database_id: row.api_key_database_id,
-                api_key_id: row.api_key_id,
-                api_key_label: row.api_key_label,
-                api_key_owner: row.api_key_owner,
-                accumulator: VolumeAccumulator {
-                    trade_count: 1,
-                    total_input: input,
-                    total_output: output,
-                },
-            });
-        } else {
-            has_more = true;
-            break;
-        }
-    }
-    drop(rows);
-
-    let next_cursor = if has_more {
-        groups
+    let page = attribution_report::aggregate_volume(
+        pool,
+        attribution_db::AttributionFilter {
+            api_key_hash,
+            start_block,
+            end_block,
+            transaction_hash: None,
+        },
+        cursor.map(|cursor| attribution_db::VolumeCursor {
+            api_key_hash: &cursor.api_key_hash,
+            chain_id: cursor.chain_id,
+            input_token: &cursor.input_token,
+            output_token: &cursor.output_token,
+        }),
+        limit,
+    )
+    .await
+    .map_err(attribution_read_error)?;
+    let volume = page
+        .records
+        .into_iter()
+        .map(|record| {
+            Ok(AttributionVolume {
+                api_key_hash: record.api_key_hash,
+                api_key_database_id: record.api_key_database_id,
+                api_key_id: record.api_key_id,
+                api_key_label: record.api_key_label,
+                api_key_owner: record.api_key_owner,
+                chain_id: to_u32(record.chain_id, "chain id")?,
+                input_token: record.input_token,
+                output_token: record.output_token,
+                trade_count: record.trade_count,
+                total_input_amount: record.total_input.format().map_err(float_error)?,
+                total_output_amount: record.total_output.format().map_err(float_error)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let next_cursor = if page.has_more {
+        volume
             .last()
-            .map(|group| AttributionVolumeCursor::try_from(&group.key))
+            .map(AttributionVolumeCursor::try_from)
             .transpose()?
     } else {
         None
     };
-    let volume = groups
-        .into_iter()
-        .map(|group| {
-            Ok(AttributionVolume {
-                api_key_hash: group.key.api_key_hash,
-                api_key_database_id: group.api_key_database_id,
-                api_key_id: group.api_key_id,
-                api_key_label: group.api_key_label,
-                api_key_owner: group.api_key_owner,
-                chain_id: to_u32(group.key.chain_id, "chain id")?,
-                input_token: group.key.input_token,
-                output_token: group.key.output_token,
-                trade_count: group.accumulator.trade_count,
-                total_input_amount: group
-                    .accumulator
-                    .total_input
-                    .format()
-                    .map_err(float_error)?,
-                total_output_amount: group
-                    .accumulator
-                    .total_output
-                    .format()
-                    .map_err(float_error)?,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
     Ok((volume, next_cursor))
 }
 
-fn push_volume_cursor<'args>(
-    query: &mut QueryBuilder<'args, Sqlite>,
-    cursor: &'args VolumeCursorFilter,
-) {
-    query
-        .push(" AND (trades.api_key_hash > ")
-        .push_bind(&cursor.api_key_hash)
-        .push(" OR (trades.api_key_hash = ")
-        .push_bind(&cursor.api_key_hash)
-        .push(" AND trades.chain_id > ")
-        .push_bind(cursor.chain_id)
-        .push(") OR (trades.api_key_hash = ")
-        .push_bind(&cursor.api_key_hash)
-        .push(" AND trades.chain_id = ")
-        .push_bind(cursor.chain_id)
-        .push(" AND trades.input_token > ")
-        .push_bind(&cursor.input_token)
-        .push(") OR (trades.api_key_hash = ")
-        .push_bind(&cursor.api_key_hash)
-        .push(" AND trades.chain_id = ")
-        .push_bind(cursor.chain_id)
-        .push(" AND trades.input_token = ")
-        .push_bind(&cursor.input_token)
-        .push(" AND trades.output_token > ")
-        .push_bind(&cursor.output_token)
-        .push("))");
-}
-
-fn push_filters<'args>(
-    query: &mut QueryBuilder<'args, Sqlite>,
-    api_key_hash: Option<&'args str>,
-    start_block: Option<i64>,
-    end_block: Option<i64>,
-    transaction_hash: Option<&'args str>,
-) {
-    if let Some(api_key_hash) = api_key_hash {
-        query.push(" AND api_key_hash = ").push_bind(api_key_hash);
-    }
-    if let Some(start_block) = start_block {
-        query.push(" AND block_number >= ").push_bind(start_block);
-    }
-    if let Some(end_block) = end_block {
-        query.push(" AND block_number <= ").push_bind(end_block);
-    }
-    if let Some(transaction_hash) = transaction_hash {
-        query
-            .push(" AND transaction_hash = ")
-            .push_bind(transaction_hash);
+fn attribution_read_error(error: attribution_report::AttributionReportError) -> ApiError {
+    match error {
+        attribution_report::AttributionReportError::Database(error) => query_error(error),
+        attribution_report::AttributionReportError::InvalidAmount(error) => float_error(error),
     }
 }
 
@@ -565,10 +362,10 @@ fn query_error(error: sqlx::Error) -> ApiError {
     ApiError::Internal("failed to query attribution report".into())
 }
 
-impl TryFrom<AttributedTradeRow> for AttributedExecution {
+impl TryFrom<attribution_db::AttributedTradeRow> for AttributedExecution {
     type Error = ApiError;
 
-    fn try_from(row: AttributedTradeRow) -> Result<Self, Self::Error> {
+    fn try_from(row: attribution_db::AttributedTradeRow) -> Result<Self, Self::Error> {
         let signed_output = parse_float(&row.output_amount)?;
         let output = Float::zero()
             .and_then(|zero| zero.sub(signed_output))
@@ -599,10 +396,10 @@ impl TryFrom<AttributedTradeRow> for AttributedExecution {
     }
 }
 
-impl TryFrom<&AttributedTradeRow> for AttributionExecutionCursor {
+impl TryFrom<&attribution_db::AttributedTradeRow> for AttributionExecutionCursor {
     type Error = ApiError;
 
-    fn try_from(row: &AttributedTradeRow) -> Result<Self, Self::Error> {
+    fn try_from(row: &attribution_db::AttributedTradeRow) -> Result<Self, Self::Error> {
         Ok(Self {
             before_block: to_u64(row.block_number, "block number")?,
             before_log_index: to_u64(row.log_index, "log index")?,
@@ -611,22 +408,22 @@ impl TryFrom<&AttributedTradeRow> for AttributionExecutionCursor {
     }
 }
 
-impl TryFrom<&VolumeKey> for AttributionVolumeCursor {
+impl TryFrom<&AttributionVolume> for AttributionVolumeCursor {
     type Error = ApiError;
 
-    fn try_from(key: &VolumeKey) -> Result<Self, Self::Error> {
+    fn try_from(volume: &AttributionVolume) -> Result<Self, Self::Error> {
         Ok(Self {
-            after_api_key_hash: key.api_key_hash.clone(),
-            after_chain_id: to_u32(key.chain_id, "chain id")?,
-            after_input_token: key.input_token.clone(),
-            after_output_token: key.output_token.clone(),
+            after_api_key_hash: volume.api_key_hash.clone(),
+            after_chain_id: volume.chain_id,
+            after_input_token: volume.input_token.clone(),
+            after_output_token: volume.output_token.clone(),
         })
     }
 }
 
 fn execution_cursor_filter(
     params: &AttributionExecutionParams,
-) -> Result<Option<ExecutionCursorFilter<'_>>, ApiError> {
+) -> Result<Option<attribution_db::ExecutionCursor<'_>>, ApiError> {
     match (
         params.before_block,
         params.before_log_index,
@@ -634,7 +431,7 @@ fn execution_cursor_filter(
     ) {
         (None, None, None) => Ok(None),
         (Some(block), Some(log_index), Some(trade_id)) if !trade_id.is_empty() => {
-            Ok(Some(ExecutionCursorFilter {
+            Ok(Some(attribution_db::ExecutionCursor {
                 block: i64::try_from(block)
                     .map_err(|_| ApiError::BadRequest("beforeBlock is too large".into()))?,
                 log_index: i64::try_from(log_index)

@@ -1,3 +1,4 @@
+pub(crate) mod attribution;
 mod migrate;
 mod pool;
 pub(crate) mod registry_history;

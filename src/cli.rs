@@ -103,7 +103,7 @@ async fn create_key(
     .execute(&mut *transaction)
     .await
     .map_err(|e| format!("failed to insert API key: {e}"))?;
-    crate::attribution_reporting::snapshot_api_key(
+    crate::db::attribution::snapshot_api_key(
         &mut transaction,
         insert.last_insert_rowid(),
         &key_id,
@@ -200,15 +200,9 @@ async fn delete_key(pool: &DbPool, key_id: &str) -> Result<(), Box<dyn std::erro
             .await
             .map_err(|e| format!("failed to query API key before deletion: {e}"))?;
     if let Some((id, label, owner)) = identity {
-        crate::attribution_reporting::snapshot_api_key(
-            &mut transaction,
-            id,
-            key_id,
-            &label,
-            &owner,
-        )
-        .await
-        .map_err(|e| format!("failed to preserve API key attribution identity: {e}"))?;
+        crate::db::attribution::snapshot_api_key(&mut transaction, id, key_id, &label, &owner)
+            .await
+            .map_err(|e| format!("failed to preserve API key attribution identity: {e}"))?;
     }
     let result = sqlx::query("DELETE FROM api_keys WHERE key_id = ?")
         .bind(key_id)
