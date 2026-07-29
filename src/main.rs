@@ -412,6 +412,9 @@ async fn main() {
         database_max_connections = cfg.database_max_connections,
         usage_log_max_concurrency = cfg.usage_log_max_concurrency,
         response_cache_max_entries = cfg.response_cache_max_entries,
+        response_cache_max_trade_rows = cfg
+            .response_cache_max_trade_rows
+            .unwrap_or(cfg.response_cache_max_entries),
         response_cache_ttl_seconds = cfg.response_cache_ttl_seconds,
         "rate limiter configured"
     );
@@ -421,8 +424,10 @@ async fn main() {
             let registry_artifact_store = registry_artifact::RegistryArtifactStore::new(
                 std::path::PathBuf::from(&cfg.private_registry_path),
             );
-            let response_caches = cache::RouteResponseCaches::new(
+            let response_caches = cache::RouteResponseCaches::new_with_trade_weight(
                 cfg.response_cache_max_entries,
+                cfg.response_cache_max_trade_rows
+                    .unwrap_or(cfg.response_cache_max_entries),
                 std::time::Duration::from_secs(cfg.response_cache_ttl_seconds),
             );
 
@@ -788,6 +793,7 @@ mod tests {
             database_max_connections: 5,
             usage_log_max_concurrency: 2,
             response_cache_max_entries: 0,
+            response_cache_max_trade_rows: None,
             response_cache_ttl_seconds: 0,
             registry_url,
             private_registry_path: private_registry_path.to_string_lossy().into_owned(),

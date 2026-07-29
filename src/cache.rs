@@ -80,10 +80,32 @@ pub(crate) struct RouteResponseCaches {
     group: CacheGroup,
 }
 
+fn trades_query_weight(response: &TradesQueryResponse) -> u32 {
+    let trade_count = match response {
+        TradesQueryResponse::ByOrderHashes(grouped) => grouped
+            .trades_by_order_hash
+            .iter()
+            .map(|entry| entry.trades.len())
+            .sum::<usize>(),
+        TradesQueryResponse::ByTokens(page) => page.trades.len(),
+    };
+    u32::try_from(trade_count).map_or(u32::MAX, |weight| weight.max(1))
+}
+
 impl RouteResponseCaches {
+    #[cfg(test)]
     pub(crate) fn new(max_capacity: u64, ttl: Duration) -> Self {
+        Self::new_with_trade_weight(max_capacity, max_capacity, ttl)
+    }
+
+    pub(crate) fn new_with_trade_weight(
+        max_capacity: u64,
+        max_trade_weight: u64,
+        ttl: Duration,
+    ) -> Self {
         let enabled = max_capacity > 0 && !ttl.is_zero();
         let max_capacity = max_capacity.max(1);
+        let max_trade_weight = max_trade_weight.max(1);
         let ttl = if ttl.is_zero() {
             Duration::from_nanos(1)
         } else {
@@ -95,16 +117,8 @@ impl RouteResponseCaches {
         let swap_candidates = AppCache::new(max_capacity, ttl);
         let trades_by_token = AppCache::new(max_capacity, ttl);
         let trades_by_taker = AppCache::new(max_capacity, ttl);
-        let trades_query = AppCache::new_weighted(max_capacity, ttl, |_, response| {
-            let trade_count = match response {
-                TradesQueryResponse::ByOrderHashes(grouped) => grouped
-                    .trades_by_order_hash
-                    .iter()
-                    .map(|entry| entry.trades.len())
-                    .sum::<usize>(),
-                TradesQueryResponse::ByTokens(page) => page.trades.len(),
-            };
-            u32::try_from(trade_count).map_or(u32::MAX, |weight| weight.max(1))
+        let trades_query = AppCache::new_weighted(max_trade_weight, ttl, |_, response| {
+            trades_query_weight(response)
         });
 
         let mut group = CacheGroup::new();
