@@ -6,7 +6,7 @@ use super::{
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::batch_query::{
     parse_canonical_addresses, require_single_subgraph_for_pagination, validate_configured_chain,
@@ -38,6 +38,11 @@ struct ValidatedOrdersQuery {
     page: u16,
     page_size: u16,
     denomination: Denomination,
+}
+
+enum OrdersQueryCacheResult {
+    ApiError(ApiError),
+    SkipCache(OrdersListResponse),
 }
 
 #[utoipa::path(
@@ -113,7 +118,9 @@ pub(crate) async fn process_orders_query(
             cache_enabled = caches.is_enabled(),
             "batch orders response cache bypassed"
         );
-        return compute_orders_query(ds, &query).await;
+        return compute_orders_query(ds, &query)
+            .await
+            .map(|(response, _cache_safe)| response);
     }
 
     if let Some(response) = caches.orders_query.get(&cache_key).await {
@@ -132,13 +139,23 @@ pub(crate) async fn process_orders_query(
         cache_hit = false,
         "batch orders response cache miss"
     );
-    caches
+    match caches
         .orders_query
         .get_or_try_insert(cache_key, || async {
-            compute_orders_query(ds, &query).await
+            match compute_orders_query(ds, &query).await {
+                Ok((response, true)) => Ok(response),
+                Ok((response, false)) => Err(OrdersQueryCacheResult::SkipCache(response)),
+                Err(error) => Err(OrdersQueryCacheResult::ApiError(error)),
+            }
         })
         .await
-        .map_err(|error| (*error).clone())
+    {
+        Ok(response) => Ok(response),
+        Err(error) => match error.as_ref() {
+            OrdersQueryCacheResult::ApiError(error) => Err(error.clone()),
+            OrdersQueryCacheResult::SkipCache(response) => Ok(response.clone()),
+        },
+    }
 }
 
 fn validate_orders_query(request: OrdersQueryRequest) -> Result<ValidatedOrdersQuery, ApiError> {
@@ -257,7 +274,7 @@ fn orders_query_cache_key(query: &ValidatedOrdersQuery) -> String {
 async fn compute_orders_query(
     ds: &dyn OrdersListDataSource,
     query: &ValidatedOrdersQuery,
-) -> Result<OrdersListResponse, ApiError> {
+) -> Result<(OrdersListResponse, bool), ApiError> {
     let token_filter = if query.token_addresses.is_empty() {
         None
     } else {
@@ -300,24 +317,21 @@ async fn compute_orders_query(
     deduplicate_and_sort_orders(&mut orders);
 
     let quote_results = get_order_quotes_for_summaries(ds, &orders).await;
-    if quote_results.iter().any(|result| match result {
+    let cache_safe = !quote_results.iter().any(|result| match result {
         Ok(quotes) => quotes
             .iter()
             .any(|quote| !quote.success || quote.error.is_some()),
         Err(_) => true,
-    }) {
-        tracing::error!(
+    });
+    if !cache_safe {
+        tracing::warn!(
             chain_id = query.chain_id,
             batch_size = query.token_addresses.len(),
-            "batch order quote computation was incomplete"
+            "batch order quote computation was incomplete; response will not be cached"
         );
-        return Err(ApiError::coded(
-            ApiErrorCode::OrdersQueryFailed,
-            "the order source could not serve this request",
-        ));
     }
     let wrap_ratios = current_wrap_ratios_for_orders(ds, query.denomination, &orders).await?;
-    build_orders_list_response(
+    let response = build_orders_list_response(
         &orders,
         total_count,
         query.page.into(),
@@ -325,7 +339,8 @@ async fn compute_orders_query(
         quote_results,
         query.denomination,
         &wrap_ratios,
-    )
+    )?;
+    Ok((response, cache_safe))
 }
 
 fn deduplicate_and_sort_orders(orders: &mut Vec<RaindexOrder>) {
@@ -541,14 +556,56 @@ mod tests {
         };
         let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
         for _ in 0..2 {
-            assert!(process_orders_query(
+            let response = process_orders_query(
                 &ds,
                 &caches,
-                request(vec!["0x4200000000000000000000000000000000000006".into(),]),
+                request(vec!["0x4200000000000000000000000000000000000006".into()]),
             )
             .await
-            .is_err());
+            .unwrap();
+            assert_eq!(response.orders[0].io_ratio, "-");
+            assert_eq!(response.orders[0].max_output, None);
         }
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rocket::async_test]
+    async fn concurrent_failed_quote_responses_are_coalesced_but_not_cached() {
+        let order = order(
+            "0x0000000000000000000000000000000000000000000000000000000000000002",
+            2,
+        );
+        let ds = Arc::new(MockDataSource {
+            quotes: Ok(vec![mock_failed_quote()]),
+            delay: Duration::from_millis(25),
+            ..mock_ds(vec![order])
+        });
+        let caches = Arc::new(RouteResponseCaches::new(100, Duration::from_secs(60)));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let ds = Arc::clone(&ds);
+            let caches = Arc::clone(&caches);
+            tasks.spawn(async move {
+                process_orders_query(
+                    ds.as_ref(),
+                    caches.as_ref(),
+                    request(vec!["0x4200000000000000000000000000000000000006".into()]),
+                )
+                .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap().is_ok());
+        }
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
+
+        assert!(process_orders_query(
+            ds.as_ref(),
+            caches.as_ref(),
+            request(vec!["0x4200000000000000000000000000000000000006".into()]),
+        )
+        .await
+        .is_ok());
         assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
     }
 
