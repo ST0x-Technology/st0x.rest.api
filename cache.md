@@ -10,7 +10,7 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
 
 | Cache                          | Location                                                                                   | Contents                                                                                                                                            | TTL / retention                                                                                                                                                                                                             | Invalidation                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Route response caches          | `src/cache.rs` via `ApplicationState.response_caches`                                      | Order quotes, orders by token, swap candidates, trades by token, trades by taker                                                                    | Configured by `response_cache_ttl_seconds`; production and preview use 5 seconds. Disabled when `response_cache_max_entries = 0` or TTL is 0, as in dev. Each cache has its own `response_cache_max_entries` Moka capacity. | Time-based expiry; process restart; `/admin/reload-registry` invalidates all route response caches. Errors are not cached. Concurrent misses are coalesced by Moka. |
+| Route response caches          | `src/cache.rs` via `ApplicationState.response_caches`                                      | Order quotes, orders by token or batch query, swap candidates, trades by token, taker, or batch query                                               | Configured by `response_cache_ttl_seconds`; production and preview use 5 seconds. Disabled when `response_cache_max_entries = 0` or TTL is 0, as in dev. Each cache has its own `response_cache_max_entries` Moka capacity. | Time-based expiry; process restart; `/admin/reload-registry` invalidates all route response caches. Errors are not cached. Concurrent misses are coalesced by Moka. |
 | Token details aggregate cache  | `src/routes/token_details.rs`                                                              | Holder count, transfer count, deposit volume, and withdraw volume for SFT-backed token details, keyed by SFT subgraph URL and wrapped token address | Fixed 5 minutes, max 512 aggregate entries                                                                                                                                                                                  | Time-based expiry; process restart. Tests can clear it directly.                                                                                                    |
 | Token details list cache       | `src/routes/token_details.rs`                                                              | Batch `/v1/tokens/details` responses, keyed by the sorted requested token set and SFT subgraph URLs                                                 | Fixed 5 minutes, max 64 list responses                                                                                                                                                                                      | Time-based expiry; process restart. Partial responses are not cached.                                                                                               |
 | Raindex local DB               | configured by `local_db_path` and owned by `rain_orderbook_common`                         | Local index of configured raindex orderbook state used by list/detail/trade queries                                                                 | Persistent SQLite state. Freshness is controlled by the raindex sync scheduler, not an API TTL.                                                                                                                             | Updated by the raindex local DB sync process. Health is exposed in `/health/detailed` with per-network and per-orderbook sync state.                                |
@@ -20,17 +20,23 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
 
 ## Route Response Cache Details
 
-`RouteResponseCaches` wraps five independent Moka caches:
+`RouteResponseCaches` wraps seven independent Moka caches:
 
 - `order_quotes`: expensive quote results for order summaries/details.
 - `orders_by_token`: paginated `/v1/orders/token/{address}` responses keyed by
   normalized address, state, side, page, page size, and denomination.
+- `orders_query`: paginated `/v1/orders/query` responses keyed by canonical,
+  order-insensitive batch filters. Potentially partial multi-subgraph results
+  bypass this cache.
 - `swap_candidates`: computed take-order candidates for a token pair and the
   exact active order set used to build the route.
 - `trades_by_token`: paginated `/v1/trades/token/{address}` responses keyed by
   normalized address, pagination, time filters, and denomination.
 - `trades_by_taker`: paginated `/v1/trades/taker/{address}` responses keyed the
   same way as token trade responses.
+- `trades_query`: token/time-window and grouped order-hash `/v1/trades/query`
+  responses keyed by canonical, order-insensitive filters. Potentially partial
+  multi-subgraph results bypass this cache.
 
 These caches are intentionally short-lived because they sit in front of data
 that can change quickly with new blocks, vault balance changes, order removals,
