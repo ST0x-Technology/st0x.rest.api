@@ -19,7 +19,7 @@ use rain_orderbook_common::raindex_client::trades::{
     GetTradesByOrderHashesFilters, GetTradesFilters, GetTradesTokenFilter, OrderHashes,
     RaindexTrade, RaindexTradesByOrderHashResult, RaindexTradesListResult,
 };
-use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
+use rain_orderbook_common::raindex_client::types::{ChainIds, PaginationParams, TimeFilter};
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::serde::json::Json;
 use rocket::Route;
@@ -59,6 +59,32 @@ pub(crate) trait TradesDataSource: Send + Sync {
         order_hashes: Vec<B256>,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesByOrderHashResult, ApiError>;
+
+    async fn get_trades_query(
+        &self,
+        chain_id: u32,
+        filters: GetTradesFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let _ = (chain_id, filters, page, page_size);
+        Err(ApiError::Internal("batch trades query unavailable".into()))
+    }
+
+    async fn get_trades_by_order_hashes_query(
+        &self,
+        chain_id: Option<u32>,
+        order_hashes: Vec<B256>,
+        filters: GetTradesByOrderHashesFilters,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
+        let _ = chain_id;
+        self.get_trades_by_order_hashes(order_hashes, filters.time_filter.unwrap_or_default())
+            .await
+    }
+
+    fn complete_query_results_cacheable(&self, _chain_id: Option<u32>) -> bool {
+        true
+    }
 
     async fn get_current_wrap_ratios_for_tokens(
         &self,
@@ -177,6 +203,59 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
                 tracing::error!(error = %e, "failed to query trades by order hashes");
                 ApiError::Internal("failed to query trades".into())
             })
+    }
+
+    async fn get_trades_query(
+        &self,
+        chain_id: u32,
+        filters: GetTradesFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.client
+            .get_trades(
+                Some(ChainIds(vec![chain_id])),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(chain_id, %error, "failed to batch query trades");
+                ApiError::Internal("failed to query trades".into())
+            })
+    }
+
+    async fn get_trades_by_order_hashes_query(
+        &self,
+        chain_id: Option<u32>,
+        order_hashes: Vec<B256>,
+        filters: GetTradesByOrderHashesFilters,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
+        self.client
+            .get_trades_by_order_hashes(
+                chain_id.map(|chain_id| ChainIds(vec![chain_id])),
+                OrderHashes(order_hashes),
+                Some(filters),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(chain_id, %error, "failed to batch query trades by order hashes");
+                ApiError::Internal("failed to query trades".into())
+            })
+    }
+
+    fn complete_query_results_cacheable(&self, chain_id: Option<u32>) -> bool {
+        let Ok(raindexes) = self.client.get_all_raindexes() else {
+            tracing::warn!(chain_id, "unable to verify batch trades cache completeness");
+            return false;
+        };
+        let subgraphs = raindexes
+            .values()
+            .filter(|raindex| chain_id.is_none_or(|id| raindex.network.chain_id == id))
+            .map(|raindex| raindex.subgraph.url.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        subgraphs.len() <= 1
     }
 
     async fn get_current_wrap_ratios_for_tokens(
@@ -383,7 +462,7 @@ pub(super) fn trades_pagination_params(
 pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_trades_by_tx,
-        get_by_order_hashes::get_trades_by_order_hashes,
+        get_by_order_hashes::post_trades_query,
         get_by_token::get_trades_by_token,
         get_by_taker::get_trades_by_taker,
         get_by_address::get_trades_by_address

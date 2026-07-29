@@ -7,7 +7,7 @@ use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
 use rain_orderbook_common::take_orders::TakeOrderCandidate;
 
 use crate::types::orders::OrdersListResponse;
-use crate::types::trades::TradesByAddressResponse;
+use crate::types::trades::{TradesByAddressResponse, TradesQueryResponse};
 
 pub(crate) struct AppCache<K, V>(pub(crate) Cache<K, V>)
 where
@@ -55,9 +55,11 @@ pub(crate) struct RouteResponseCaches {
     enabled: bool,
     pub order_quotes: AppCache<String, Vec<RaindexOrderQuote>>,
     pub orders_by_token: AppCache<String, OrdersListResponse>,
+    pub orders_query: AppCache<String, OrdersListResponse>,
     pub swap_candidates: AppCache<String, Vec<TakeOrderCandidate>>,
     pub trades_by_token: AppCache<String, TradesByAddressResponse>,
     pub trades_by_taker: AppCache<String, TradesByAddressResponse>,
+    pub trades_query: AppCache<String, TradesQueryResponse>,
     group: CacheGroup,
 }
 
@@ -72,24 +74,30 @@ impl RouteResponseCaches {
         };
         let order_quotes = AppCache::new(max_capacity, ttl);
         let orders_by_token = AppCache::new(max_capacity, ttl);
+        let orders_query = AppCache::new(max_capacity, ttl);
         let swap_candidates = AppCache::new(max_capacity, ttl);
         let trades_by_token = AppCache::new(max_capacity, ttl);
         let trades_by_taker = AppCache::new(max_capacity, ttl);
+        let trades_query = AppCache::new(max_capacity, ttl);
 
         let mut group = CacheGroup::new();
         group.register(&order_quotes);
         group.register(&orders_by_token);
+        group.register(&orders_query);
         group.register(&swap_candidates);
         group.register(&trades_by_token);
         group.register(&trades_by_taker);
+        group.register(&trades_query);
 
         Self {
             enabled,
             order_quotes,
             orders_by_token,
+            orders_query,
             swap_candidates,
             trades_by_token,
             trades_by_taker,
+            trades_query,
             group,
         }
     }

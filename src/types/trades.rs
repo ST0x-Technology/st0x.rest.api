@@ -77,16 +77,40 @@ pub struct TradesByAddressResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct TradesByOrderHashesRequest {
+pub struct TradesQueryRequest {
+    /// Existing grouped order-hash mode. When this field is present, including
+    /// as an empty array, the response keeps the legacy `tradesByOrderHash`
+    /// shape.
     #[schema(
-        value_type = Vec<String>,
+        value_type = Option<Vec<String>>,
         example = json!(["0x000000000000000000000000000000000000000000000000000000000000abcd"])
     )]
-    pub order_hashes: Vec<String>,
+    pub order_hashes: Option<Vec<String>>,
+    /// Match trades whose input or output token is in this set. Addresses are
+    /// case-normalized and deduplicated.
+    #[serde(default)]
+    #[schema(
+        value_type = Vec<String>,
+        example = json!([
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "0x4200000000000000000000000000000000000006"
+        ])
+    )]
+    pub token_addresses: Vec<String>,
+    /// Required for token-only batch mode and optional for legacy order-hash
+    /// mode.
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(example = 1718452800)]
     pub start_time: Option<u64>,
     #[schema(example = 1718539200)]
     pub end_time: Option<u64>,
+    /// Used by token-only batch mode.
+    #[schema(example = 1, minimum = 1)]
+    pub page: Option<u16>,
+    /// Used by token-only batch mode.
+    #[schema(example = 20, minimum = 1, maximum = 50)]
+    pub page_size: Option<u16>,
     #[schema(example = "wrapped")]
     pub denomination: Option<Denomination>,
 }
@@ -105,6 +129,13 @@ pub struct TradesByOrderHashesResponse {
     pub trades_by_order_hash: Vec<TradesByOrderHashEntry>,
     #[schema(example = 3)]
     pub total_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum TradesQueryResponse {
+    ByOrderHashes(TradesByOrderHashesResponse),
+    ByTokens(TradesByAddressResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

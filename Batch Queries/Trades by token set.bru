@@ -1,0 +1,39 @@
+meta {
+  name: Trades by token set
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/v1/trades/query
+  body: json
+  auth: basic
+}
+
+auth:basic {
+  username: {{apiKey}}
+  password: {{apiSecret}}
+}
+
+body:json {
+  {
+    "chainId": 8453,
+    "tokenAddresses": [
+      "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "0x4200000000000000000000000000000000000006"
+    ],
+    "startTime": 1718452800,
+    "endTime": 1718539200,
+    "page": 1,
+    "pageSize": 50,
+    "denomination": "wrapped"
+  }
+}
+
+tests {
+  test("returns a bounded trades page", function () {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody()).to.have.property("trades");
+    expect(res.getBody()).to.have.property("pagination");
+  });
+}

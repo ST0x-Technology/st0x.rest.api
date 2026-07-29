@@ -133,13 +133,14 @@ enum StartupRegistryError {
         routes::orders::get_orders_by_tx,
         routes::orders::get_orders_by_address,
         routes::orders::get_orders_by_token,
+        routes::orders::post_orders_query,
         routes::vaults::get_vaults,
         routes::vaults::get_vault_totals,
         routes::admin::put_registry,
         routes::attribution_admin::get_attributed_executions,
         routes::attribution_admin::get_attribution_volume,
         routes::trades::get_by_tx::get_trades_by_tx,
-        routes::trades::get_by_order_hashes::get_trades_by_order_hashes,
+        routes::trades::get_by_order_hashes::post_trades_query,
         routes::trades::get_by_token::get_trades_by_token,
         routes::trades::get_by_taker::get_trades_by_taker,
         routes::trades::get_by_address::get_trades_by_address,
@@ -600,6 +601,8 @@ mod tests {
         let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
         let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
+        let orders_query_path = &openapi["paths"]["/v1/orders/query"]["post"];
+        let trades_query_path = &openapi["paths"]["/v1/trades/query"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
         assert_eq!(
@@ -685,6 +688,23 @@ mod tests {
                 ["description"]
                 .as_str()
                 .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert_eq!(orders_query_path["tags"][0], "Orders");
+        assert_eq!(
+            orders_query_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/OrdersQueryRequest"
+        );
+        assert_eq!(trades_query_path["tags"][0], "Trades");
+        assert_eq!(
+            trades_query_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TradesQueryRequest"
+        );
+        assert_eq!(
+            schemas["TradesQueryResponse"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/TradesByOrderHashesResponse" },
+                { "$ref": "#/components/schemas/TradesByAddressResponse" }
+            ])
         );
         assert!(
             schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
