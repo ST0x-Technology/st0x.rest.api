@@ -217,5 +217,9 @@ short-lived cache keys are order-insensitive and include every
 response-affecting filter, including exact time bounds and denomination.
 Concurrent identical cold requests share one computation, and failed
 computations are never cached. The pinned SDK does not expose a completeness
-flag for partial multi-subgraph list successes, so queries spanning more than
-one subgraph safely bypass the response cache.
+flag or globally paginate merged multi-subgraph list results. Token mode
+therefore rejects networks backed by anything other than exactly one unique
+subgraph so its pagination remains bounded and stable. Legacy grouped order-hash
+mode remains backward compatible and bypasses the response cache when its scope
+spans multiple subgraphs. Grouped responses above 5,000 trades also fail cache
+admission after their concurrent cold request has been coalesced.

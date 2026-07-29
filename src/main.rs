@@ -140,7 +140,7 @@ enum StartupRegistryError {
         routes::attribution_admin::get_attributed_executions,
         routes::attribution_admin::get_attribution_volume,
         routes::trades::get_by_tx::get_trades_by_tx,
-        routes::trades::get_by_order_hashes::post_trades_query,
+        routes::trades::query::post_trades_query,
         routes::trades::get_by_token::get_trades_by_token,
         routes::trades::get_by_taker::get_trades_by_taker,
         routes::trades::get_by_address::get_trades_by_address,

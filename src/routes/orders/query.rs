@@ -8,6 +8,9 @@ use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::batch_query::{
+    parse_canonical_addresses, require_single_subgraph_for_pagination, validate_configured_chain,
+};
 use crate::types::common::Denomination;
 use crate::types::orders::{OrderSide, OrderState, OrdersListResponse, OrdersQueryRequest};
 use alloy::primitives::{Address, B256};
@@ -92,22 +95,6 @@ pub async fn post_orders_query(
     .await
 }
 
-fn validate_configured_chain(
-    client: &rain_orderbook_common::raindex_client::RaindexClient,
-    chain_id: u32,
-) -> Result<(), ApiError> {
-    let configured_chain_ids = client.get_unique_chain_ids().map_err(|error| {
-        tracing::error!(%error, "failed to read configured chain IDs");
-        ApiError::Internal("failed to validate chainId".into())
-    })?;
-    if configured_chain_ids.contains(&chain_id) {
-        Ok(())
-    } else {
-        tracing::warn!(chain_id, "unsupported chainId");
-        Err(ApiError::BadRequest("unsupported chainId".into()))
-    }
-}
-
 pub(crate) async fn process_orders_query(
     ds: &dyn OrdersListDataSource,
     caches: &crate::cache::RouteResponseCaches,
@@ -116,13 +103,14 @@ pub(crate) async fn process_orders_query(
     let query = validate_orders_query(request)?;
     let cache_key = orders_query_cache_key(&query);
 
-    let cache_safe = ds.complete_query_results_cacheable(query.chain_id);
-    if !caches.is_enabled() || !cache_safe {
+    let subgraph_count =
+        ds.query_subgraph_count(query.chain_id, query.raindex_addresses.as_slice())?;
+    require_single_subgraph_for_pagination("orders", query.chain_id, subgraph_count)?;
+    if !caches.is_enabled() {
         tracing::info!(
             chain_id = query.chain_id,
             batch_size = query.token_addresses.len(),
             cache_enabled = caches.is_enabled(),
-            cache_safe,
             "batch orders response cache bypassed"
         );
         return compute_orders_query(ds, &query).await;
@@ -158,21 +146,24 @@ fn validate_orders_query(request: OrdersQueryRequest) -> Result<ValidatedOrdersQ
         return validation_error("chainId must be greater than zero");
     }
 
-    let token_addresses = parse_addresses(
+    let token_addresses = parse_canonical_addresses(
         "tokenAddresses",
         request.token_addresses,
         MAX_ADDRESS_FILTERS,
-    )?;
-    let owner_addresses = parse_addresses(
+    )
+    .map_err(log_orders_validation_error)?;
+    let owner_addresses = parse_canonical_addresses(
         "ownerAddresses",
         request.owner_addresses,
         MAX_ADDRESS_FILTERS,
-    )?;
-    let raindex_addresses = parse_addresses(
+    )
+    .map_err(log_orders_validation_error)?;
+    let raindex_addresses = parse_canonical_addresses(
         "raindexAddresses",
         request.raindex_addresses,
         MAX_ADDRESS_FILTERS,
-    )?;
+    )
+    .map_err(log_orders_validation_error)?;
     let order_hash = request
         .order_hash
         .map(|hash| {
@@ -210,42 +201,15 @@ fn validate_orders_query(request: OrdersQueryRequest) -> Result<ValidatedOrdersQ
     })
 }
 
-fn parse_addresses(
-    field: &'static str,
-    values: Vec<String>,
-    max: usize,
-) -> Result<Vec<Address>, ApiError> {
-    if values.len() > max {
-        return validation_error(format!("{field} must contain at most {max} entries"));
-    }
-
-    let original_len = values.len();
-    let mut addresses = values
-        .into_iter()
-        .map(|value| {
-            Address::from_str(&value).map_err(|error| {
-                tracing::warn!(field, input = %value, %error, "invalid address in batch query");
-                ApiError::BadRequest(format!("invalid address in {field}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    addresses.sort_unstable();
-    addresses.dedup();
-    if addresses.len() != original_len {
-        tracing::info!(
-            field,
-            supplied_count = original_len,
-            canonical_count = addresses.len(),
-            "deduplicated batch address filter"
-        );
-    }
-    Ok(addresses)
-}
-
 fn validation_error<T>(message: impl Into<String>) -> Result<T, ApiError> {
     let message = message.into();
     tracing::warn!(%message, "invalid batch orders query");
     Err(ApiError::BadRequest(message))
+}
+
+fn log_orders_validation_error(error: ApiError) -> ApiError {
+    tracing::warn!(%error, "invalid batch orders query");
+    error
 }
 
 fn orders_query_cache_key(query: &ValidatedOrdersQuery) -> String {
@@ -436,8 +400,16 @@ mod tests {
             self.quotes.clone()
         }
 
-        fn complete_query_results_cacheable(&self, _chain_id: u32) -> bool {
-            self.cache_safe
+        fn query_subgraph_count(
+            &self,
+            _chain_id: u32,
+            raindex_addresses: &[Address],
+        ) -> Result<usize, ApiError> {
+            Ok(if self.cache_safe || !raindex_addresses.is_empty() {
+                1
+            } else {
+                2
+            })
         }
     }
 
@@ -581,22 +553,34 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn potentially_partial_sdk_results_bypass_response_cache() {
+    async fn multi_subgraph_scope_is_rejected_before_querying_sdk() {
         let ds = MockDataSource {
             cache_safe: false,
             ..mock_ds(vec![])
         };
         let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
-        for _ in 0..2 {
-            assert!(process_orders_query(
-                &ds,
-                &caches,
-                request(vec!["0x4200000000000000000000000000000000000006".into(),]),
-            )
-            .await
-            .is_ok());
-        }
-        assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
+        assert!(process_orders_query(
+            &ds,
+            &caches,
+            request(vec!["0x4200000000000000000000000000000000000006".into(),]),
+        )
+        .await
+        .is_err());
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[rocket::async_test]
+    async fn raindex_filter_can_narrow_multi_subgraph_network_to_one() {
+        let ds = MockDataSource {
+            cache_safe: false,
+            ..mock_ds(vec![])
+        };
+        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
+        let mut query = request(vec!["0x4200000000000000000000000000000000000006".into()]);
+        query.raindex_addresses = vec!["0x0000000000000000000000000000000000000001".into()];
+
+        assert!(process_orders_query(&ds, &caches, query).await.is_ok());
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
     }
 
     #[rocket::async_test]

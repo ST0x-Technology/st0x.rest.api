@@ -36,6 +36,10 @@ where
         self.0.insert(key, value).await
     }
 
+    pub(crate) async fn invalidate(&self, key: &K) {
+        self.0.invalidate(key).await
+    }
+
     pub(crate) async fn get_or_try_insert<F, Fut, E>(&self, key: K, fetch: F) -> Result<V, Arc<E>>
     where
         F: FnOnce() -> Fut,

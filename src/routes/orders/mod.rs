@@ -58,13 +58,18 @@ pub(crate) trait OrdersListDataSource: Send + Sync {
         page: u16,
         page_size: u16,
     ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
-        let _ = chain_id;
-        self.get_orders_list(filters, Some(page), Some(page_size))
-            .await
+        let _ = (chain_id, filters, page, page_size);
+        Err(ApiError::Internal("batch orders query unavailable".into()))
     }
 
-    fn complete_query_results_cacheable(&self, _chain_id: u32) -> bool {
-        true
+    fn query_subgraph_count(
+        &self,
+        _chain_id: u32,
+        _raindex_addresses: &[Address],
+    ) -> Result<usize, ApiError> {
+        Err(ApiError::Internal(
+            "batch orders query scope unavailable".into(),
+        ))
     }
 
     async fn get_order_quotes(
@@ -342,17 +347,16 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         Ok((result.orders().to_vec(), result.total_count()))
     }
 
-    fn complete_query_results_cacheable(&self, chain_id: u32) -> bool {
-        let Ok(raindexes) = self.client.get_all_raindexes() else {
-            tracing::warn!(chain_id, "unable to verify batch orders cache completeness");
-            return false;
-        };
-        let subgraphs = raindexes
-            .values()
-            .filter(|raindex| raindex.network.chain_id == chain_id)
-            .map(|raindex| raindex.subgraph.url.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        subgraphs.len() <= 1
+    fn query_subgraph_count(
+        &self,
+        chain_id: u32,
+        raindex_addresses: &[Address],
+    ) -> Result<usize, ApiError> {
+        crate::routes::batch_query::unique_subgraph_count_for_raindexes(
+            self.client,
+            Some(chain_id),
+            raindex_addresses,
+        )
     }
 
     async fn get_order_quotes(

@@ -6,10 +6,12 @@ use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
+use crate::routes::batch_query::{
+    parse_canonical_addresses, require_single_subgraph_for_pagination, validate_configured_chain,
+};
 use crate::types::common::Denomination;
 use crate::types::trades::{
-    TradesByAddressResponse, TradesByOrderHashEntry, TradesByOrderHashesResponse, TradesPagination,
-    TradesQueryRequest, TradesQueryResponse,
+    TradesByOrderHashEntry, TradesByOrderHashesResponse, TradesQueryRequest, TradesQueryResponse,
 };
 use alloy::primitives::{Address, B256};
 use rain_orderbook_common::raindex_client::trades::{
@@ -27,25 +29,64 @@ const MAX_ORDER_HASHES: usize = 64;
 const MAX_PAGE_SIZE: u16 = 50;
 const MAX_PAGE: u16 = 1_000;
 const MAX_TOKEN_TIME_RANGE_SECONDS: u64 = 90 * 24 * 60 * 60;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TradesQueryMode {
-    OrderHashes,
-    Tokens,
-}
+const MAX_CACHED_GROUPED_TRADES: u64 = 5_000;
 
 #[derive(Debug, Clone)]
-struct ValidatedTradesQuery {
-    mode: TradesQueryMode,
+struct ValidatedOrderHashTradesQuery {
     chain_id: Option<u32>,
     token_addresses: Vec<Address>,
     canonical_order_hashes: Vec<B256>,
     response_order_hashes: Vec<B256>,
     start_time: Option<u64>,
     end_time: Option<u64>,
+    denomination: Denomination,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedTokenTradesQuery {
+    chain_id: u32,
+    token_addresses: Vec<Address>,
+    start_time: u64,
+    end_time: u64,
     page: u16,
     page_size: u16,
     denomination: Denomination,
+}
+
+#[derive(Debug, Clone)]
+enum ValidatedTradesQuery {
+    OrderHashes(ValidatedOrderHashTradesQuery),
+    Tokens(ValidatedTokenTradesQuery),
+}
+
+impl ValidatedTradesQuery {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::OrderHashes(_) => "order-hashes",
+            Self::Tokens(_) => "tokens",
+        }
+    }
+
+    fn chain_id(&self) -> Option<u32> {
+        match self {
+            Self::OrderHashes(query) => query.chain_id,
+            Self::Tokens(query) => Some(query.chain_id),
+        }
+    }
+
+    fn batch_size(&self) -> usize {
+        match self {
+            Self::OrderHashes(query) => query.canonical_order_hashes.len(),
+            Self::Tokens(query) => query.token_addresses.len(),
+        }
+    }
+
+    fn response_order_hashes(&self) -> &[B256] {
+        match self {
+            Self::OrderHashes(query) => &query.response_order_hashes,
+            Self::Tokens(_) => &[],
+        }
+    }
 }
 
 #[utoipa::path(
@@ -103,22 +144,6 @@ pub async fn post_trades_query(
     .await
 }
 
-fn validate_configured_chain(
-    client: &rain_orderbook_common::raindex_client::RaindexClient,
-    chain_id: u32,
-) -> Result<(), ApiError> {
-    let configured_chain_ids = client.get_unique_chain_ids().map_err(|error| {
-        tracing::error!(%error, "failed to read configured chain IDs");
-        ApiError::Internal("failed to validate chainId".into())
-    })?;
-    if configured_chain_ids.contains(&chain_id) {
-        Ok(())
-    } else {
-        tracing::warn!(chain_id, "unsupported chainId");
-        Err(ApiError::BadRequest("unsupported chainId".into()))
-    }
-}
-
 pub(crate) async fn process_trades_query(
     ds: &dyn TradesDataSource,
     caches: &crate::cache::RouteResponseCaches,
@@ -127,43 +152,60 @@ pub(crate) async fn process_trades_query(
     let query = validate_trades_query(request)?;
     let cache_key = trades_query_cache_key(&query);
 
-    let cache_safe = ds.complete_query_results_cacheable(query.chain_id);
+    let subgraph_count = ds.query_subgraph_count(query.chain_id())?;
+    let cache_safe = match &query {
+        ValidatedTradesQuery::Tokens(query) => {
+            require_single_subgraph_for_pagination("trades", query.chain_id, subgraph_count)?;
+            true
+        }
+        ValidatedTradesQuery::OrderHashes(_) => subgraph_count <= 1,
+    };
     let response = if !caches.is_enabled() || !cache_safe {
         tracing::info!(
-            mode = ?query.mode,
-            batch_size = query.token_addresses.len().max(query.canonical_order_hashes.len()),
+            mode = query.mode(),
+            batch_size = query.batch_size(),
             cache_enabled = caches.is_enabled(),
             cache_safe,
+            subgraph_count,
             "batch trades response cache bypassed"
         );
         compute_trades_query(ds, &query).await?
     } else if let Some(response) = caches.trades_query.get(&cache_key).await {
         tracing::info!(
-            mode = ?query.mode,
-            batch_size = query.token_addresses.len().max(query.canonical_order_hashes.len()),
+            mode = query.mode(),
+            batch_size = query.batch_size(),
             cache_hit = true,
             "batch trades response cache hit"
         );
         response
     } else {
         tracing::info!(
-            mode = ?query.mode,
-            batch_size = query.token_addresses.len().max(query.canonical_order_hashes.len()),
+            mode = query.mode(),
+            batch_size = query.batch_size(),
             cache_hit = false,
             "batch trades response cache miss"
         );
         caches
             .trades_query
-            .get_or_try_insert(cache_key, || async {
+            .get_or_try_insert(cache_key.clone(), || async {
                 compute_trades_query(ds, &query).await
             })
             .await
             .map_err(|error| (*error).clone())?
     };
 
+    if !trades_query_cache_admissible(&response) {
+        caches.trades_query.invalidate(&cache_key).await;
+        tracing::info!(
+            mode = query.mode(),
+            batch_size = query.batch_size(),
+            "batch trades response exceeded cache admission bound"
+        );
+    }
+
     Ok(restore_legacy_hash_order(
         response,
-        &query.response_order_hashes,
+        query.response_order_hashes(),
     ))
 }
 
@@ -177,11 +219,6 @@ fn validate_trades_query(request: TradesQueryRequest) -> Result<ValidatedTradesQ
             "orderHashes must contain at most {MAX_ORDER_HASHES} entries"
         ));
     }
-    if request.token_addresses.len() > MAX_TOKEN_ADDRESSES {
-        return validation_error(format!(
-            "tokenAddresses must contain at most {MAX_TOKEN_ADDRESSES} entries"
-        ));
-    }
     if request.chain_id == Some(0) {
         return validation_error("chainId must be greater than zero");
     }
@@ -193,34 +230,45 @@ fn validate_trades_query(request: TradesQueryRequest) -> Result<ValidatedTradesQ
         return validation_error("startTime must be less than or equal to endTime");
     }
 
-    let token_addresses = parse_addresses(request.token_addresses)?;
-    let has_order_hashes_field = request.order_hashes.is_some();
-    let response_order_hashes =
-        parse_order_hashes_preserving_order(request.order_hashes.unwrap_or_default())?;
-    let mut canonical_order_hashes = response_order_hashes.clone();
-    canonical_order_hashes.sort_unstable();
-    let mode = if has_order_hashes_field {
-        TradesQueryMode::OrderHashes
-    } else {
-        TradesQueryMode::Tokens
-    };
+    let token_addresses = parse_canonical_addresses(
+        "tokenAddresses",
+        request.token_addresses,
+        MAX_TOKEN_ADDRESSES,
+    )
+    .map_err(log_trades_validation_error)?;
+    let denomination = request.denomination.unwrap_or_default();
 
-    let (page, page_size) = match mode {
-        TradesQueryMode::OrderHashes => {
+    match request.order_hashes {
+        Some(order_hashes) => {
             if request.page.is_some() || request.page_size.is_some() {
                 return validation_error(
                     "page and pageSize are only supported in token-only query mode",
                 );
             }
-            (1, MAX_PAGE_SIZE)
+            let response_order_hashes = parse_order_hashes_preserving_order(order_hashes)?;
+            let mut canonical_order_hashes = response_order_hashes.clone();
+            canonical_order_hashes.sort_unstable();
+            Ok(ValidatedTradesQuery::OrderHashes(
+                ValidatedOrderHashTradesQuery {
+                    chain_id: request.chain_id,
+                    token_addresses,
+                    canonical_order_hashes,
+                    response_order_hashes,
+                    start_time: request.start_time,
+                    end_time: request.end_time,
+                    denomination,
+                },
+            ))
         }
-        TradesQueryMode::Tokens => {
+        None => {
             if token_addresses.is_empty() {
                 return validation_error("tokenAddresses or orderHashes is required");
             }
-            if request.chain_id.is_none() {
-                return validation_error("chainId is required in token-only query mode");
-            }
+            let chain_id = request.chain_id.ok_or_else(|| {
+                log_trades_validation_error(ApiError::BadRequest(
+                    "chainId is required in token-only query mode".into(),
+                ))
+            })?;
             let (Some(start), Some(end)) = (request.start_time, request.end_time) else {
                 return validation_error(
                     "startTime and endTime are required in token-only query mode",
@@ -237,45 +285,17 @@ fn validate_trades_query(request: TradesQueryRequest) -> Result<ValidatedTradesQ
             if page_size == 0 || page_size > MAX_PAGE_SIZE {
                 return validation_error("pageSize must be between 1 and 50");
             }
-            (page, page_size)
+            Ok(ValidatedTradesQuery::Tokens(ValidatedTokenTradesQuery {
+                chain_id,
+                token_addresses,
+                start_time: start,
+                end_time: end,
+                page,
+                page_size,
+                denomination,
+            }))
         }
-    };
-
-    Ok(ValidatedTradesQuery {
-        mode,
-        chain_id: request.chain_id,
-        token_addresses,
-        canonical_order_hashes,
-        response_order_hashes,
-        start_time: request.start_time,
-        end_time: request.end_time,
-        page,
-        page_size,
-        denomination: request.denomination.unwrap_or_default(),
-    })
-}
-
-fn parse_addresses(values: Vec<String>) -> Result<Vec<Address>, ApiError> {
-    let original_len = values.len();
-    let mut addresses = values
-        .into_iter()
-        .map(|value| {
-            Address::from_str(&value).map_err(|error| {
-                tracing::warn!(input = %value, %error, "invalid token address");
-                ApiError::BadRequest("invalid address in tokenAddresses".into())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    addresses.sort_unstable();
-    addresses.dedup();
-    if original_len != addresses.len() {
-        tracing::info!(
-            supplied_count = original_len,
-            canonical_count = addresses.len(),
-            "deduplicated batch token addresses"
-        );
     }
-    Ok(addresses)
 }
 
 fn parse_order_hashes_preserving_order(values: Vec<String>) -> Result<Vec<B256>, ApiError> {
@@ -307,44 +327,62 @@ fn validation_error<T>(message: impl Into<String>) -> Result<T, ApiError> {
     Err(ApiError::BadRequest(message))
 }
 
+fn log_trades_validation_error(error: ApiError) -> ApiError {
+    tracing::warn!(%error, "invalid batch trades query");
+    error
+}
+
 fn trades_query_cache_key(query: &ValidatedTradesQuery) -> String {
-    let tokens = query
-        .token_addresses
-        .iter()
-        .map(|address| format!("{address:#x}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let hashes = query
-        .canonical_order_hashes
-        .iter()
-        .map(|hash| format!("{hash:#x}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let denomination = match query.denomination {
+    let addresses = |values: &[Address]| {
+        values
+            .iter()
+            .map(|address| format!("{address:#x}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let denomination = |value| match value {
         Denomination::Wrapped => "wrapped",
         Denomination::Unwrapped => "unwrapped",
     };
-    format!(
-        "trades-query/v1/{:?}/{}/{}/{}/{:?}/{:?}/{}/{}/{}",
-        query.mode,
-        query.chain_id.unwrap_or_default(),
-        tokens,
-        hashes,
-        query.start_time,
-        query.end_time,
-        query.page,
-        query.page_size,
-        denomination
-    )
+
+    match query {
+        ValidatedTradesQuery::OrderHashes(query) => {
+            let hashes = query
+                .canonical_order_hashes
+                .iter()
+                .map(|hash| format!("{hash:#x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "trades-query/v2/order-hashes/{}/{}/{}/{start_time:?}/{end_time:?}/{}",
+                query.chain_id.unwrap_or_default(),
+                addresses(&query.token_addresses),
+                hashes,
+                denomination(query.denomination),
+                start_time = query.start_time,
+                end_time = query.end_time,
+            )
+        }
+        ValidatedTradesQuery::Tokens(query) => format!(
+            "trades-query/v2/tokens/{}/{}/{}/{}/{}/{}/{}",
+            query.chain_id,
+            addresses(&query.token_addresses),
+            query.start_time,
+            query.end_time,
+            query.page,
+            query.page_size,
+            denomination(query.denomination)
+        ),
+    }
 }
 
 async fn compute_trades_query(
     ds: &dyn TradesDataSource,
     query: &ValidatedTradesQuery,
 ) -> Result<TradesQueryResponse, ApiError> {
-    match query.mode {
-        TradesQueryMode::OrderHashes => compute_order_hash_trades(ds, query).await,
-        TradesQueryMode::Tokens => compute_token_trades(ds, query).await,
+    match query {
+        ValidatedTradesQuery::OrderHashes(query) => compute_order_hash_trades(ds, query).await,
+        ValidatedTradesQuery::Tokens(query) => compute_token_trades(ds, query).await,
     }
 }
 
@@ -357,7 +395,7 @@ fn token_filter(tokens: &[Address]) -> Option<GetTradesTokenFilter> {
 
 async fn compute_order_hash_trades(
     ds: &dyn TradesDataSource,
-    query: &ValidatedTradesQuery,
+    query: &ValidatedOrderHashTradesQuery,
 ) -> Result<TradesQueryResponse, ApiError> {
     tracing::info!(
         chain_id = query.chain_id,
@@ -390,11 +428,12 @@ async fn compute_order_hash_trades(
         })
         .collect::<Vec<_>>();
     grouped_trades.sort_by_key(|(order_hash, _)| *order_hash);
-    let all_trades = grouped_trades
-        .iter()
-        .flat_map(|(_, trades)| trades.iter().cloned())
-        .collect::<Vec<_>>();
-    let wrap_ratios = current_wrap_ratios_for_trades(ds, query.denomination, &all_trades).await?;
+    let wrap_ratios = current_wrap_ratios_for_trades(
+        ds,
+        query.denomination,
+        grouped_trades.iter().flat_map(|(_, trades)| trades.iter()),
+    )
+    .await?;
     let trades_by_order_hash = grouped_trades
         .into_iter()
         .map(|(order_hash, trades)| {
@@ -420,13 +459,10 @@ async fn compute_order_hash_trades(
 
 async fn compute_token_trades(
     ds: &dyn TradesDataSource,
-    query: &ValidatedTradesQuery,
+    query: &ValidatedTokenTradesQuery,
 ) -> Result<TradesQueryResponse, ApiError> {
-    let chain_id = query
-        .chain_id
-        .ok_or_else(|| ApiError::BadRequest("chainId is required".into()))?;
     tracing::info!(
-        chain_id,
+        chain_id = query.chain_id,
         batch_size = query.token_addresses.len(),
         page = query.page,
         page_size = query.page_size,
@@ -434,12 +470,12 @@ async fn compute_token_trades(
     );
     let result = ds
         .get_trades_query(
-            chain_id,
+            query.chain_id,
             GetTradesFilters {
                 tokens: token_filter(&query.token_addresses),
                 time_filter: Some(TimeFilter {
-                    start: query.start_time,
-                    end: query.end_time,
+                    start: Some(query.start_time),
+                    end: Some(query.end_time),
                 }),
                 ..Default::default()
             },
@@ -452,40 +488,37 @@ async fn compute_token_trades(
     deduplicate_and_sort_trades(&mut trades);
     let duplicate_count = returned_count.saturating_sub(trades.len()) as u64;
     let total_trades = result.total_count().saturating_sub(duplicate_count);
-    let wrap_ratios = current_wrap_ratios_for_trades(ds, query.denomination, &trades).await?;
-    let trades = trades
-        .iter()
-        .map(|trade| map_trade_for_list(trade, query.denomination, &wrap_ratios))
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    let total_pages = total_trades.div_ceil(u64::from(query.page_size));
-
-    Ok(TradesQueryResponse::ByTokens(TradesByAddressResponse {
-        trades,
-        pagination: TradesPagination {
-            page: query.page.into(),
-            page_size: query.page_size.into(),
-            total_trades,
-            total_pages,
-            has_more: u64::from(query.page) < total_pages,
-        },
-    }))
+    super::build_trades_list_response_from_parts(
+        ds,
+        &trades,
+        total_trades,
+        query.page.into(),
+        query.page_size.into(),
+        query.denomination,
+    )
+    .await
+    .map(TradesQueryResponse::ByTokens)
 }
 
 fn deduplicate_and_sort_trades(trades: &mut Vec<RaindexTrade>) {
     let original_len = trades.len();
     let mut seen = HashSet::new();
     trades.retain(|trade| seen.insert((trade.chain_id(), trade.id())));
-    trades.sort_by(|left, right| {
-        right
-            .timestamp()
-            .cmp(&left.timestamp())
-            .then_with(|| left.id().cmp(&right.id()))
-    });
+    trades.sort_by_cached_key(|trade| (std::cmp::Reverse(trade.timestamp()), trade.id()));
     tracing::info!(
         returned_count = original_len,
         deduplicated_count = trades.len(),
         "canonicalized batch trades result"
     );
+}
+
+fn trades_query_cache_admissible(response: &TradesQueryResponse) -> bool {
+    match response {
+        TradesQueryResponse::ByOrderHashes(response) => {
+            response.total_count <= MAX_CACHED_GROUPED_TRADES
+        }
+        TradesQueryResponse::ByTokens(_) => true,
+    }
 }
 
 fn restore_legacy_hash_order(
@@ -580,14 +613,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_trades_by_order_hashes(
-            &self,
-            _order_hashes: Vec<B256>,
-            _time_filter: TimeFilter,
-        ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
-            unimplemented!()
-        }
-
         async fn get_trades_query(
             &self,
             chain_id: u32,
@@ -618,8 +643,8 @@ mod tests {
             self.grouped_result.clone()
         }
 
-        fn complete_query_results_cacheable(&self, _chain_id: Option<u32>) -> bool {
-            self.cache_safe
+        fn query_subgraph_count(&self, _chain_id: Option<u32>) -> Result<usize, ApiError> {
+            Ok(if self.cache_safe { 1 } else { 2 })
         }
     }
 
@@ -725,6 +750,15 @@ mod tests {
             trades_query_cache_key(&first),
             trades_query_cache_key(&second)
         );
+    }
+
+    #[test]
+    fn oversized_grouped_response_is_not_cache_admissible() {
+        let response = TradesQueryResponse::ByOrderHashes(TradesByOrderHashesResponse {
+            trades_by_order_hash: vec![],
+            total_count: MAX_CACHED_GROUPED_TRADES + 1,
+        });
+        assert!(!trades_query_cache_admissible(&response));
     }
 
     #[test]
@@ -919,20 +953,41 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn potentially_partial_sdk_results_bypass_response_cache() {
+    async fn multi_subgraph_token_scope_is_rejected_before_querying_sdk() {
         let ds = MockTradesDataSource {
             cache_safe: false,
             ..mock_ds()
         };
         let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
+        assert!(process_trades_query(
+            &ds,
+            &caches,
+            token_request(vec!["0x4200000000000000000000000000000000000006".into(),]),
+        )
+        .await
+        .is_err());
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[rocket::async_test]
+    async fn potentially_partial_legacy_results_bypass_response_cache() {
+        let ds = MockTradesDataSource {
+            cache_safe: false,
+            ..mock_ds()
+        };
+        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
+        let request = || TradesQueryRequest {
+            order_hashes: Some(vec![]),
+            token_addresses: vec![],
+            chain_id: None,
+            start_time: None,
+            end_time: None,
+            page: None,
+            page_size: None,
+            denomination: None,
+        };
         for _ in 0..2 {
-            assert!(process_trades_query(
-                &ds,
-                &caches,
-                token_request(vec!["0x4200000000000000000000000000000000000006".into(),]),
-            )
-            .await
-            .is_ok());
+            assert!(process_trades_query(&ds, &caches, request()).await.is_ok());
         }
         assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
     }

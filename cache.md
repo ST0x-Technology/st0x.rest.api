@@ -26,8 +26,8 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
 - `orders_by_token`: paginated `/v1/orders/token/{address}` responses keyed by
   normalized address, state, side, page, page size, and denomination.
 - `orders_query`: paginated `/v1/orders/query` responses keyed by canonical,
-  order-insensitive batch filters. Potentially partial multi-subgraph results
-  bypass this cache.
+  order-insensitive batch filters. Networks backed by anything other than one
+  unique subgraph are rejected because the SDK cannot globally paginate them.
 - `swap_candidates`: computed take-order candidates for a token pair and the
   exact active order set used to build the route.
 - `trades_by_token`: paginated `/v1/trades/token/{address}` responses keyed by
@@ -35,8 +35,10 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
 - `trades_by_taker`: paginated `/v1/trades/taker/{address}` responses keyed the
   same way as token trade responses.
 - `trades_query`: token/time-window and grouped order-hash `/v1/trades/query`
-  responses keyed by canonical, order-insensitive filters. Potentially partial
-  multi-subgraph results bypass this cache.
+  responses keyed by canonical, order-insensitive filters. Multi-subgraph token
+  queries are rejected; legacy grouped queries spanning multiple subgraphs
+  bypass this cache. Grouped responses above 5,000 trades are coalesced but
+  evicted immediately after computation.
 
 These caches are intentionally short-lived because they sit in front of data
 that can change quickly with new blocks, vault balance changes, order removals,
