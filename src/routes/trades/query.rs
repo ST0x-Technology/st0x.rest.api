@@ -26,7 +26,7 @@ use tracing::Instrument;
 
 const MAX_TOKEN_ADDRESSES: usize = 64;
 const MAX_ORDER_HASHES: usize = 64;
-const MAX_PAGE_SIZE: u16 = 50;
+const MAX_PAGE_SIZE: u16 = 500;
 const MAX_PAGE: u16 = 1_000;
 const MAX_TOKEN_TIME_RANGE_SECONDS: u64 = 90 * 24 * 60 * 60;
 const MAX_CACHED_GROUPED_TRADES: u64 = 5_000;
@@ -283,7 +283,7 @@ fn validate_trades_query(request: TradesQueryRequest) -> Result<ValidatedTradesQ
                 return validation_error("page must be between 1 and 1000");
             }
             if page_size == 0 || page_size > MAX_PAGE_SIZE {
-                return validation_error("pageSize must be between 1 and 50");
+                return validation_error("pageSize must be between 1 and 500");
             }
             Ok(ValidatedTradesQuery::Tokens(ValidatedTokenTradesQuery {
                 chain_id,
@@ -766,6 +766,10 @@ mod tests {
         let mut request = token_request(vec!["0x4200000000000000000000000000000000000006".into()]);
         request.end_time = Some(request.start_time.unwrap() + MAX_TOKEN_TIME_RANGE_SECONDS + 1);
         assert!(validate_trades_query(request).is_err());
+
+        let mut request = token_request(vec!["0x4200000000000000000000000000000000000006".into()]);
+        request.page_size = Some(MAX_PAGE_SIZE);
+        assert!(validate_trades_query(request).is_ok());
 
         let mut request = token_request(vec!["0x4200000000000000000000000000000000000006".into()]);
         request.page_size = Some(MAX_PAGE_SIZE + 1);

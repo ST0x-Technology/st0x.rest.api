@@ -28,6 +28,19 @@ where
         )
     }
 
+    pub(crate) fn new_weighted<F>(max_capacity: u64, ttl: Duration, weigher: F) -> Self
+    where
+        F: Fn(&K, &V) -> u32 + Send + Sync + 'static,
+    {
+        Self(
+            Cache::builder()
+                .max_capacity(max_capacity)
+                .weigher(weigher)
+                .time_to_live(ttl)
+                .build(),
+        )
+    }
+
     pub(crate) async fn get(&self, key: &K) -> Option<V> {
         self.0.get(key).await
     }
@@ -82,7 +95,17 @@ impl RouteResponseCaches {
         let swap_candidates = AppCache::new(max_capacity, ttl);
         let trades_by_token = AppCache::new(max_capacity, ttl);
         let trades_by_taker = AppCache::new(max_capacity, ttl);
-        let trades_query = AppCache::new(max_capacity, ttl);
+        let trades_query = AppCache::new_weighted(max_capacity, ttl, |_, response| {
+            let trade_count = match response {
+                TradesQueryResponse::ByOrderHashes(grouped) => grouped
+                    .trades_by_order_hash
+                    .iter()
+                    .map(|entry| entry.trades.len())
+                    .sum::<usize>(),
+                TradesQueryResponse::ByTokens(page) => page.trades.len(),
+            };
+            u32::try_from(trade_count).map_or(u32::MAX, |weight| weight.max(1))
+        });
 
         let mut group = CacheGroup::new();
         group.register(&order_quotes);
@@ -168,6 +191,15 @@ mod tests {
     async fn test_app_cache_get_returns_none_for_missing_key() {
         let cache: AppCache<&str, u32> = AppCache::new(10, Duration::from_secs(60));
         assert!(cache.get(&"missing").await.is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_weighted_cache_rejects_entry_over_capacity() {
+        let cache: AppCache<&str, u32> =
+            AppCache::new_weighted(3, Duration::from_secs(60), |_, weight| *weight);
+        cache.insert("heavy", 4).await;
+        cache.0.run_pending_tasks().await;
+        assert!(cache.get(&"heavy").await.is_none());
     }
 
     #[rocket::async_test]

@@ -109,7 +109,7 @@ pub struct TradesQueryRequest {
     #[schema(example = 1, minimum = 1)]
     pub page: Option<u16>,
     /// Used by token-only batch mode.
-    #[schema(example = 20, minimum = 1, maximum = 50)]
+    #[schema(example = 20, minimum = 1, maximum = 500)]
     pub page_size: Option<u16>,
     #[schema(example = "wrapped")]
     pub denomination: Option<Denomination>,

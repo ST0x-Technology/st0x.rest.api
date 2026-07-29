@@ -169,7 +169,7 @@ Omit `orderHashes` and provide `chainId`, `tokenAddresses`, `startTime`, and
 
 Token-set mode requires 1 through 64 token addresses, a configured non-zero
 `chainId`, and both time bounds. The inclusive time window may not exceed 90
-days. `page` is bounded to 1 through 1000 and `pageSize` to 1 through 50.
+days. `page` is bounded to 1 through 1000 and `pageSize` to 1 through 500.
 
 The response is `TradesByAddressResponse`, with the same `trades` and
 `pagination` fields as the existing single-token route. Trades that match both
