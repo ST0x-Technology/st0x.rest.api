@@ -102,7 +102,6 @@ fn trades_query_weight(response: &TradesQueryResponse) -> u32 {
 }
 
 impl RouteResponseCaches {
-    #[cfg(test)]
     pub(crate) fn new(max_capacity: u64, ttl: Duration) -> Self {
         Self::new_with_trade_weight(max_capacity, max_capacity, ttl)
     }
