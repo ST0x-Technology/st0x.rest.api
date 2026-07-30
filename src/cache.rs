@@ -66,6 +66,7 @@ where
 
 pub(crate) struct RouteResponseCaches {
     enabled: bool,
+    trades_query_enabled: bool,
     pub order_quotes: AppCache<String, Vec<RaindexOrderQuote>>,
     pub orders_by_token: AppCache<String, OrdersListResponse>,
     pub orders_query: AppCache<String, OrdersListResponse>,
@@ -76,16 +77,28 @@ pub(crate) struct RouteResponseCaches {
     group: CacheGroup,
 }
 
+fn trade_row_weight(counts: impl IntoIterator<Item = usize>) -> u32 {
+    counts
+        .into_iter()
+        .try_fold(0_u32, |total, count| {
+            u32::try_from(count)
+                .ok()
+                .and_then(|count| total.checked_add(count))
+        })
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
 fn trades_query_weight(response: &TradesQueryResponse) -> u32 {
-    let trade_count = match response {
-        TradesQueryResponse::ByOrderHashes(grouped) => grouped
-            .trades_by_order_hash
-            .iter()
-            .map(|entry| entry.trades.len())
-            .sum::<usize>(),
-        TradesQueryResponse::ByTokens(page) => page.trades.len(),
-    };
-    u32::try_from(trade_count).map_or(u32::MAX, |weight| weight.max(1))
+    match response {
+        TradesQueryResponse::ByOrderHashes(grouped) => trade_row_weight(
+            grouped
+                .trades_by_order_hash
+                .iter()
+                .map(|entry| entry.trades.len()),
+        ),
+        TradesQueryResponse::ByTokens(page) => trade_row_weight([page.trades.len()]),
+    }
 }
 
 impl RouteResponseCaches {
@@ -100,6 +113,7 @@ impl RouteResponseCaches {
         ttl: Duration,
     ) -> Self {
         let enabled = max_capacity > 0 && !ttl.is_zero();
+        let trades_query_enabled = enabled && max_trade_weight > 0;
         let max_capacity = max_capacity.max(1);
         let max_trade_weight = max_trade_weight.max(1);
         let ttl = if ttl.is_zero() {
@@ -128,6 +142,7 @@ impl RouteResponseCaches {
 
         Self {
             enabled,
+            trades_query_enabled,
             order_quotes,
             orders_by_token,
             orders_query,
@@ -141,6 +156,10 @@ impl RouteResponseCaches {
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(crate) fn trades_query_is_enabled(&self) -> bool {
+        self.trades_query_enabled
     }
 
     pub(crate) fn invalidate_all(&self) {
@@ -189,6 +208,32 @@ impl CacheGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::common::TokenRef;
+    use crate::types::trades::{
+        TradeByAddress, TradesByOrderHashEntry, TradesByOrderHashesResponse, TradesPagination,
+    };
+    use alloy::primitives::{Address, B256};
+
+    fn mock_trade() -> TradeByAddress {
+        TradeByAddress {
+            tx_hash: B256::ZERO,
+            input_amount: "1".into(),
+            output_amount: "1".into(),
+            input_token: TokenRef {
+                address: Address::ZERO,
+                symbol: "IN".into(),
+                decimals: 18,
+            },
+            output_token: TokenRef {
+                address: Address::ZERO,
+                symbol: "OUT".into(),
+                decimals: 18,
+            },
+            order_hash: Some(B256::ZERO),
+            timestamp: 1,
+            block_number: 1,
+        }
+    }
 
     #[rocket::async_test]
     async fn test_app_cache_insert_and_get() {
@@ -210,6 +255,54 @@ mod tests {
         cache.insert("heavy", 4).await;
         cache.0.run_pending_tasks().await;
         assert!(cache.get(&"heavy").await.is_none());
+    }
+
+    #[test]
+    fn trades_query_weight_counts_token_mode_rows() {
+        let response = TradesQueryResponse::ByTokens(TradesByAddressResponse {
+            trades: vec![mock_trade(), mock_trade(), mock_trade()],
+            pagination: TradesPagination {
+                page: 1,
+                page_size: 3,
+                total_trades: 3,
+                total_pages: 1,
+                has_more: false,
+            },
+        });
+
+        assert_eq!(trades_query_weight(&response), 3);
+    }
+
+    #[test]
+    fn trades_query_weight_sums_grouped_rows() {
+        let response = TradesQueryResponse::ByOrderHashes(TradesByOrderHashesResponse {
+            trades_by_order_hash: vec![
+                TradesByOrderHashEntry {
+                    order_hash: B256::ZERO,
+                    trades: vec![mock_trade(), mock_trade()],
+                },
+                TradesByOrderHashEntry {
+                    order_hash: B256::with_last_byte(1),
+                    trades: vec![mock_trade()],
+                },
+            ],
+            total_count: 3,
+        });
+
+        assert_eq!(trades_query_weight(&response), 3);
+    }
+
+    #[test]
+    fn trade_row_weight_saturates_on_overflow() {
+        assert_eq!(trade_row_weight([u32::MAX as usize, 1]), u32::MAX);
+    }
+
+    #[test]
+    fn zero_trade_row_budget_disables_only_trades_query_cache() {
+        let caches = RouteResponseCaches::new_with_trade_weight(100, 0, Duration::from_secs(5));
+
+        assert!(caches.is_enabled());
+        assert!(!caches.trades_query_is_enabled());
     }
 
     #[rocket::async_test]

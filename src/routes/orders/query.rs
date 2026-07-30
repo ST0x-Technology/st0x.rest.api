@@ -1,16 +1,14 @@
 use super::{
     active_filter_for_state, build_orders_list_response, current_wrap_ratios_for_orders,
-    get_order_quotes_for_summaries, OrdersListDataSource, RaindexOrdersListDataSource,
-    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    get_order_quotes_for_summaries, quote_set_is_complete, BatchOrdersDataSource,
+    RaindexOrdersListDataSource, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::routes::batch_query::{
-    parse_canonical_addresses, require_single_subgraph_for_pagination, validate_configured_chain,
-};
+use crate::routes::batch_query::{parse_canonical_addresses, validate_configured_chain};
 use crate::types::common::Denomination;
 use crate::types::orders::{OrderSide, OrderState, OrdersListResponse, OrdersQueryRequest};
 use alloy::primitives::{Address, B256};
@@ -42,7 +40,20 @@ struct ValidatedOrdersQuery {
 
 enum OrdersQueryCacheResult {
     ApiError(ApiError),
-    SkipCache(OrdersListResponse),
+    NotCacheable(OrdersListResponse),
+}
+
+enum ComputedOrdersQuery {
+    Cacheable(OrdersListResponse),
+    NotCacheable(OrdersListResponse),
+}
+
+impl ComputedOrdersQuery {
+    fn into_response(self) -> OrdersListResponse {
+        match self {
+            Self::Cacheable(response) | Self::NotCacheable(response) => response,
+        }
+    }
 }
 
 #[utoipa::path(
@@ -55,6 +66,7 @@ enum OrdersQueryCacheResult {
         (status = 200, description = "Bounded orders page matching the batch filters", body = OrdersListResponse),
         (status = 400, description = "Invalid batch filters or bounds", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 422, description = "Request body could not be deserialized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 502, description = "Order source or live quote query failed", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -81,14 +93,11 @@ pub async fn post_orders_query(
             "batch orders query request received"
         );
 
-        let client = {
-            let raindex = shared_raindex.read().await;
-            raindex.client().clone()
-        };
-        validate_configured_chain(&client, request.chain_id)?;
+        let raindex = shared_raindex.read().await;
+        validate_configured_chain(raindex.client(), request.chain_id)?;
 
         let ds = RaindexOrdersListDataSource {
-            client: &client,
+            client: raindex.client(),
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
@@ -101,16 +110,13 @@ pub async fn post_orders_query(
 }
 
 pub(crate) async fn process_orders_query(
-    ds: &dyn OrdersListDataSource,
+    ds: &dyn BatchOrdersDataSource,
     caches: &crate::cache::RouteResponseCaches,
     request: OrdersQueryRequest,
 ) -> Result<OrdersListResponse, ApiError> {
     let query = validate_orders_query(request)?;
     let cache_key = orders_query_cache_key(&query);
 
-    let subgraph_count =
-        ds.query_subgraph_count(query.chain_id, query.raindex_addresses.as_slice())?;
-    require_single_subgraph_for_pagination("orders", query.chain_id, subgraph_count)?;
     if !caches.is_enabled() {
         tracing::info!(
             chain_id = query.chain_id,
@@ -120,7 +126,7 @@ pub(crate) async fn process_orders_query(
         );
         return compute_orders_query(ds, &query)
             .await
-            .map(|(response, _cache_safe)| response);
+            .map(ComputedOrdersQuery::into_response);
     }
 
     if let Some(response) = caches.orders_query.get(&cache_key).await {
@@ -145,8 +151,10 @@ pub(crate) async fn process_orders_query(
         .orders_query
         .get_or_try_insert(cache_key, || async {
             match compute_orders_query(ds, &query).await {
-                Ok((response, true)) => Ok(response),
-                Ok((response, false)) => Err(OrdersQueryCacheResult::SkipCache(response)),
+                Ok(ComputedOrdersQuery::Cacheable(response)) => Ok(response),
+                Ok(ComputedOrdersQuery::NotCacheable(response)) => {
+                    Err(OrdersQueryCacheResult::NotCacheable(response))
+                }
                 Err(error) => Err(OrdersQueryCacheResult::ApiError(error)),
             }
         })
@@ -155,7 +163,7 @@ pub(crate) async fn process_orders_query(
         Ok(response) => Ok(response),
         Err(error) => match error.as_ref() {
             OrdersQueryCacheResult::ApiError(error) => Err(error.clone()),
-            OrdersQueryCacheResult::SkipCache(response) => Ok(response.clone()),
+            OrdersQueryCacheResult::NotCacheable(response) => Ok(response.clone()),
         },
     }
 }
@@ -274,9 +282,9 @@ fn orders_query_cache_key(query: &ValidatedOrdersQuery) -> String {
 }
 
 async fn compute_orders_query(
-    ds: &dyn OrdersListDataSource,
+    ds: &dyn BatchOrdersDataSource,
     query: &ValidatedOrdersQuery,
-) -> Result<(OrdersListResponse, bool), ApiError> {
+) -> Result<ComputedOrdersQuery, ApiError> {
     let token_filter = if query.token_addresses.is_empty() {
         None
     } else {
@@ -319,11 +327,11 @@ async fn compute_orders_query(
     deduplicate_and_sort_orders(&mut orders);
 
     let quote_results = get_order_quotes_for_summaries(ds, &orders).await;
-    let cache_safe = !quote_results.iter().any(|result| match result {
-        Ok(quotes) => quotes
-            .iter()
-            .any(|quote| !quote.success || quote.error.is_some()),
-        Err(_) => true,
+    let cache_safe = orders.iter().zip(&quote_results).all(|(order, result)| {
+        !order.active()
+            || result
+                .as_ref()
+                .is_ok_and(|quotes| quote_set_is_complete(quotes))
     });
     if !cache_safe {
         tracing::warn!(
@@ -342,7 +350,11 @@ async fn compute_orders_query(
         query.denomination,
         &wrap_ratios,
     )?;
-    Ok((response, cache_safe))
+    Ok(if cache_safe {
+        ComputedOrdersQuery::Cacheable(response)
+    } else {
+        ComputedOrdersQuery::NotCacheable(response)
+    })
 }
 
 fn deduplicate_and_sort_orders(orders: &mut Vec<RaindexOrder>) {
@@ -368,6 +380,7 @@ mod tests {
     use super::*;
     use crate::cache::RouteResponseCaches;
     use crate::routes::order::test_fixtures::{mock_failed_quote, mock_quote, order_json};
+    use crate::routes::orders::OrdersListDataSource;
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
@@ -383,7 +396,6 @@ mod tests {
         calls: AtomicUsize,
         filters: Mutex<Vec<GetOrdersFilters>>,
         delay: Duration,
-        cache_safe: bool,
     }
 
     #[async_trait]
@@ -397,6 +409,16 @@ mod tests {
             unreachable!("batch tests use get_orders_query")
         }
 
+        async fn get_order_quotes(
+            &self,
+            _order: &RaindexOrder,
+        ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
+            self.quotes.clone()
+        }
+    }
+
+    #[async_trait]
+    impl BatchOrdersDataSource for MockDataSource {
         async fn get_orders_query(
             &self,
             _chain_id: u32,
@@ -408,25 +430,6 @@ mod tests {
             self.filters.lock().unwrap().push(filters);
             tokio::time::sleep(self.delay).await;
             Ok((self.orders.clone(), self.orders.len() as u32))
-        }
-
-        async fn get_order_quotes(
-            &self,
-            _order: &RaindexOrder,
-        ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
-            self.quotes.clone()
-        }
-
-        fn query_subgraph_count(
-            &self,
-            _chain_id: u32,
-            raindex_addresses: &[Address],
-        ) -> Result<usize, ApiError> {
-            Ok(if self.cache_safe || !raindex_addresses.is_empty() {
-                1
-            } else {
-                2
-            })
         }
     }
 
@@ -459,7 +462,6 @@ mod tests {
             calls: AtomicUsize::new(0),
             filters: Mutex::new(vec![]),
             delay: Duration::ZERO,
-            cache_safe: true,
         }
     }
 
@@ -564,12 +566,14 @@ mod tests {
         let ds = mock_ds(vec![]);
         let caches = RouteResponseCaches::new(0, Duration::ZERO);
         let mut query = request(vec![]);
-        query.order_hash =
-            Some("0x0000000000000000000000000000000000000000000000000000000000000001".into());
+        let order_hash =
+            B256::from_str("0x0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        query.order_hash = Some(order_hash.to_string());
 
         assert!(process_orders_query(&ds, &caches, query).await.is_ok());
         assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
-        assert!(ds.filters.lock().unwrap()[0].order_hash.is_some());
+        assert_eq!(ds.filters.lock().unwrap()[0].order_hash, Some(order_hash));
     }
 
     #[rocket::async_test]
@@ -638,37 +642,6 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn multi_subgraph_scope_is_rejected_before_querying_sdk() {
-        let ds = MockDataSource {
-            cache_safe: false,
-            ..mock_ds(vec![])
-        };
-        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
-        assert!(process_orders_query(
-            &ds,
-            &caches,
-            request(vec!["0x4200000000000000000000000000000000000006".into(),]),
-        )
-        .await
-        .is_err());
-        assert_eq!(ds.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[rocket::async_test]
-    async fn raindex_filter_can_narrow_multi_subgraph_network_to_one() {
-        let ds = MockDataSource {
-            cache_safe: false,
-            ..mock_ds(vec![])
-        };
-        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
-        let mut query = request(vec!["0x4200000000000000000000000000000000000006".into()]);
-        query.raindex_addresses = vec!["0x0000000000000000000000000000000000000001".into()];
-
-        assert!(process_orders_query(&ds, &caches, query).await.is_ok());
-        assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[rocket::async_test]
     async fn route_rejects_empty_batch_before_querying_sdk() {
         let client = TestClientBuilder::new().build().await;
         let (key_id, secret) = seed_api_key(&client).await;
@@ -683,6 +656,31 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn route_rejects_unconfigured_chain() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let response = client
+            .post("/v1/orders/query")
+            .header(ContentType::JSON)
+            .header(Header::new(
+                "Authorization",
+                basic_auth_header(&key_id, &secret),
+            ))
+            .body(
+                json!({
+                    "chainId": 1,
+                    "tokenAddresses": ["0x4200000000000000000000000000000000000006"]
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_string().await.unwrap();
+        assert!(body.contains("unsupported chainId"));
     }
 
     #[rocket::async_test]

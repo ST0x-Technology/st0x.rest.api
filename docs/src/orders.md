@@ -288,12 +288,7 @@ Canonical address sets share the short-lived response cache regardless of input
 order, duplicate entries, or address case. Concurrent identical cold requests
 share one computation. The endpoint only caches complete responses: an indexed
 query, denomination conversion, or live quote failure fails the whole request
-and is not cached. The pinned SDK paginates each subgraph independently and does
-not expose a complete merged result before pagination. The endpoint therefore
-requires the effective `chainId` and `raindexAddresses` scope to resolve to
-exactly one unique subgraph; a Raindex filter may narrow a network with several
-subgraphs to one. Supporting wider scopes requires upstream merge,
-deduplication, deterministic sorting, and global pagination.
+and is not cached.
 
 ## List Orders by Transaction
 

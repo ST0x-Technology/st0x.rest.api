@@ -218,10 +218,5 @@ Both modes normalize and deduplicate addresses and hashes before querying. Their
 short-lived cache keys are order-insensitive and include every
 response-affecting filter, including exact time bounds and denomination.
 Concurrent identical cold requests share one computation, and failed
-computations are never cached. The pinned SDK does not expose a completeness
-flag or globally paginate merged multi-subgraph list results. Token mode
-therefore rejects networks backed by anything other than exactly one unique
-subgraph so its pagination remains bounded and stable. Legacy grouped order-hash
-mode remains backward compatible and bypasses the response cache when its scope
-spans multiple subgraphs. Oversized grouped responses are rejected and never
-cached.
+computations are never cached. Oversized grouped responses are rejected and
+never cached.

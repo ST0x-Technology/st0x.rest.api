@@ -1,14 +1,13 @@
 use super::{
-    current_wrap_ratios_for_trades, map_trade_for_list, RaindexTradesDataSource, TradesDataSource,
+    current_wrap_ratios_for_trades, map_trade_for_list, BatchTradesDataSource,
+    RaindexTradesDataSource,
 };
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::routes::batch_query::{
-    parse_canonical_addresses, require_single_subgraph_for_pagination, validate_configured_chain,
-};
+use crate::routes::batch_query::{parse_canonical_addresses, validate_configured_chain};
 use crate::types::common::Denomination;
 use crate::types::trades::{
     TradesByOrderHashEntry, TradesByOrderHashesResponse, TradesQueryRequest, TradesQueryResponse,
@@ -67,13 +66,6 @@ impl ValidatedTradesQuery {
         }
     }
 
-    fn chain_id(&self) -> Option<u32> {
-        match self {
-            Self::OrderHashes(query) => query.chain_id,
-            Self::Tokens(query) => Some(query.chain_id),
-        }
-    }
-
     fn batch_size(&self) -> usize {
         match self {
             Self::OrderHashes(query) => query.canonical_order_hashes.len(),
@@ -99,6 +91,7 @@ impl ValidatedTradesQuery {
         (status = 200, description = "Legacy grouped order-hash response or paginated token-set response, selected by request mode", body = TradesQueryResponse),
         (status = 400, description = "Invalid batch filters or bounds", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 422, description = "Request body could not be deserialized", body = ApiErrorResponse),
         (status = 502, description = "Trade source query failed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -126,15 +119,12 @@ pub async fn post_trades_query(
             "batch trades query request received"
         );
 
-        let client = {
-            let raindex = shared_raindex.read().await;
-            raindex.client().clone()
-        };
+        let raindex = shared_raindex.read().await;
         if let Some(chain_id) = request.chain_id {
-            validate_configured_chain(&client, chain_id)?;
+            validate_configured_chain(raindex.client(), chain_id)?;
         }
         let ds = RaindexTradesDataSource {
-            client: &client,
+            client: raindex.client(),
             pool: pool.inner(),
         };
         process_trades_query(&ds, &app_state.response_caches, request)
@@ -146,28 +136,18 @@ pub async fn post_trades_query(
 }
 
 pub(crate) async fn process_trades_query(
-    ds: &dyn TradesDataSource,
+    ds: &dyn BatchTradesDataSource,
     caches: &crate::cache::RouteResponseCaches,
     request: TradesQueryRequest,
 ) -> Result<TradesQueryResponse, ApiError> {
     let query = validate_trades_query(request)?;
     let cache_key = trades_query_cache_key(&query);
 
-    let subgraph_count = ds.query_subgraph_count(query.chain_id())?;
-    let cache_safe = match &query {
-        ValidatedTradesQuery::Tokens(query) => {
-            require_single_subgraph_for_pagination("trades", query.chain_id, subgraph_count)?;
-            true
-        }
-        ValidatedTradesQuery::OrderHashes(_) => subgraph_count <= 1,
-    };
-    let response = if !caches.is_enabled() || !cache_safe {
+    let response = if !caches.trades_query_is_enabled() {
         tracing::info!(
             mode = query.mode(),
             batch_size = query.batch_size(),
-            cache_enabled = caches.is_enabled(),
-            cache_safe,
-            subgraph_count,
+            cache_enabled = false,
             "batch trades response cache bypassed"
         );
         compute_trades_query(ds, &query).await?
@@ -272,10 +252,10 @@ fn validate_trades_query(request: TradesQueryRequest) -> Result<ValidatedTradesQ
             let page = request.page.unwrap_or(1);
             let page_size = request.page_size.unwrap_or(20);
             if page == 0 || page > MAX_PAGE {
-                return validation_error("page must be between 1 and 1000");
+                return validation_error(format!("page must be between 1 and {MAX_PAGE}"));
             }
             if page_size == 0 || page_size > MAX_PAGE_SIZE {
-                return validation_error("pageSize must be between 1 and 500");
+                return validation_error(format!("pageSize must be between 1 and {MAX_PAGE_SIZE}"));
             }
             Ok(ValidatedTradesQuery::Tokens(ValidatedTokenTradesQuery {
                 chain_id,
@@ -369,7 +349,7 @@ fn trades_query_cache_key(query: &ValidatedTradesQuery) -> String {
 }
 
 async fn compute_trades_query(
-    ds: &dyn TradesDataSource,
+    ds: &dyn BatchTradesDataSource,
     query: &ValidatedTradesQuery,
 ) -> Result<TradesQueryResponse, ApiError> {
     match query {
@@ -386,7 +366,7 @@ fn token_filter(tokens: &[Address]) -> Option<GetTradesTokenFilter> {
 }
 
 async fn compute_order_hash_trades(
-    ds: &dyn TradesDataSource,
+    ds: &dyn BatchTradesDataSource,
     query: &ValidatedOrderHashTradesQuery,
 ) -> Result<TradesQueryResponse, ApiError> {
     tracing::info!(
@@ -481,7 +461,7 @@ async fn compute_order_hash_trades(
 }
 
 async fn compute_token_trades(
-    ds: &dyn TradesDataSource,
+    ds: &dyn BatchTradesDataSource,
     query: &ValidatedTokenTradesQuery,
 ) -> Result<TradesQueryResponse, ApiError> {
     tracing::info!(
@@ -578,6 +558,7 @@ mod tests {
     use super::*;
     use crate::cache::RouteResponseCaches;
     use crate::routes::order::test_fixtures::trade_json;
+    use crate::routes::trades::TradesDataSource;
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use async_trait::async_trait;
     use rain_orderbook_common::raindex_client::trades::{
@@ -605,7 +586,6 @@ mod tests {
         token_query: Mutex<Option<CapturedTokenQuery>>,
         grouped_hashes: Mutex<Vec<B256>>,
         delay: Duration,
-        cache_safe: bool,
     }
 
     #[async_trait]
@@ -645,7 +625,10 @@ mod tests {
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
         }
+    }
 
+    #[async_trait]
+    impl BatchTradesDataSource for MockTradesDataSource {
         async fn get_trades_query(
             &self,
             chain_id: u32,
@@ -675,10 +658,6 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             self.grouped_result.clone()
         }
-
-        fn query_subgraph_count(&self, _chain_id: Option<u32>) -> Result<usize, ApiError> {
-            Ok(if self.cache_safe { 1 } else { 2 })
-        }
     }
 
     fn hash_a() -> B256 {
@@ -707,7 +686,6 @@ mod tests {
             token_query: Mutex::new(None),
             grouped_hashes: Mutex::new(vec![]),
             delay: Duration::ZERO,
-            cache_safe: true,
         }
     }
 
@@ -1019,46 +997,6 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn multi_subgraph_token_scope_is_rejected_before_querying_sdk() {
-        let ds = MockTradesDataSource {
-            cache_safe: false,
-            ..mock_ds()
-        };
-        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
-        assert!(process_trades_query(
-            &ds,
-            &caches,
-            token_request(vec!["0x4200000000000000000000000000000000000006".into(),]),
-        )
-        .await
-        .is_err());
-        assert_eq!(ds.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[rocket::async_test]
-    async fn potentially_partial_legacy_results_bypass_response_cache() {
-        let ds = MockTradesDataSource {
-            cache_safe: false,
-            ..mock_ds()
-        };
-        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
-        let request = || TradesQueryRequest {
-            order_hashes: Some(vec![]),
-            token_addresses: vec![],
-            chain_id: None,
-            start_time: None,
-            end_time: None,
-            page: None,
-            page_size: None,
-            denomination: None,
-        };
-        for _ in 0..2 {
-            assert!(process_trades_query(&ds, &caches, request()).await.is_ok());
-        }
-        assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[rocket::async_test]
     async fn invalid_hash_returns_400_from_route() {
         let client = TestClientBuilder::new().build().await;
         let (key_id, secret) = seed_api_key(&client).await;
@@ -1073,5 +1011,32 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+
+    #[rocket::async_test]
+    async fn route_rejects_unconfigured_chain() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let response = client
+            .post("/v1/trades/query")
+            .header(Header::new(
+                "Authorization",
+                basic_auth_header(&key_id, &secret),
+            ))
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "chainId": 1,
+                    "tokenAddresses": ["0x4200000000000000000000000000000000000006"],
+                    "startTime": 1_700_000_000,
+                    "endTime": 1_700_003_600
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_string().await.unwrap();
+        assert!(body.contains("unsupported chainId"));
     }
 }

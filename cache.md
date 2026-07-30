@@ -26,8 +26,7 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
 - `orders_by_token`: paginated `/v1/orders/token/{address}` responses keyed by
   normalized address, state, side, page, page size, and denomination.
 - `orders_query`: paginated `/v1/orders/query` responses keyed by canonical,
-  order-insensitive batch filters. Networks backed by anything other than one
-  unique subgraph are rejected because the SDK cannot globally paginate them.
+  order-insensitive batch filters.
 - `swap_candidates`: computed take-order candidates for a token pair and the
   exact active order set used to build the route.
 - `trades_by_token`: paginated `/v1/trades/token/{address}` responses keyed by
@@ -35,19 +34,18 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
 - `trades_by_taker`: paginated `/v1/trades/taker/{address}` responses keyed the
   same way as token trade responses.
 - `trades_query`: token/time-window and grouped order-hash `/v1/trades/query`
-  responses keyed by canonical, order-insensitive filters. Multi-subgraph token
-  queries are rejected; legacy grouped queries spanning multiple subgraphs
-  bypass this cache. Cache entries are weighted by their returned trade-row
-  count against `response_cache_max_trade_rows`, which defaults to
-  `response_cache_max_entries` when omitted from older config files. Grouped
-  responses are capped at 5,000 deduplicated trades; larger results are rejected
-  and never cached.
+  responses keyed by canonical, order-insensitive filters. Cache entries are
+  weighted by their returned trade-row count against
+  `response_cache_max_trade_rows`, which defaults to
+  `response_cache_max_entries` when omitted from older config files. A value of
+  zero disables only this cache. Grouped responses are capped at 5,000
+  deduplicated trades; larger results are rejected and never cached.
 
 These caches are intentionally short-lived because they sit in front of data
 that can change quickly with new blocks, vault balance changes, order removals,
 and trades. They are latency and upstream-load caches, not correctness sources.
-On a cache miss, the API asks raindex/RPC/subgraphs for current data and stores
-only successful responses.
+On a cache miss, the API asks its configured data sources for current data and
+stores only successful responses.
 
 ## Data Class Policy
 

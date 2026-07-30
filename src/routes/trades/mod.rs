@@ -54,41 +54,30 @@ pub(crate) trait TradesDataSource: Send + Sync {
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
 
-    async fn get_trades_query(
-        &self,
-        chain_id: u32,
-        filters: GetTradesFilters,
-        page: u16,
-        page_size: u16,
-    ) -> Result<RaindexTradesListResult, ApiError> {
-        let _ = (chain_id, filters, page, page_size);
-        Err(ApiError::Internal("batch trades query unavailable".into()))
-    }
-
-    async fn get_trades_by_order_hashes_query(
-        &self,
-        chain_id: Option<u32>,
-        order_hashes: Vec<B256>,
-        filters: GetTradesByOrderHashesFilters,
-    ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
-        let _ = (chain_id, order_hashes, filters);
-        Err(ApiError::Internal(
-            "batch trades-by-order-hash query unavailable".into(),
-        ))
-    }
-
-    fn query_subgraph_count(&self, _chain_id: Option<u32>) -> Result<usize, ApiError> {
-        Err(ApiError::Internal(
-            "batch trades query scope unavailable".into(),
-        ))
-    }
-
     async fn get_current_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
     }
+}
+
+#[async_trait]
+pub(crate) trait BatchTradesDataSource: TradesDataSource {
+    async fn get_trades_query(
+        &self,
+        chain_id: u32,
+        filters: GetTradesFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<RaindexTradesListResult, ApiError>;
+
+    async fn get_trades_by_order_hashes_query(
+        &self,
+        chain_id: Option<u32>,
+        order_hashes: Vec<B256>,
+        filters: GetTradesByOrderHashesFilters,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError>;
 }
 
 pub(crate) struct RaindexTradesDataSource<'a> {
@@ -183,6 +172,28 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
             })
     }
 
+    async fn get_current_wrap_ratios_for_tokens(
+        &self,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .collect();
+
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
+    }
+}
+
+#[async_trait]
+impl BatchTradesDataSource for RaindexTradesDataSource<'_> {
     async fn get_trades_query(
         &self,
         chain_id: u32,
@@ -227,29 +238,6 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
                     "the trade source could not serve this request",
                 )
             })
-    }
-
-    fn query_subgraph_count(&self, chain_id: Option<u32>) -> Result<usize, ApiError> {
-        crate::routes::batch_query::unique_subgraph_count(self.client, chain_id)
-    }
-
-    async fn get_current_wrap_ratios_for_tokens(
-        &self,
-        token_addresses: &[Address],
-    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
-        let tokens: Vec<_> = self
-            .client
-            .get_all_tokens()
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to retrieve curated tokens");
-                ApiError::Internal("failed to retrieve curated tokens".into())
-            })?
-            .into_values()
-            .collect();
-
-        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
-        persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
-        Ok(wrap_ratio_values_from_responses(responses))
     }
 }
 
