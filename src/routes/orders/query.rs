@@ -114,8 +114,8 @@ pub(crate) async fn process_orders_query(
     if !caches.is_enabled() {
         tracing::info!(
             chain_id = query.chain_id,
-            batch_size = query.token_addresses.len(),
-            cache_enabled = caches.is_enabled(),
+            token_addresses_count = query.token_addresses.len(),
+            has_order_hash = query.order_hash.is_some(),
             "batch orders response cache bypassed"
         );
         return compute_orders_query(ds, &query)
@@ -126,7 +126,8 @@ pub(crate) async fn process_orders_query(
     if let Some(response) = caches.orders_query.get(&cache_key).await {
         tracing::info!(
             chain_id = query.chain_id,
-            batch_size = query.token_addresses.len(),
+            token_addresses_count = query.token_addresses.len(),
+            has_order_hash = query.order_hash.is_some(),
             cache_hit = true,
             "batch orders response cache hit"
         );
@@ -135,7 +136,8 @@ pub(crate) async fn process_orders_query(
 
     tracing::info!(
         chain_id = query.chain_id,
-        batch_size = query.token_addresses.len(),
+        token_addresses_count = query.token_addresses.len(),
+        has_order_hash = query.order_hash.is_some(),
         cache_hit = false,
         "batch orders response cache miss"
     );
@@ -197,11 +199,11 @@ fn validate_orders_query(request: OrdersQueryRequest) -> Result<ValidatedOrdersQ
 
     let page = request.page.unwrap_or(1);
     if page == 0 || page > MAX_PAGE {
-        return validation_error("page must be between 1 and 1000");
+        return validation_error(format!("page must be between 1 and {MAX_PAGE}"));
     }
     let page_size = request.page_size.unwrap_or(DEFAULT_PAGE_SIZE as u16);
     if page_size == 0 || page_size > MAX_PAGE_SIZE {
-        return validation_error("pageSize must be between 1 and 50");
+        return validation_error(format!("pageSize must be between 1 and {MAX_PAGE_SIZE}"));
     }
 
     Ok(ValidatedOrdersQuery {
@@ -542,6 +544,32 @@ mod tests {
             assert!(result.unwrap().is_ok());
         }
         assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[rocket::async_test]
+    async fn sequential_identical_requests_use_cached_response() {
+        let ds = mock_ds(vec![]);
+        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
+        let query = request(vec!["0x4200000000000000000000000000000000000006".into()]);
+
+        assert!(process_orders_query(&ds, &caches, query.clone())
+            .await
+            .is_ok());
+        assert!(process_orders_query(&ds, &caches, query).await.is_ok());
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[rocket::async_test]
+    async fn order_hash_only_request_is_valid() {
+        let ds = mock_ds(vec![]);
+        let caches = RouteResponseCaches::new(0, Duration::ZERO);
+        let mut query = request(vec![]);
+        query.order_hash =
+            Some("0x0000000000000000000000000000000000000000000000000000000000000001".into());
+
+        assert!(process_orders_query(&ds, &caches, query).await.is_ok());
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
+        assert!(ds.filters.lock().unwrap()[0].order_hash.is_some());
     }
 
     #[rocket::async_test]

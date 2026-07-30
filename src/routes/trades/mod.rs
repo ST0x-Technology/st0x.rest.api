@@ -4,7 +4,7 @@ pub(crate) mod get_by_token;
 pub(crate) mod get_by_tx;
 pub(crate) mod query;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorCode};
 use crate::types::common::{Denomination, TokenRef};
 use crate::types::trades::{
     TradeByAddress, TradesByAddressResponse, TradesPagination, TradesPaginationParams,
@@ -200,7 +200,10 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
             .await
             .map_err(|error| {
                 tracing::error!(chain_id, %error, "failed to batch query trades");
-                ApiError::Internal("failed to query trades".into())
+                ApiError::coded(
+                    ApiErrorCode::TradesQueryFailed,
+                    "the trade source could not serve this request",
+                )
             })
     }
 
@@ -219,7 +222,10 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
             .await
             .map_err(|error| {
                 tracing::error!(chain_id, %error, "failed to batch query trades by order hashes");
-                ApiError::Internal("failed to query trades".into())
+                ApiError::coded(
+                    ApiErrorCode::TradesQueryFailed,
+                    "the trade source could not serve this request",
+                )
             })
     }
 

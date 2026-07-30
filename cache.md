@@ -40,8 +40,8 @@ layer such as Redis, and the API does not currently emit `Cache-Control` or
   bypass this cache. Cache entries are weighted by their returned trade-row
   count against `response_cache_max_trade_rows`, which defaults to
   `response_cache_max_entries` when omitted from older config files. Grouped
-  responses above 5,000 trades are coalesced but evicted immediately after
-  computation.
+  responses are capped at 5,000 deduplicated trades; larger results are rejected
+  and never cached.
 
 These caches are intentionally short-lived because they sit in front of data
 that can change quickly with new blocks, vault balance changes, order removals,

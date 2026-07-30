@@ -29,7 +29,7 @@ const MAX_ORDER_HASHES: usize = 64;
 const MAX_PAGE_SIZE: u16 = 500;
 const MAX_PAGE: u16 = 1_000;
 const MAX_TOKEN_TIME_RANGE_SECONDS: u64 = 90 * 24 * 60 * 60;
-const MAX_CACHED_GROUPED_TRADES: u64 = 5_000;
+const MAX_GROUPED_TRADES: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 struct ValidatedOrderHashTradesQuery {
@@ -99,6 +99,7 @@ impl ValidatedTradesQuery {
         (status = 200, description = "Legacy grouped order-hash response or paginated token-set response, selected by request mode", body = TradesQueryResponse),
         (status = 400, description = "Invalid batch filters or bounds", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 502, description = "Trade source query failed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
@@ -187,21 +188,12 @@ pub(crate) async fn process_trades_query(
         );
         caches
             .trades_query
-            .get_or_try_insert(cache_key.clone(), || async {
+            .get_or_try_insert(cache_key, || async {
                 compute_trades_query(ds, &query).await
             })
             .await
             .map_err(|error| (*error).clone())?
     };
-
-    if !trades_query_cache_admissible(&response) {
-        caches.trades_query.invalidate(&cache_key).await;
-        tracing::info!(
-            mode = query.mode(),
-            batch_size = query.batch_size(),
-            "batch trades response exceeded cache admission bound"
-        );
-    }
 
     Ok(restore_legacy_hash_order(
         response,
@@ -416,7 +408,16 @@ async fn compute_order_hash_trades(
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                chain_id = query.chain_id,
+                order_hashes_count = query.canonical_order_hashes.len(),
+                %error,
+                "grouped trades SDK query failed"
+            );
+            error
+        })?;
 
     let mut grouped_trades = result
         .trades_by_order_hash()
@@ -428,12 +429,30 @@ async fn compute_order_hash_trades(
         })
         .collect::<Vec<_>>();
     grouped_trades.sort_by_key(|(order_hash, _)| *order_hash);
+    let total_count = grouped_trades
+        .iter()
+        .map(|(_, trades)| trades.len() as u64)
+        .sum::<u64>();
+    if total_count > MAX_GROUPED_TRADES {
+        return validation_error(format!(
+            "grouped order-hash results must contain at most {MAX_GROUPED_TRADES} trades; narrow the request filters"
+        ));
+    }
     let wrap_ratios = current_wrap_ratios_for_trades(
         ds,
         query.denomination,
         grouped_trades.iter().flat_map(|(_, trades)| trades.iter()),
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            chain_id = query.chain_id,
+            order_hashes_count = query.canonical_order_hashes.len(),
+            %error,
+            "failed to prepare grouped trades response"
+        );
+        error
+    })?;
     let trades_by_order_hash = grouped_trades
         .into_iter()
         .map(|(order_hash, trades)| {
@@ -443,12 +462,16 @@ async fn compute_order_hash_trades(
                 .collect::<Result<Vec<_>, ApiError>>()?;
             Ok(TradesByOrderHashEntry { order_hash, trades })
         })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    let total_count = trades_by_order_hash
-        .iter()
-        .map(|entry| entry.trades.len() as u64)
-        .sum();
-
+        .collect::<Result<Vec<_>, ApiError>>()
+        .map_err(|error| {
+            tracing::error!(
+                chain_id = query.chain_id,
+                order_hashes_count = query.canonical_order_hashes.len(),
+                %error,
+                "failed to map grouped trades response"
+            );
+            error
+        })?;
     Ok(TradesQueryResponse::ByOrderHashes(
         TradesByOrderHashesResponse {
             trades_by_order_hash,
@@ -482,21 +505,40 @@ async fn compute_token_trades(
             query.page,
             query.page_size,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                chain_id = query.chain_id,
+                batch_size = query.token_addresses.len(),
+                page = query.page,
+                page_size = query.page_size,
+                %error,
+                "token-set trades SDK query failed"
+            );
+            error
+        })?;
     let mut trades = result.trades().to_vec();
-    let returned_count = trades.len();
     deduplicate_and_sort_trades(&mut trades);
-    let duplicate_count = returned_count.saturating_sub(trades.len()) as u64;
-    let total_trades = result.total_count().saturating_sub(duplicate_count);
     super::build_trades_list_response_from_parts(
         ds,
         &trades,
-        total_trades,
+        result.total_count(),
         query.page.into(),
         query.page_size.into(),
         query.denomination,
     )
     .await
+    .map_err(|error| {
+        tracing::error!(
+            chain_id = query.chain_id,
+            batch_size = query.token_addresses.len(),
+            page = query.page,
+            page_size = query.page_size,
+            %error,
+            "failed to prepare token-set trades response"
+        );
+        error
+    })
     .map(TradesQueryResponse::ByTokens)
 }
 
@@ -510,15 +552,6 @@ fn deduplicate_and_sort_trades(trades: &mut Vec<RaindexTrade>) {
         deduplicated_count = trades.len(),
         "canonicalized batch trades result"
     );
-}
-
-fn trades_query_cache_admissible(response: &TradesQueryResponse) -> bool {
-    match response {
-        TradesQueryResponse::ByOrderHashes(response) => {
-            response.total_count <= MAX_CACHED_GROUPED_TRADES
-        }
-        TradesQueryResponse::ByTokens(_) => true,
-    }
 }
 
 fn restore_legacy_hash_order(
@@ -753,15 +786,6 @@ mod tests {
     }
 
     #[test]
-    fn oversized_grouped_response_is_not_cache_admissible() {
-        let response = TradesQueryResponse::ByOrderHashes(TradesByOrderHashesResponse {
-            trades_by_order_hash: vec![],
-            total_count: MAX_CACHED_GROUPED_TRADES + 1,
-        });
-        assert!(!trades_query_cache_admissible(&response));
-    }
-
-    #[test]
     fn token_mode_validates_time_and_page_bounds() {
         let mut request = token_request(vec!["0x4200000000000000000000000000000000000006".into()]);
         request.end_time = Some(request.start_time.unwrap() + MAX_TOKEN_TIME_RANGE_SECONDS + 1);
@@ -852,7 +876,45 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn duplicate_trades_are_removed_before_pagination_metadata() {
+    async fn oversized_grouped_results_are_rejected_and_not_cached() {
+        let trades = (0..=MAX_GROUPED_TRADES)
+            .map(|index| trade(&format!("0x{index:064x}"), index))
+            .collect::<Vec<_>>();
+        let grouped_result = serde_json::from_value(json!({
+            "tradesByOrderHash": [{
+                "orderHash": hash_a(),
+                "trades": trades
+            }],
+            "totalCount": MAX_GROUPED_TRADES + 1
+        }))
+        .unwrap();
+        let ds = MockTradesDataSource {
+            grouped_result: Ok(grouped_result),
+            ..mock_ds()
+        };
+        let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
+        let request = TradesQueryRequest {
+            order_hashes: Some(vec![hash_a().to_string()]),
+            token_addresses: vec![],
+            chain_id: None,
+            start_time: None,
+            end_time: None,
+            page: None,
+            page_size: None,
+            denomination: None,
+        };
+
+        for _ in 0..2 {
+            let error = process_trades_query(&ds, &caches, request.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)));
+        }
+        assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rocket::async_test]
+    async fn duplicate_trades_are_removed_without_changing_global_total() {
         let result: RaindexTradesListResult = serde_json::from_value(json!({
             "trades": [trade_json(), trade_json()],
             "totalCount": 2,
@@ -874,7 +936,7 @@ mod tests {
             panic!("expected token response");
         };
         assert_eq!(response.trades.len(), 1);
-        assert_eq!(response.pagination.total_trades, 1);
+        assert_eq!(response.pagination.total_trades, 2);
     }
 
     #[rocket::async_test]

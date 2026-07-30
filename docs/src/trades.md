@@ -210,7 +210,9 @@ The response remains:
 Order-hash mode supports up to 64 hashes. It also accepts optional `chainId` and
 up to 64 `tokenAddresses`, which the SDK combines with the order-hash set in the
 same indexed query. Existing clients may continue omitting both. `page` and
-`pageSize` are intentionally rejected in this legacy grouped mode.
+`pageSize` are intentionally rejected in this legacy grouped mode. The
+deduplicated grouped result is bounded to 5,000 trades; requests producing more
+must narrow their hashes, token addresses, chain, or time window.
 
 Both modes normalize and deduplicate addresses and hashes before querying. Their
 short-lived cache keys are order-insensitive and include every
@@ -221,5 +223,5 @@ flag or globally paginate merged multi-subgraph list results. Token mode
 therefore rejects networks backed by anything other than exactly one unique
 subgraph so its pagination remains bounded and stable. Legacy grouped order-hash
 mode remains backward compatible and bypasses the response cache when its scope
-spans multiple subgraphs. Grouped responses above 5,000 trades also fail cache
-admission after their concurrent cold request has been coalesced.
+spans multiple subgraphs. Oversized grouped responses are rejected and never
+cached.
