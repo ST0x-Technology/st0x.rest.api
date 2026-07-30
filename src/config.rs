@@ -17,6 +17,9 @@ pub struct Config {
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,
     pub local_db_path: String,
+    pub price_sampler_enabled: bool,
+    pub price_sample_interval_seconds: u64,
+    pub price_history_retention_seconds: u64,
     #[serde(default)]
     pub attribution_start_block: Option<u64>,
     #[serde(default = "default_attribution_sync_interval_seconds")]

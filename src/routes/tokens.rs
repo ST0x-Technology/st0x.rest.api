@@ -327,19 +327,8 @@ fn wrap_ratio_history_event_from_snapshot(
     })
 }
 
-fn extension_address(token: &TokenCfg, key: &str) -> Option<Address> {
-    token
-        .extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get(key))
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<Address>().ok())
-}
-
 pub(super) fn matches_token_proof_address(token: &TokenCfg, address: Address) -> bool {
-    token.address == address
-        || extension_address(token, "unwrappedAddress") == Some(address)
-        || extension_address(token, "legacyAddress") == Some(address)
+    crate::wrap_ratio::token_address_variants(token).contains(&address)
 }
 
 fn resolve_proof_subgraph_urls(
@@ -840,6 +829,7 @@ pub async fn get_wrap_ratios(
             match unwrapped_address(token) {
                 Ok(expected_asset_address) => inputs.push(WrapRatioBatchInput {
                     token,
+                    share_address: token.address,
                     expected_asset_address,
                 }),
                 Err(error) => {
@@ -872,7 +862,7 @@ pub async fn get_wrap_ratios(
                     continue;
                 };
 
-                let row = find_wrap_ratio_item(&group.response.items, input.token.address)
+                let row = find_wrap_ratio_item(&group.response.items, input.share_address)
                     .and_then(|item| {
                         build_wrap_ratio_response(item, input.expected_asset_address, &metadata)
                     });
@@ -881,12 +871,12 @@ pub async fn get_wrap_ratios(
                     Ok(row) => data.push(row),
                     Err(error) => {
                         tracing::error!(
-                            share_address = %input.token.address,
+                            share_address = %input.share_address,
                             error = %error,
                             "failed to read wrapped token ratio"
                         );
                         errors.push(WrapRatioErrorResponse {
-                            share_address: input.token.address,
+                            share_address: input.share_address,
                             message: error.batch_message(),
                         });
                     }
@@ -956,6 +946,7 @@ pub async fn get_wrap_ratio_by_address(
 
         let inputs = vec![WrapRatioBatchInput {
             token,
+            share_address: token.address,
             expected_asset_address,
         }];
         let mut groups = read_wrap_ratios_batch(&inputs).await?;

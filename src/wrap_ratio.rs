@@ -100,6 +100,35 @@ pub(crate) fn is_st0x_token(token: &TokenCfg) -> bool {
         == Some("ST0x")
 }
 
+pub(crate) fn token_address_variants(token: &TokenCfg) -> Vec<Address> {
+    let mut addresses = vec![token.address];
+    for address in [
+        optional_extension_address(token, "unwrappedAddress"),
+        legacy_address(token),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        addresses.push(address);
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn optional_extension_address(token: &TokenCfg, key: &str) -> Option<Address> {
+    token
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(key))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Address>().ok())
+}
+
+pub(crate) fn legacy_address(token: &TokenCfg) -> Option<Address> {
+    optional_extension_address(token, "legacyAddress")
+}
+
 pub(crate) fn unwrapped_address(token: &TokenCfg) -> Result<Address, WrapRatioLookupError> {
     let value = token
         .extensions
@@ -128,6 +157,7 @@ fn assets_per_share_display(assets_display: String) -> String {
 
 pub(crate) struct WrapRatioBatchInput<'a> {
     pub token: &'a TokenCfg,
+    pub share_address: Address,
     pub expected_asset_address: Address,
 }
 
@@ -240,7 +270,7 @@ pub(crate) async fn read_wrap_ratios_batch(
         let vaults = input_indices
             .iter()
             .filter_map(|index| inputs.get(*index))
-            .map(|input| Erc4626BatchVault::new(input.token.address))
+            .map(|input| Erc4626BatchVault::new(input.share_address))
             .collect();
 
         let response = batch_share_ratios(&first_input.token.network.rpcs, vaults, None)
@@ -270,10 +300,15 @@ pub(crate) async fn read_wrap_ratio_responses_for_addresses(
     let requested: HashSet<Address> = share_addresses.iter().copied().collect();
     let mut inputs = Vec::new();
 
-    for token in tokens
-        .iter()
-        .filter(|token| requested.contains(&token.address) && is_st0x_token(token))
-    {
+    for token in tokens.iter().filter(|token| is_st0x_token(token)) {
+        let share_addresses = [Some(token.address), legacy_address(token)]
+            .into_iter()
+            .flatten()
+            .filter(|address| requested.contains(address))
+            .collect::<HashSet<_>>();
+        if share_addresses.is_empty() {
+            continue;
+        }
         let expected_asset_address = unwrapped_address(token).map_err(|error| {
             tracing::error!(
                 share_address = %token.address,
@@ -282,10 +317,13 @@ pub(crate) async fn read_wrap_ratio_responses_for_addresses(
             );
             error.into_api_error()
         })?;
-        inputs.push(WrapRatioBatchInput {
-            token,
-            expected_asset_address,
-        });
+        for share_address in share_addresses {
+            inputs.push(WrapRatioBatchInput {
+                token,
+                share_address,
+                expected_asset_address,
+            });
+        }
     }
 
     let mut responses = Vec::new();
@@ -305,20 +343,30 @@ pub(crate) async fn read_wrap_ratio_responses_for_addresses(
                 continue;
             };
 
-            let row = find_wrap_ratio_item(&group.response.items, input.token.address)
-                .and_then(|item| {
+            let row =
+                find_wrap_ratio_item(&group.response.items, input.share_address).and_then(|item| {
                     build_wrap_ratio_response(item, input.expected_asset_address, &metadata)
-                })
-                .map_err(|error| {
+                });
+
+            match row {
+                Ok(row) => responses.push(row),
+                Err(error) if input.share_address != input.token.address => {
+                    tracing::warn!(
+                        share_address = %input.share_address,
+                        canonical_address = %input.token.address,
+                        error = %error,
+                        "skipping unavailable legacy wrapped token ratio"
+                    );
+                }
+                Err(error) => {
                     tracing::error!(
-                        share_address = %input.token.address,
+                        share_address = %input.share_address,
                         error = %error,
                         "failed to read wrapped token ratio"
                     );
-                    error.into_api_error()
-                })?;
-
-            responses.push(row);
+                    return Err(error.into_api_error());
+                }
+            }
         }
     }
 
@@ -484,6 +532,43 @@ mod tests {
 
         assert!(is_st0x_token(&st0x));
         assert!(!is_st0x_token(&usdc));
+    }
+
+    #[test]
+    fn token_address_variants_returns_only_canonical_without_aliases() {
+        let wrapped = token(WT_MSTR, Some(json!({ "category": "ST0x" })));
+
+        assert_eq!(token_address_variants(&wrapped), vec![WT_MSTR]);
+    }
+
+    #[test]
+    fn token_address_variants_deduplicates_valid_aliases() {
+        let wrapped = token(
+            WT_MSTR,
+            Some(json!({
+                "category": "ST0x",
+                "unwrappedAddress": format!("{T_MSTR:#x}"),
+                "legacyAddress": format!("{T_MSTR:#x}")
+            })),
+        );
+        let mut expected = vec![WT_MSTR, T_MSTR];
+        expected.sort_unstable();
+
+        assert_eq!(token_address_variants(&wrapped), expected);
+    }
+
+    #[test]
+    fn token_address_variants_ignores_malformed_aliases() {
+        let wrapped = token(
+            WT_MSTR,
+            Some(json!({
+                "category": "ST0x",
+                "unwrappedAddress": "not-an-address",
+                "legacyAddress": 42
+            })),
+        );
+
+        assert_eq!(token_address_variants(&wrapped), vec![WT_MSTR]);
     }
 
     #[test]

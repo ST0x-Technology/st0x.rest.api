@@ -1,6 +1,7 @@
 use crate::db::DbPool;
 use crate::error::ApiError;
 use crate::fairings::TracingSpan;
+use crate::market_price::{unix_now, MarketPriceState};
 use crate::raindex::SharedRaindexProvider;
 use crate::types::health::{
     DbHealthStatus, DbStatus, DetailedHealthResponse, HealthResponse, HealthStatus,
@@ -46,20 +47,23 @@ pub async fn get_health_detailed(
     span: TracingSpan,
     pool: &State<DbPool>,
     shared_raindex: &State<SharedRaindexProvider>,
+    market_price_state: &State<MarketPriceState>,
 ) -> Result<Json<DetailedHealthResponse>, ApiError> {
     async move {
         tracing::info!("detailed health check request received");
 
         tracing::info!("checking application database and raindex local database");
         let (app_db, raindex) = tokio::join!(check_app_db(pool), check_raindex_db(shared_raindex));
+        let market_prices = market_price_state.health_status(unix_now()?).await;
 
-        let status = detailed_status(&app_db, &raindex);
+        let status = detailed_status(&app_db, &raindex, &market_prices);
         tracing::info!(status = ?status, "detailed health check completed");
 
         Ok(Json(DetailedHealthResponse {
             status,
             app_db,
             raindex,
+            market_prices,
         }))
     }
     .instrument(span.0)
@@ -195,11 +199,16 @@ fn raindex_error(snapshot: &LocalDbSyncSnapshot) -> Option<String> {
     }
 }
 
-fn detailed_status(app_db: &DbStatus, raindex: &RaindexSyncStatus) -> HealthStatus {
+fn detailed_status(
+    app_db: &DbStatus,
+    raindex: &RaindexSyncStatus,
+    market_prices: &crate::types::health::MarketPriceHealthStatus,
+) -> HealthStatus {
     if !app_db.connected || !raindex.healthy || raindex.status == RaindexSyncStatusKind::Failure {
         HealthStatus::Error
     } else if raindex.status == RaindexSyncStatusKind::NotConfigured
         || raindex.status == RaindexSyncStatusKind::Syncing
+        || !market_prices.healthy
     {
         HealthStatus::Degraded
     } else {
@@ -214,6 +223,7 @@ pub fn routes() -> Vec<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::health::MarketPriceHealthStatus;
     use alloy::primitives::address;
     use rain_orderbook_common::local_db::RaindexIdentifier;
     use rain_orderbook_common::raindex_client::local_db::{LocalDbStatus, SchedulerState};
@@ -234,7 +244,10 @@ mod tests {
             orderbooks: vec![],
         };
 
-        assert_eq!(detailed_status(&app_db, &raindex), HealthStatus::Degraded);
+        assert_eq!(
+            detailed_status(&app_db, &raindex, &healthy_market_prices()),
+            HealthStatus::Degraded
+        );
     }
 
     #[test]
@@ -253,7 +266,10 @@ mod tests {
             orderbooks: vec![],
         };
 
-        assert_eq!(detailed_status(&app_db, &raindex), HealthStatus::Error);
+        assert_eq!(
+            detailed_status(&app_db, &raindex, &healthy_market_prices()),
+            HealthStatus::Error
+        );
     }
 
     #[test]
@@ -272,7 +288,10 @@ mod tests {
             orderbooks: vec![],
         };
 
-        assert_eq!(detailed_status(&app_db, &raindex), HealthStatus::Degraded);
+        assert_eq!(
+            detailed_status(&app_db, &raindex, &healthy_market_prices()),
+            HealthStatus::Degraded
+        );
     }
 
     #[test]
@@ -383,6 +402,7 @@ mod tests {
                 networks: vec![],
                 orderbooks: vec![],
             },
+            market_prices: healthy_market_prices(),
         };
 
         let serialized = match serde_json::to_value(response) {
@@ -407,6 +427,44 @@ mod tests {
         assert_eq!(
             raindex.error.as_deref(),
             Some("raindex local DB sync is not configured")
+        );
+    }
+
+    fn healthy_market_prices() -> MarketPriceHealthStatus {
+        MarketPriceHealthStatus {
+            enabled: true,
+            healthy: true,
+            running: true,
+            last_attempt_at: Some(100),
+            last_success_at: Some(100),
+            consecutive_failures: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn detailed_status_is_degraded_when_market_prices_are_stale() {
+        let app_db = DbStatus {
+            status: DbHealthStatus::Ok,
+            connected: true,
+            error: None,
+        };
+        let raindex = RaindexSyncStatus {
+            status: RaindexSyncStatusKind::Active,
+            configured: true,
+            healthy: true,
+            error: None,
+            networks: vec![],
+            orderbooks: vec![],
+        };
+        let market_prices = MarketPriceHealthStatus {
+            healthy: false,
+            ..healthy_market_prices()
+        };
+
+        assert_eq!(
+            detailed_status(&app_db, &raindex, &market_prices),
+            HealthStatus::Degraded
         );
     }
 }

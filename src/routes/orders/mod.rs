@@ -14,7 +14,7 @@ use crate::wrap_ratio::{
 };
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use futures::{future::join_all, stream, StreamExt};
+use futures::{stream, StreamExt};
 use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch as fetch_order_quotes_batch, RaindexOrderQuote,
 };
@@ -27,6 +27,7 @@ use std::collections::HashMap;
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
 pub(crate) const MAX_PAGE_SIZE: u16 = 50;
 const MAX_CHAIN_BATCH_CONCURRENCY: usize = 4;
+const MAX_INDIVIDUAL_QUOTE_CONCURRENCY: usize = 8;
 
 type OrderQuoteResult = Result<Vec<RaindexOrderQuote>, ApiError>;
 type OrderQuoteBatchResult = Result<Vec<Vec<RaindexOrderQuote>>, ApiError>;
@@ -187,10 +188,12 @@ where
         "falling back to per-order quotes"
     );
 
-    join_all(indexed_orders.into_iter().map(|(index, order)| async move {
+    stream::iter(indexed_orders.into_iter().map(|(index, order)| async move {
         let result = ds.get_order_quotes(&order).await;
         (index, result)
     }))
+    .buffer_unordered(MAX_INDIVIDUAL_QUOTE_CONCURRENCY)
+    .collect()
     .await
 }
 

@@ -15,6 +15,7 @@ mod denomination;
 mod erc4626;
 mod error;
 mod fairings;
+mod market_price;
 mod metrics;
 mod raindex;
 mod registry_artifact;
@@ -119,6 +120,8 @@ enum StartupRegistryError {
         routes::tokens::get_token_details,
         routes::tokens::get_token_details_by_address,
         routes::tokens::get_token_proofs,
+        routes::prices::get_prices,
+        routes::prices::get_price_history,
         routes::swap::post_swap_quote,
         routes::swap::post_swap_quote_v2,
         routes::swap::post_swap_calldata,
@@ -148,6 +151,7 @@ enum StartupRegistryError {
     tags(
         (name = "Health", description = "Health check endpoints"),
         (name = "Tokens", description = "Token information endpoints"),
+        (name = "Prices", description = "ST0x market price endpoints"),
         (name = "Swap", description = "Swap quote and calldata endpoints"),
         (name = "Order", description = "Order deployment and management endpoints"),
         (name = "Orders", description = "Order listing and query endpoints"),
@@ -189,15 +193,28 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     .to_cors()?)
 }
 
-pub(crate) fn rocket(
+pub(crate) struct RocketDependencies {
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     app_state: app_state::ApplicationState,
     analytics: analytics::Analytics,
+    market_price_state: market_price::MarketPriceState,
+}
+
+pub(crate) fn rocket(
+    dependencies: RocketDependencies,
     docs_dir: String,
     usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
+    let RocketDependencies {
+        pool,
+        rate_limiter,
+        raindex_config,
+        app_state,
+        analytics,
+        market_price_state,
+    } = dependencies;
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
@@ -210,8 +227,10 @@ pub(crate) fn rocket(
         .manage(raindex_config)
         .manage(app_state)
         .manage(analytics)
+        .manage(market_price_state)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
+        .mount("/v1/prices", routes::prices::routes())
         .mount("/v1/swap", routes::swap::routes())
         .mount("/v2/swap", routes::swap::routes_v2())
         .mount("/v1/order", routes::order::routes())
@@ -433,9 +452,22 @@ async fn main() {
                     }
                 };
 
-            let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+            let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
+            let market_price_config = match market_price::MarketPriceConfig::try_from(&cfg) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(%error, "invalid market price configuration");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let market_price_state = market_price::MarketPriceState::new(
+                pool.clone(),
+                shared_raindex.clone(),
+                market_price_config.clone(),
+            );
 
             if !std::path::Path::new(&cfg.docs_dir).is_dir() {
                 tracing::error!(docs_dir = %cfg.docs_dir, "docs_dir is not a valid directory");
@@ -475,13 +507,29 @@ async fn main() {
 
             let analytics = analytics::Analytics::from_env();
 
+            if market_price_config.enabled {
+                tokio::spawn(market_price::supervise_market_price_sampler(
+                    market_price_state.clone(),
+                ));
+                tracing::info!(
+                    interval_seconds = market_price_config.sample_interval.as_secs(),
+                    retention_seconds = market_price_config.retention.as_secs(),
+                    "registry-driven market price sampler started"
+                );
+            } else {
+                tracing::warn!("market price sampler is disabled");
+            }
+
             let attribution_pool = pool.clone();
             let mut rocket = match rocket(
-                pool,
-                rate_limiter,
-                shared_raindex,
-                app_state,
-                analytics,
+                RocketDependencies {
+                    pool,
+                    rate_limiter,
+                    raindex_config: shared_raindex,
+                    app_state,
+                    analytics,
+                    market_price_state,
+                },
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
             ) {
@@ -728,6 +776,9 @@ mod tests {
             rate_limit_per_key_rpm: 60,
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
+            price_sampler_enabled: false,
+            price_sample_interval_seconds: 60,
+            price_history_retention_seconds: 604800,
             telemetry: None,
             attribution_start_block: None,
             attribution_sync_interval_seconds: 60,

@@ -90,7 +90,7 @@ impl TestClientBuilder {
             }
         };
 
-        let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+        let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
         let artifact_store =
             crate::registry_artifact::RegistryArtifactStore::new(private_registry_path);
         let response_caches =
@@ -105,13 +105,25 @@ impl TestClientBuilder {
         let analytics = self
             .analytics
             .unwrap_or_else(crate::analytics::Analytics::disabled);
+        let market_price_state = crate::market_price::MarketPriceState::new(
+            pool.clone(),
+            shared_raindex.clone(),
+            crate::market_price::MarketPriceConfig {
+                enabled: false,
+                sample_interval: std::time::Duration::from_secs(60),
+                retention: std::time::Duration::from_secs(604800),
+            },
+        );
         let docs_dir = std::env::temp_dir().to_string_lossy().into_owned();
         let rocket = crate::rocket(
-            pool,
-            self.rate_limiter,
-            shared_raindex,
-            app_state,
-            analytics,
+            crate::RocketDependencies {
+                pool,
+                rate_limiter: self.rate_limiter,
+                raindex_config: shared_raindex,
+                app_state,
+                analytics,
+                market_price_state,
+            },
             docs_dir,
             2,
         )
