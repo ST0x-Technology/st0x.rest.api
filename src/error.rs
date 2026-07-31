@@ -19,6 +19,7 @@ pub enum ApiErrorCode {
     RateLimited,
     NotYetIndexed,
     SwapUnsupportedToken,
+    SwapSameToken,
     SwapNoLiquidity,
     SwapQuoteFailed,
     SwapPreflightFailed,
@@ -39,6 +40,7 @@ impl ApiErrorCode {
             Self::RateLimited => "RATE_LIMITED",
             Self::NotYetIndexed => "NOT_YET_INDEXED",
             Self::SwapUnsupportedToken => "SWAP_UNSUPPORTED_TOKEN",
+            Self::SwapSameToken => "SWAP_SAME_TOKEN",
             Self::SwapNoLiquidity => "SWAP_NO_LIQUIDITY",
             Self::SwapQuoteFailed => "SWAP_QUOTE_FAILED",
             Self::SwapPreflightFailed => "SWAP_PREFLIGHT_FAILED",
@@ -50,9 +52,10 @@ impl ApiErrorCode {
 
     pub const fn status(self) -> Status {
         match self {
-            Self::BadRequest | Self::SwapUnsupportedToken | Self::SwapPreflightFailed => {
-                Status::BadRequest
-            }
+            Self::BadRequest
+            | Self::SwapUnsupportedToken
+            | Self::SwapSameToken
+            | Self::SwapPreflightFailed => Status::BadRequest,
             Self::UnprocessableEntity => Status::UnprocessableEntity,
             Self::Unauthorized => Status::Unauthorized,
             Self::Forbidden => Status::Forbidden,
@@ -119,23 +122,45 @@ impl ApiError {
             public_message,
         }
     }
+
+    /// The stable error code this error is reported as.
+    ///
+    /// Shared by the HTTP responder and by analytics so a failure carries the same
+    /// code in PostHog as the caller saw on the wire — otherwise the two drift and
+    /// a dashboard can disagree with the client about what actually happened.
+    pub fn code(&self) -> ApiErrorCode {
+        match self {
+            ApiError::BadRequest(_) => ApiErrorCode::BadRequest,
+            ApiError::Unauthorized(_) => ApiErrorCode::Unauthorized,
+            ApiError::Forbidden(_) => ApiErrorCode::Forbidden,
+            ApiError::NotFound(_) => ApiErrorCode::NotFound,
+            ApiError::Internal(_) => ApiErrorCode::InternalError,
+            ApiError::RateLimited(_) => ApiErrorCode::RateLimited,
+            ApiError::NotYetIndexed(_) => ApiErrorCode::NotYetIndexed,
+            ApiError::Coded { code, .. } => *code,
+        }
+    }
+
+    /// The message returned to the caller. Public by construction — every variant
+    /// holds text already destined for the response body, so this never leaks
+    /// internal detail that `respond_to` would have withheld.
+    pub fn public_message(&self) -> String {
+        match self {
+            ApiError::BadRequest(msg)
+            | ApiError::Unauthorized(msg)
+            | ApiError::Forbidden(msg)
+            | ApiError::NotFound(msg)
+            | ApiError::Internal(msg)
+            | ApiError::RateLimited(msg)
+            | ApiError::NotYetIndexed(msg) => msg.clone(),
+            ApiError::Coded { public_message, .. } => (*public_message).to_string(),
+        }
+    }
 }
 
 impl<'r> Responder<'r, 'static> for ApiError {
     fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let (code, message) = match &self {
-            ApiError::BadRequest(msg) => (ApiErrorCode::BadRequest, msg.clone()),
-            ApiError::Unauthorized(msg) => (ApiErrorCode::Unauthorized, msg.clone()),
-            ApiError::Forbidden(msg) => (ApiErrorCode::Forbidden, msg.clone()),
-            ApiError::NotFound(msg) => (ApiErrorCode::NotFound, msg.clone()),
-            ApiError::Internal(msg) => (ApiErrorCode::InternalError, msg.clone()),
-            ApiError::RateLimited(msg) => (ApiErrorCode::RateLimited, msg.clone()),
-            ApiError::NotYetIndexed(msg) => (ApiErrorCode::NotYetIndexed, msg.clone()),
-            ApiError::Coded {
-                code,
-                public_message,
-            } => (*code, (*public_message).to_string()),
-        };
+        let (code, message) = (self.code(), self.public_message());
         let status = code.status();
         let span = request_span_for(req);
         span.in_scope(|| {
@@ -292,10 +317,32 @@ mod tests {
     }
 
     #[test]
+    fn test_code_and_message_cover_coded_and_representative_errors() {
+        let cases: [(ApiError, ApiErrorCode, &str); 2] = [
+            (
+                ApiError::BadRequest("bad".into()),
+                ApiErrorCode::BadRequest,
+                "bad",
+            ),
+            (
+                ApiError::coded(ApiErrorCode::SwapSameToken, "same token"),
+                ApiErrorCode::SwapSameToken,
+                "same token",
+            ),
+        ];
+
+        for (error, expected_code, expected_message) in cases {
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(error.public_message(), expected_message);
+        }
+    }
+
+    #[test]
     fn test_catalog_serializes_stable_codes() {
         let cases = [
             (ApiErrorCode::BadRequest, "\"BAD_REQUEST\""),
             (ApiErrorCode::SwapQuoteFailed, "\"SWAP_QUOTE_FAILED\""),
+            (ApiErrorCode::SwapSameToken, "\"SWAP_SAME_TOKEN\""),
             (
                 ApiErrorCode::UpstreamUnavailable,
                 "\"UPSTREAM_UNAVAILABLE\"",
@@ -311,6 +358,7 @@ mod tests {
     fn test_trade_catalog_uses_expected_http_statuses() {
         let cases = [
             (ApiErrorCode::SwapUnsupportedToken, Status::BadRequest),
+            (ApiErrorCode::SwapSameToken, Status::BadRequest),
             (ApiErrorCode::SwapPreflightFailed, Status::BadRequest),
             (ApiErrorCode::SwapNoLiquidity, Status::NotFound),
             (ApiErrorCode::SwapQuoteFailed, Status::InternalServerError),

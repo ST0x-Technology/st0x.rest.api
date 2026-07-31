@@ -1,5 +1,10 @@
-use super::{RaindexSwapDataSource, SwapDataSource};
-use crate::analytics::{swap_calldata_generated_event, Analytics, ApiVersion};
+use super::{
+    capture_swap_outcome, ensure_distinct_tokens, snapshot_swap_context, RaindexSwapDataSource,
+    SwapAnalyticsContext, SwapDataSource,
+};
+use crate::analytics::{
+    swap_calldata_failed_event, swap_calldata_generated_event, Analytics, ApiVersion,
+};
 use crate::app_state::ApplicationState;
 use crate::attribution::{attribution_message_hash, Attribution, AttributionSigner};
 use crate::auth::AuthenticatedKey;
@@ -151,33 +156,42 @@ async fn handle_swap_calldata(
     attribution: &Attribution,
     req: SwapCalldataRequest,
 ) -> Result<SwapCalldataResponse, ApiError> {
-    let analytics_context = analytics.is_enabled().then(|| {
-        (
-            req.taker,
-            req.input_token,
-            req.output_token,
-            serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
-        )
+    let taker = req.taker;
+    let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        taker: Some(taker),
+        input_token: req.input_token,
+        output_token: req.output_token,
+        requested_amount: req.output_amount.clone(),
+        denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        api_version: ApiVersion::V1,
+        mode: None,
     });
-    let mut response = process_swap_calldata(ds, req).await?;
-    embed_and_validate_attribution(&mut response, signer, attribution).await?;
 
-    if let Some((taker, input_token, output_token, denomination)) = analytics_context {
-        analytics.capture(|| {
+    // Attribution failures are calldata failures too — the caller ends up with no
+    // calldata either way — so both fallible steps feed the same failure event.
+    capture_swap_outcome(
+        analytics,
+        analytics_context,
+        async {
+            let mut response = process_swap_calldata(ds, req).await?;
+            embed_and_validate_attribution(&mut response, signer, attribution).await?;
+            Ok(response)
+        },
+        |context, error| swap_calldata_failed_event(key, context.failure(), error),
+        |context, response| {
             swap_calldata_generated_event(
                 key,
                 taker,
-                input_token,
-                output_token,
-                denomination,
-                ApiVersion::V1,
-                None,
-                &response,
+                context.input_token,
+                context.output_token,
+                context.denomination.clone(),
+                context.api_version,
+                context.mode.clone(),
+                response,
             )
-        });
-    }
-
-    Ok(response)
+        },
+    )
+    .await
 }
 
 async fn handle_swap_calldata_v2(
@@ -188,34 +202,40 @@ async fn handle_swap_calldata_v2(
     attribution: &Attribution,
     req: SwapCalldataV2Request,
 ) -> Result<SwapCalldataV2Response, ApiError> {
-    let analytics_context = analytics.is_enabled().then(|| {
-        (
-            req.taker,
-            req.input_token,
-            req.output_token,
-            serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
-            serde_json::to_value(req.mode).ok(),
-        )
+    let taker = req.taker;
+    let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        taker: Some(taker),
+        input_token: req.input_token,
+        output_token: req.output_token,
+        requested_amount: req.amount.clone(),
+        denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        api_version: ApiVersion::V2,
+        mode: serde_json::to_value(req.mode).ok(),
     });
-    let mut response = process_swap_calldata_v2(ds, req).await?;
-    embed_and_validate_attribution(&mut response.calldata, signer, attribution).await?;
 
-    if let Some((taker, input_token, output_token, denomination, mode)) = analytics_context {
-        analytics.capture(|| {
+    capture_swap_outcome(
+        analytics,
+        analytics_context,
+        async {
+            let mut response = process_swap_calldata_v2(ds, req).await?;
+            embed_and_validate_attribution(&mut response.calldata, signer, attribution).await?;
+            Ok(response)
+        },
+        |context, error| swap_calldata_failed_event(key, context.failure(), error),
+        |context, response| {
             swap_calldata_generated_event(
                 key,
                 taker,
-                input_token,
-                output_token,
-                denomination,
-                ApiVersion::V2,
-                mode,
+                context.input_token,
+                context.output_token,
+                context.denomination.clone(),
+                context.api_version,
+                context.mode.clone(),
                 &response.calldata,
             )
-        });
-    }
-
-    Ok(response)
+        },
+    )
+    .await
 }
 
 async fn embed_and_validate_attribution(
@@ -446,6 +466,7 @@ async fn process_swap_calldata_v2(
     ds: &dyn SwapDataSource,
     req: SwapCalldataV2Request,
 ) -> Result<SwapCalldataV2Response, ApiError> {
+    ensure_distinct_tokens(req.input_token, req.output_token)?;
     let result = process_swap_calldata_build(ds, req.try_into()?).await?;
     Ok(SwapCalldataV2Response {
         calldata: result.calldata,
@@ -457,6 +478,8 @@ async fn process_swap_calldata_build(
     ds: &dyn SwapDataSource,
     req: SwapCalldataBuildRequest,
 ) -> Result<SwapCalldataBuildResult, ApiError> {
+    ensure_distinct_tokens(req.input_token, req.output_token)?;
+
     ds.validate_supported_tokens(req.input_token, req.output_token)
         .await
         .map_err(map_calldata_boundary_error)?;
@@ -997,6 +1020,165 @@ mod tests {
             .expect("swap_calldata_generated event");
         assert_eq!(event.properties["api_version"], "v2");
         assert_eq!(event.properties["mode"], "spendExact");
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_calldata_captures_v1_failure_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let key = test_key();
+        let attribution_state = test_attribution_state();
+        let attribution = attribution_state.for_api_key(&key.key_id, TAKER);
+
+        let result = handle_swap_calldata(
+            &ds,
+            &key,
+            &analytics,
+            &attribution_state.signer,
+            &attribution,
+            calldata_request("100", "2.5"),
+        )
+        .await;
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
+
+        let events = recording.events();
+        let event = events
+            .iter()
+            .find(|event| event.event == "swap_calldata_failed")
+            .expect("swap_calldata_failed event");
+        assert_eq!(event.distinct_id, "client:test-client");
+        assert_eq!(event.properties["requested_amount"], "100");
+        assert_eq!(event.properties["api_version"], "v1");
+        assert_eq!(event.properties["taker"], TAKER.to_string().to_lowercase());
+        assert_eq!(event.properties["error_code"], "SWAP_CALLDATA_FAILED");
+        assert_eq!(event.properties["status_code"], 500);
+        assert!(!events
+            .iter()
+            .any(|event| event.event == "swap_calldata_generated"));
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_calldata_v2_captures_attribution_failure_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            // Deliberately invalid ABI: processing succeeds, attribution embedding fails.
+            calldata_result: Ok(ready_response()),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let key = test_key();
+        let attribution_state = test_attribution_state();
+        let attribution = attribution_state.for_api_key(&key.key_id, TAKER);
+
+        let result = handle_swap_calldata_v2(
+            &ds,
+            &key,
+            &analytics,
+            &attribution_state.signer,
+            &attribution,
+            calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5"),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::Internal(_))));
+
+        let events = recording.events();
+        let event = events
+            .iter()
+            .find(|event| event.event == "swap_calldata_failed")
+            .expect("swap_calldata_failed event");
+        assert_eq!(event.properties["requested_amount"], "100");
+        assert_eq!(event.properties["api_version"], "v2");
+        assert_eq!(event.properties["mode"], "spendExact");
+        assert_eq!(event.properties["taker"], TAKER.to_string().to_lowercase());
+        assert_eq!(event.properties["error_code"], "INTERNAL_ERROR");
+        assert_eq!(event.properties["status_code"], 500);
+        assert!(!events
+            .iter()
+            .any(|event| event.event == "swap_calldata_generated"));
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_calldata_rejects_same_token_before_data_source_and_captures_failure()
+    {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("data source must not be reached".into())),
+            orders: Err(ApiError::Internal("data source must not be reached".into())),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("data source must not be reached".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let key = test_key();
+        let attribution_state = test_attribution_state();
+        let attribution = attribution_state.for_api_key(&key.key_id, TAKER);
+        let mut request = calldata_request("100", "2.5");
+        request.output_token = request.input_token;
+
+        let result = handle_swap_calldata(
+            &ds,
+            &key,
+            &analytics,
+            &attribution_state.signer,
+            &attribution,
+            request,
+        )
+        .await;
+
+        assert_error_code(result, ApiErrorCode::SwapSameToken);
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_calldata_failed")
+            .expect("swap_calldata_failed event");
+        assert_eq!(event.properties["api_version"], "v1");
+        assert_eq!(event.properties["same_token"], true);
+        assert_eq!(event.properties["error_code"], "SWAP_SAME_TOKEN");
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_calldata_v2_same_token_precedes_price_limit_validation() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("data source must not be reached".into())),
+            orders: Err(ApiError::Internal("data source must not be reached".into())),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("data source must not be reached".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let key = test_key();
+        let attribution_state = test_attribution_state();
+        let attribution = attribution_state.for_api_key(&key.key_id, TAKER);
+        let mut request = calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2.5");
+        request.output_token = request.input_token;
+        request.price_cap = None;
+
+        let result = handle_swap_calldata_v2(
+            &ds,
+            &key,
+            &analytics,
+            &attribution_state.signer,
+            &attribution,
+            request,
+        )
+        .await;
+
+        assert_error_code(result, ApiErrorCode::SwapSameToken);
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_calldata_failed")
+            .expect("swap_calldata_failed event");
+        assert_eq!(event.properties["api_version"], "v2");
+        assert_eq!(event.properties["same_token"], true);
+        assert_eq!(event.properties["error_code"], "SWAP_SAME_TOKEN");
     }
 
     #[rocket::async_test]

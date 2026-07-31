@@ -6,11 +6,16 @@
 
 use super::AnalyticsEvent;
 use crate::auth::{AuthClientInfo, AuthenticatedKey};
+use crate::error::ApiError;
 use crate::types::swap::{SwapCalldataResponse, SwapQuoteResponse, SwapQuoteV2Response};
 use alloy::primitives::Address;
+use rain_math_float::Float;
 use serde_json::{Map, Value};
 
-/// Which swap-calldata API version produced an event.
+const MAX_ANALYTICS_AMOUNT_LENGTH: usize = 128;
+
+/// Which swap API version produced an event.
+#[derive(Clone, Copy)]
 pub(crate) enum ApiVersion {
     V1,
     V2,
@@ -107,6 +112,7 @@ pub(crate) fn swap_quoted_event(
         "estimated_io_ratio".to_string(),
         resp.estimated_io_ratio.clone().into(),
     );
+    props.insert("api_version".to_string(), ApiVersion::V1.as_str().into());
     AnalyticsEvent {
         event: "swap_quoted",
         distinct_id: client_distinct_id(&info),
@@ -155,6 +161,7 @@ pub(crate) fn swap_quoted_v2_event(
         "resolved_price_cap".to_string(),
         resp.resolved_price_cap.clone().into(),
     );
+    props.insert("api_version".to_string(), ApiVersion::V2.as_str().into());
     AnalyticsEvent {
         event: "swap_quoted",
         distinct_id: client_distinct_id(&info),
@@ -198,6 +205,105 @@ pub(crate) fn swap_calldata_generated_event(
         distinct_id: taker_id,
         properties: props,
     }
+}
+
+/// What a caller asked for on a swap request that then failed.
+///
+/// The success events describe a *response*, so they can only ever describe requests
+/// that worked — a client failing 100% of the time is indistinguishable from one
+/// sending no traffic at all. This carries the *request* instead, captured before it
+/// is consumed, so a failure reports the pair and size that produced it.
+pub(crate) struct SwapFailure<'a> {
+    pub input_token: Address,
+    pub output_token: Address,
+    /// The requested amount, verbatim. Which side it denominates depends on the
+    /// endpoint (v1 quote takes an output amount, v2 an amount plus a mode), so it
+    /// is reported as-is alongside `api_version` rather than being reinterpreted.
+    pub requested_amount: &'a str,
+    pub denomination: Value,
+    pub api_version: ApiVersion,
+    pub mode: Option<Value>,
+    /// Present only on calldata requests, which carry an end-user wallet.
+    pub taker: Option<Address>,
+}
+
+/// Failed swap quote. Attributed to the client: a failing quote is an integration
+/// problem, so the useful grouping is "which client", not "which wallet".
+pub(crate) fn swap_quote_failed_event(
+    key: &AuthenticatedKey,
+    failure: SwapFailure<'_>,
+    error: &ApiError,
+) -> AnalyticsEvent {
+    swap_failed_event("swap_quote_failed", key, failure, error)
+}
+
+/// Failed swap calldata. Attributed to the client for the same reason as
+/// [`swap_quote_failed_event`]; the wallet is still reported as a `taker` property.
+pub(crate) fn swap_calldata_failed_event(
+    key: &AuthenticatedKey,
+    failure: SwapFailure<'_>,
+    error: &ApiError,
+) -> AnalyticsEvent {
+    swap_failed_event("swap_calldata_failed", key, failure, error)
+}
+
+fn swap_failed_event(
+    event: &'static str,
+    key: &AuthenticatedKey,
+    failure: SwapFailure<'_>,
+    error: &ApiError,
+) -> AnalyticsEvent {
+    let info = key.client_info();
+    let code = error.code();
+    let mut props = base_props(&info);
+    props.insert(
+        "input_token".to_string(),
+        token_str(failure.input_token).into(),
+    );
+    props.insert(
+        "output_token".to_string(),
+        token_str(failure.output_token).into(),
+    );
+    if analytics_requested_amount(failure.requested_amount) {
+        props.insert(
+            "requested_amount".to_string(),
+            failure.requested_amount.into(),
+        );
+    }
+    props.insert("denomination".to_string(), failure.denomination);
+    props.insert(
+        "api_version".to_string(),
+        failure.api_version.as_str().into(),
+    );
+    props.insert("error_code".to_string(), code.as_str().into());
+    props.insert("status_code".to_string(), code.status().code.into());
+    // Precomputed because it is the failure mode that is invisible in aggregate:
+    // a same-token pair is always a caller bug, and grouping on two address columns
+    // to notice it is exactly the step nobody takes.
+    props.insert(
+        "same_token".to_string(),
+        (failure.input_token == failure.output_token).into(),
+    );
+    if let Some(mode) = failure.mode {
+        props.insert("mode".to_string(), mode);
+    }
+    if let Some(taker) = failure.taker {
+        props.insert("taker".to_string(), token_str(taker).into());
+    }
+    AnalyticsEvent {
+        event,
+        distinct_id: client_distinct_id(&info),
+        properties: props,
+    }
+}
+
+/// Keep arbitrary request text out of PostHog while preserving valid trade sizes.
+///
+/// Swap amount fields deserialize as strings and failure events include parse errors,
+/// so a failed request is not proof that the value is numeric. The length bound also
+/// keeps an authenticated caller from creating oversized analytics properties.
+fn analytics_requested_amount(amount: &str) -> bool {
+    amount.len() <= MAX_ANALYTICS_AMOUNT_LENGTH && Float::parse(amount.to_string()).is_ok()
 }
 
 /// Lowercased `0x…` address string. Matches the site's `posthog.identify()` form so
@@ -263,9 +369,102 @@ mod tests {
         assert_eq!(event.event, "swap_quoted");
         assert_eq!(event.distinct_id, "client:site-key");
         assert_eq!(event.properties["estimated_input"], Value::from("1250.75"));
+        assert_eq!(event.properties["api_version"], Value::from("v1"));
         assert_eq!(
             event.properties["api_client_label"],
             Value::from("St0x Website")
+        );
+    }
+
+    #[test]
+    fn swap_quote_failed_event_reports_the_request_and_the_wire_error() {
+        let event = swap_quote_failed_event(
+            &test_key(),
+            SwapFailure {
+                input_token: addr(1),
+                output_token: addr(2),
+                requested_amount: "0.01",
+                denomination: Value::from("wrapped"),
+                api_version: ApiVersion::V1,
+                mode: None,
+                taker: None,
+            },
+            &crate::error::ApiError::coded(
+                crate::error::ApiErrorCode::SwapNoLiquidity,
+                "no executable liquidity is available for this pair",
+            ),
+        );
+
+        assert_eq!(event.event, "swap_quote_failed");
+        // Client-scoped: a failing quote is an integration problem, not a wallet one.
+        assert_eq!(event.distinct_id, "client:site-key");
+        assert_eq!(event.properties["requested_amount"], Value::from("0.01"));
+        assert_eq!(
+            event.properties["error_code"],
+            Value::from("SWAP_NO_LIQUIDITY")
+        );
+        // Mirrors the HTTP status the caller actually received.
+        assert_eq!(event.properties["status_code"], Value::from(404));
+        assert_eq!(event.properties["same_token"], Value::from(false));
+        assert!(event.properties.get("taker").is_none());
+        assert!(event.properties.get("mode").is_none());
+    }
+
+    #[test]
+    fn swap_failure_omits_non_numeric_requested_amount() {
+        let event = swap_quote_failed_event(
+            &test_key(),
+            SwapFailure {
+                input_token: addr(1),
+                output_token: addr(2),
+                requested_amount: "customer@example.com",
+                denomination: Value::from("wrapped"),
+                api_version: ApiVersion::V1,
+                mode: None,
+                taker: None,
+            },
+            &crate::error::ApiError::BadRequest("invalid output_amount".into()),
+        );
+
+        assert!(event.properties.get("requested_amount").is_none());
+    }
+
+    #[test]
+    fn analytics_requested_amount_enforces_length_boundary() {
+        assert!(analytics_requested_amount(&format!("{}1", "0".repeat(127))));
+        assert!(!analytics_requested_amount(&format!(
+            "{}1",
+            "0".repeat(128)
+        )));
+    }
+
+    #[test]
+    fn swap_failure_flags_a_same_token_pair() {
+        let event = swap_calldata_failed_event(
+            &test_key(),
+            SwapFailure {
+                input_token: addr(7),
+                output_token: addr(7),
+                requested_amount: "100",
+                denomination: Value::from("wrapped"),
+                api_version: ApiVersion::V2,
+                mode: Some(Value::from("spendExact")),
+                taker: Some(addr(0xAB)),
+            },
+            &crate::error::ApiError::coded(
+                crate::error::ApiErrorCode::SwapSameToken,
+                "inputToken and outputToken must be different tokens",
+            ),
+        );
+
+        assert_eq!(event.event, "swap_calldata_failed");
+        assert_eq!(event.properties["same_token"], Value::from(true));
+        assert_eq!(event.properties["status_code"], Value::from(400));
+        assert_eq!(event.properties["api_version"], Value::from("v2"));
+        assert_eq!(event.properties["mode"], Value::from("spendExact"));
+        assert_eq!(
+            event.properties["taker"],
+            Value::from(addr(0xAB).to_string().to_lowercase())
         );
     }
 

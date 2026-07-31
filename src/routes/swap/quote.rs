@@ -1,5 +1,10 @@
-use super::{RaindexSwapDataSource, SwapDataSource};
-use crate::analytics::{swap_quoted_event, swap_quoted_v2_event, Analytics};
+use super::{
+    capture_swap_outcome, ensure_distinct_tokens, snapshot_swap_context, RaindexSwapDataSource,
+    SwapAnalyticsContext, SwapDataSource,
+};
+use crate::analytics::{
+    swap_quote_failed_event, swap_quoted_event, swap_quoted_v2_event, Analytics, ApiVersion,
+};
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
@@ -127,19 +132,32 @@ async fn handle_swap_quote(
     analytics: &Analytics,
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
-    let response = process_swap_quote(ds, req).await?;
-
-    analytics.capture(|| {
-        swap_quoted_event(
-            key,
-            response.input_token,
-            response.output_token,
-            serde_json::to_value(response.denomination).unwrap_or(serde_json::Value::Null),
-            &response,
-        )
+    let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        input_token: req.input_token,
+        output_token: req.output_token,
+        requested_amount: req.output_amount.clone(),
+        denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        api_version: ApiVersion::V1,
+        mode: None,
+        taker: None,
     });
 
-    Ok(response)
+    capture_swap_outcome(
+        analytics,
+        analytics_context,
+        process_swap_quote(ds, req),
+        |context, error| swap_quote_failed_event(key, context.failure(), error),
+        |_context, response| {
+            swap_quoted_event(
+                key,
+                response.input_token,
+                response.output_token,
+                serde_json::to_value(response.denomination).unwrap_or(serde_json::Value::Null),
+                response,
+            )
+        },
+    )
+    .await
 }
 
 async fn handle_swap_quote_v2(
@@ -148,17 +166,32 @@ async fn handle_swap_quote_v2(
     analytics: &Analytics,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
-    let response = process_swap_quote_v2(ds, req).await?;
+    let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        input_token: req.input_token,
+        output_token: req.output_token,
+        requested_amount: req.amount.clone(),
+        denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        api_version: ApiVersion::V2,
+        mode: serde_json::to_value(req.mode).ok(),
+        taker: None,
+    });
 
-    analytics.capture(|| swap_quoted_v2_event(key, &response));
-
-    Ok(response)
+    capture_swap_outcome(
+        analytics,
+        analytics_context,
+        process_swap_quote_v2(ds, req),
+        |context, error| swap_quote_failed_event(key, context.failure(), error),
+        |_context, response| swap_quoted_v2_event(key, response),
+    )
+    .await
 }
 
 async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
+    ensure_distinct_tokens(req.input_token, req.output_token)?;
+
     ds.validate_supported_tokens(req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
@@ -246,6 +279,9 @@ async fn process_swap_quote_v2(
     ds: &dyn SwapDataSource,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
+    ensure_distinct_tokens(req.input_token, req.output_token)?;
+    let price_limit = validate_quote_v2_price_limit(&req)?;
+
     ds.validate_supported_tokens(req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
@@ -288,14 +324,10 @@ async fn process_swap_quote_v2(
         return Err(no_liquidity_error());
     }
 
-    let price_cap = match (
-        req.price_cap.as_ref(),
-        req.slippage_bps,
-        req.reference_io_ratio.as_ref(),
-    ) {
-        (Some(price_cap), None, None) => {
+    let price_cap = match price_limit {
+        QuoteV2PriceLimit::Fixed(price_cap) => {
             let normalized = normalize_calldata_price_cap(
-                price_cap.clone(),
+                price_cap.to_string(),
                 "price_cap",
                 req.denomination,
                 req.input_token,
@@ -307,19 +339,14 @@ async fn process_swap_quote_v2(
                 ApiError::BadRequest("invalid price_cap".into())
             })?
         }
-        (Some(_), None, Some(_)) => {
-            tracing::warn!(
-                "swap quote rejected because reference_io_ratio was provided without slippage_bps"
-            );
-            return Err(ApiError::BadRequest(
-                "reference_io_ratio requires slippage_bps".into(),
-            ));
-        }
-        (None, Some(slippage_bps @ 1..=5000), reference_io_ratio) => {
+        QuoteV2PriceLimit::Slippage {
+            slippage_bps,
+            reference_io_ratio,
+        } => {
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
-                        reference_io_ratio.clone(),
+                        reference_io_ratio.to_string(),
                         "reference_io_ratio",
                         req.denomination,
                         req.input_token,
@@ -344,18 +371,6 @@ async fn process_swap_quote_v2(
                 slippage_bps,
                 reference_io_ratio,
             )?
-        }
-        (None, Some(_), _) => {
-            tracing::warn!("swap quote rejected for out-of-range slippage_bps");
-            return Err(ApiError::BadRequest(
-                "slippage_bps must be between 1 and 5000".into(),
-            ));
-        }
-        _ => {
-            tracing::warn!("swap quote rejected without exactly one price limit");
-            return Err(ApiError::BadRequest(
-                "provide exactly one of price_cap or slippage_bps".into(),
-            ));
         }
     };
 
@@ -430,6 +445,52 @@ async fn process_swap_quote_v2(
     })
 }
 
+enum QuoteV2PriceLimit<'a> {
+    Fixed(&'a str),
+    Slippage {
+        slippage_bps: u16,
+        reference_io_ratio: Option<&'a str>,
+    },
+}
+
+fn validate_quote_v2_price_limit(
+    req: &SwapQuoteV2Request,
+) -> Result<QuoteV2PriceLimit<'_>, ApiError> {
+    match (
+        req.price_cap.as_deref(),
+        req.slippage_bps,
+        req.reference_io_ratio.as_deref(),
+    ) {
+        (Some(price_cap), None, None) => Ok(QuoteV2PriceLimit::Fixed(price_cap)),
+        (Some(_), None, Some(_)) => {
+            tracing::warn!(
+                "swap quote rejected because reference_io_ratio was provided without slippage_bps"
+            );
+            Err(ApiError::BadRequest(
+                "reference_io_ratio requires slippage_bps".into(),
+            ))
+        }
+        (None, Some(slippage_bps @ 1..=5000), reference_io_ratio) => {
+            Ok(QuoteV2PriceLimit::Slippage {
+                slippage_bps,
+                reference_io_ratio,
+            })
+        }
+        (None, Some(_), _) => {
+            tracing::warn!("swap quote rejected for out-of-range slippage_bps");
+            Err(ApiError::BadRequest(
+                "slippage_bps must be between 1 and 5000".into(),
+            ))
+        }
+        _ => {
+            tracing::warn!("swap quote rejected without exactly one price limit");
+            Err(ApiError::BadRequest(
+                "provide exactly one of price_cap or slippage_bps".into(),
+            ))
+        }
+    }
+}
+
 fn no_liquidity_error() -> ApiError {
     ApiError::coded(
         ApiErrorCode::SwapNoLiquidity,
@@ -475,6 +536,7 @@ mod tests {
 
     const USDC: alloy::primitives::Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: alloy::primitives::Address = address!("4200000000000000000000000000000000000006");
+    const TAKER: alloy::primitives::Address = address!("1111111111111111111111111111111111111111");
 
     fn test_key() -> AuthenticatedKey {
         AuthenticatedKey {
@@ -793,10 +855,10 @@ mod tests {
     #[rocket::async_test]
     async fn test_process_swap_quote_v2_validates_price_limit_options() {
         let ds = MockSwapDataSource {
-            supported_tokens: Ok(()),
-            orders: Ok(vec![mock_order()]),
-            candidates: vec![mock_candidate("5", "1")],
-            calldata_result: Err(ApiError::Internal("unused".into())),
+            supported_tokens: Err(ApiError::Internal("data source must not be reached".into())),
+            orders: Err(ApiError::Internal("data source must not be reached".into())),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("data source must not be reached".into())),
         };
 
         let mut both = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
@@ -862,6 +924,7 @@ mod tests {
         assert_eq!(event.distinct_id, "client:test-client");
         assert_eq!(event.properties["estimated_output"], "5");
         assert_eq!(event.properties["fully_filled"], true);
+        assert_eq!(event.properties["api_version"], "v2");
     }
 
     #[rocket::async_test]
@@ -888,6 +951,125 @@ mod tests {
         assert_eq!(event.distinct_id, "client:test-client");
         assert_eq!(event.properties["estimated_input"], "150");
         assert_eq!(event.properties["api_client_owner"], "test-owner");
+        assert_eq!(event.properties["api_version"], "v1");
+    }
+
+    /// A failing quote must still report the pair that failed. Without this the only
+    /// signal is an `api_request` 404 with no tokens on it, which is what made a
+    /// 100%-failing integrator indistinguishable from one sending no traffic.
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_captures_failure_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]), // no orders for the pair -> SWAP_NO_LIQUIDITY
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let result = handle_swap_quote(&ds, &test_key(), &analytics, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quote_failed")
+            .expect("swap_quote_failed event");
+        assert_eq!(event.distinct_id, "client:test-client");
+        assert_eq!(event.properties["api_client_owner"], "test-owner");
+        assert_eq!(
+            event.properties["input_token"],
+            USDC.to_string().to_lowercase()
+        );
+        assert_eq!(
+            event.properties["output_token"],
+            WETH.to_string().to_lowercase()
+        );
+        assert_eq!(event.properties["requested_amount"], "100");
+        assert_eq!(event.properties["error_code"], "SWAP_NO_LIQUIDITY");
+        assert_eq!(event.properties["status_code"], 404);
+        assert_eq!(event.properties["same_token"], false);
+        assert_eq!(event.properties["api_version"], "v1");
+        // No swap_quoted on the failure path: success and failure stay disjoint so a
+        // success rate computed from these two events is meaningful.
+        assert!(!recording
+            .events()
+            .iter()
+            .any(|event| event.event == "swap_quoted"));
+    }
+
+    /// The guard must run before any data-source call: the whole point is to avoid the
+    /// full-book RPC sweep a same-token pair would otherwise trigger. A data source
+    /// that errors on first use proves it was never reached.
+    #[rocket::async_test]
+    async fn test_same_token_pair_is_rejected_before_touching_the_data_source() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("data source must not be reached".into())),
+            orders: Err(ApiError::Internal("data source must not be reached".into())),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let mut req = quote_request("100");
+        req.output_token = req.input_token;
+
+        assert_error_code(
+            process_swap_quote(&ds, req).await,
+            ApiErrorCode::SwapSameToken,
+        );
+    }
+
+    #[rocket::async_test]
+    async fn test_same_token_failure_is_flagged_in_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let mut req = quote_request("100");
+        req.output_token = req.input_token;
+
+        let result = handle_swap_quote(&ds, &test_key(), &analytics, req).await;
+        assert_error_code(result, ApiErrorCode::SwapSameToken);
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quote_failed")
+            .expect("swap_quote_failed event");
+        assert_eq!(event.properties["same_token"], true);
+        assert_eq!(event.properties["error_code"], "SWAP_SAME_TOKEN");
+        assert_eq!(event.properties["status_code"], 400);
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_v2_captures_failure_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let mut request = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        request.taker = Some(TAKER);
+        let result = handle_swap_quote_v2(&ds, &test_key(), &analytics, request).await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quote_failed")
+            .expect("swap_quote_failed event");
+        assert_eq!(event.properties["api_version"], "v2");
+        assert_eq!(event.properties["requested_amount"], "5");
+        assert_eq!(event.properties["error_code"], "SWAP_NO_LIQUIDITY");
+        assert!(event.properties.get("taker").is_none());
     }
 
     #[rocket::async_test]

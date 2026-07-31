@@ -45,6 +45,7 @@ unexpected failures outside those boundaries.
 
 | HTTP Status | Code                     | Description                                   |
 | ----------- | ------------------------ | --------------------------------------------- |
+| 400         | `SWAP_SAME_TOKEN`        | Input and output swap tokens are identical    |
 | 400         | `SWAP_UNSUPPORTED_TOKEN` | One or both swap tokens are unsupported       |
 | 404         | `SWAP_NO_LIQUIDITY`      | No executable liquidity is available          |
 | 500         | `SWAP_QUOTE_FAILED`      | Quote generation failed unexpectedly          |

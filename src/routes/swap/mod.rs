@@ -3,6 +3,7 @@ mod denomination;
 mod quote;
 mod slippage;
 
+use crate::analytics::{Analytics, AnalyticsEvent, ApiVersion, SwapFailure};
 use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorCode};
@@ -26,6 +27,61 @@ use rain_orderbook_common::take_orders::{
 };
 use rocket::Route;
 use std::collections::HashMap;
+use std::future::Future;
+
+struct SwapAnalyticsContext {
+    input_token: Address,
+    output_token: Address,
+    requested_amount: String,
+    denomination: serde_json::Value,
+    api_version: ApiVersion,
+    mode: Option<serde_json::Value>,
+    taker: Option<Address>,
+}
+
+impl SwapAnalyticsContext {
+    fn failure(&self) -> SwapFailure<'_> {
+        SwapFailure {
+            input_token: self.input_token,
+            output_token: self.output_token,
+            requested_amount: &self.requested_amount,
+            denomination: self.denomination.clone(),
+            api_version: self.api_version,
+            mode: self.mode.clone(),
+            taker: self.taker,
+        }
+    }
+}
+
+fn snapshot_swap_context(
+    analytics: &Analytics,
+    build: impl FnOnce() -> SwapAnalyticsContext,
+) -> Option<SwapAnalyticsContext> {
+    analytics.is_enabled().then(build)
+}
+
+async fn capture_swap_outcome<T>(
+    analytics: &Analytics,
+    context: Option<SwapAnalyticsContext>,
+    operation: impl Future<Output = Result<T, ApiError>>,
+    build_failure: impl FnOnce(&SwapAnalyticsContext, &ApiError) -> AnalyticsEvent,
+    build_success: impl FnOnce(&SwapAnalyticsContext, &T) -> AnalyticsEvent,
+) -> Result<T, ApiError> {
+    match operation.await {
+        Ok(response) => {
+            if let Some(context) = context.as_ref() {
+                analytics.capture(|| build_success(context, &response));
+            }
+            Ok(response)
+        }
+        Err(error) => {
+            if let Some(context) = context.as_ref() {
+                analytics.capture(|| build_failure(context, &error));
+            }
+            Err(error)
+        }
+    }
+}
 
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
@@ -265,6 +321,36 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     }
 }
 
+/// Reject a swap whose input and output token are the same, before any order lookup.
+///
+/// Such a request is always a caller bug, but it is not a *cheap* one: the token is
+/// individually supported, so `validate_supported_tokens` passes, and the pair matches
+/// every order holding that token. For a stablecoin leg that is the entire book, which
+/// then gets quoted over RPC before the simulation finds no executable leg and returns
+/// "no liquidity" — a ~15s round trip to deliver a misleading answer to a malformed
+/// question. Failing fast makes the error self-explanatory and stops one request from
+/// costing a full-book RPC sweep.
+pub(crate) fn ensure_distinct_tokens(
+    input_token: Address,
+    output_token: Address,
+) -> Result<(), ApiError> {
+    if input_token != output_token {
+        return Ok(());
+    }
+    tracing::warn!(
+        token = %input_token,
+        "swap request rejected: input and output token are identical"
+    );
+    Err(same_token_error())
+}
+
+fn same_token_error() -> ApiError {
+    ApiError::coded(
+        ApiErrorCode::SwapSameToken,
+        "inputToken and outputToken must be different tokens",
+    )
+}
+
 fn map_raindex_error(e: RaindexError) -> ApiError {
     match &e {
         RaindexError::NoLiquidity | RaindexError::InsufficientLiquidity { .. } => {
@@ -274,8 +360,14 @@ fn map_raindex_error(e: RaindexError) -> ApiError {
                 "no executable liquidity is available for this pair",
             )
         }
-        RaindexError::SameTokenPair
-        | RaindexError::NonPositiveAmount
+        // Kept distinct from the generic bucket below: `ensure_distinct_tokens` should
+        // catch this at the edge, so reaching it here means a same-token pair slipped
+        // past the guard and the caller still deserves to be told which mistake it was.
+        RaindexError::SameTokenPair => {
+            tracing::warn!(error = %e, "same-token pair reached the raindex layer");
+            same_token_error()
+        }
+        RaindexError::NonPositiveAmount
         | RaindexError::NegativePriceCap
         | RaindexError::FromHexError(_)
         | RaindexError::Float(_) => {
@@ -340,19 +432,58 @@ pub fn routes_v2() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_raindex_error, swap_candidates_cache_key, swap_chain_ids};
+    use super::{
+        ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
+        swap_candidates_cache_key, swap_chain_ids,
+    };
+    use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
     use alloy::primitives::address;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rain_orderbook_common::raindex_client::RaindexError;
     use rain_orderbook_common::rpc_client::RpcClientError;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn mock_order(chain_id: u32, order_hash: &str) -> RaindexOrder {
         let mut value = crate::test_helpers::order_json();
         value["chainId"] = json!(chain_id);
         value["orderHash"] = json!(order_hash);
         serde_json::from_value(value).expect("deserialize mock order")
+    }
+
+    #[test]
+    fn test_ensure_distinct_tokens_accepts_distinct_and_rejects_equal_tokens() {
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let weth = address!("4200000000000000000000000000000000000006");
+        assert!(ensure_distinct_tokens(usdc, weth).is_ok());
+        assert!(matches!(
+            ensure_distinct_tokens(usdc, usdc),
+            Err(ApiError::Coded { code, .. }) if code == ApiErrorCode::SwapSameToken
+        ));
+    }
+
+    #[test]
+    fn test_disabled_analytics_skips_swap_context_snapshot() {
+        let built = AtomicBool::new(false);
+
+        let context = snapshot_swap_context(&Analytics::disabled(), || {
+            built.store(true, Ordering::Relaxed);
+            unreachable!("disabled analytics must not build a swap context")
+        });
+
+        assert!(context.is_none());
+        assert!(!built.load(Ordering::Relaxed));
+    }
+
+    /// A same-token pair that somehow reaches the raindex layer must still surface as
+    /// `SWAP_SAME_TOKEN`, not be flattened into the generic invalid-parameters bucket.
+    #[test]
+    fn test_same_token_pair_from_raindex_keeps_its_code() {
+        assert!(matches!(
+            map_raindex_error(RaindexError::SameTokenPair),
+            ApiError::Coded { code, .. } if code == ApiErrorCode::SwapSameToken
+        ));
     }
 
     #[test]
