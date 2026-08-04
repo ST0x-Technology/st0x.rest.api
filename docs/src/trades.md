@@ -137,3 +137,86 @@ POST /v1/trades/query
 
 For `POST /v1/trades/query`, include `"denomination": "unwrapped"` in the JSON
 body with `orderHashes`, `startTime`, and `endTime`.
+
+## Batch Trade Query
+
+```
+POST /v1/trades/query
+```
+
+The route has two explicitly typed modes within one backward-compatible
+contract.
+
+### Token-set mode
+
+Omit `orderHashes` and provide `chainId`, `tokenAddresses`, `startTime`, and
+`endTime`. The SDK performs one indexed query for the token set:
+
+```json
+{
+  "chainId": 8453,
+  "tokenAddresses": [
+    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "0x4200000000000000000000000000000000000006"
+  ],
+  "startTime": 1718452800,
+  "endTime": 1718539200,
+  "page": 1,
+  "pageSize": 50,
+  "denomination": "wrapped"
+}
+```
+
+Token-set mode requires 1 through 64 token addresses, a configured non-zero
+`chainId`, and both time bounds. The inclusive time window may not exceed 90
+days. `page` is bounded to 1 through 1000 and `pageSize` to 1 through 500.
+
+The response is `TradesByAddressResponse`, with the same `trades` and
+`pagination` fields as the existing single-token route. Trades that match both
+sides of the requested token set are deduplicated by network and indexed trade
+ID. Results are ordered by timestamp descending and indexed trade ID ascending.
+
+### Order-hash mode
+
+When the `orderHashes` field is present, the route preserves its existing
+grouped response. An explicit empty array remains valid and returns an empty
+grouped response:
+
+```json
+{
+  "orderHashes": [
+    "0x000000000000000000000000000000000000000000000000000000000000abcd"
+  ],
+  "startTime": 1718452800,
+  "endTime": 1718539200,
+  "denomination": "wrapped"
+}
+```
+
+The response remains:
+
+```json
+{
+  "tradesByOrderHash": [
+    {
+      "orderHash": "0x000000000000000000000000000000000000000000000000000000000000abcd",
+      "trades": []
+    }
+  ],
+  "totalCount": 0
+}
+```
+
+Order-hash mode supports up to 64 hashes. It also accepts optional `chainId` and
+up to 64 `tokenAddresses`, which the SDK combines with the order-hash set in the
+same indexed query. Existing clients may continue omitting both. `page` and
+`pageSize` are intentionally rejected in this legacy grouped mode. The
+deduplicated grouped result is bounded to 5,000 trades; requests producing more
+must narrow their hashes, token addresses, chain, or time window.
+
+Both modes normalize and deduplicate addresses and hashes before querying. Their
+short-lived cache keys are order-insensitive and include every
+response-affecting filter, including exact time bounds and denomination.
+Concurrent identical cold requests share one computation, and failed
+computations are never cached. Oversized grouped responses are rejected and
+never cached.

@@ -25,6 +25,7 @@ pub enum ApiErrorCode {
     SwapPreflightFailed,
     SwapCalldataFailed,
     OrdersQueryFailed,
+    TradesQueryFailed,
     UpstreamUnavailable,
 }
 
@@ -46,6 +47,7 @@ impl ApiErrorCode {
             Self::SwapPreflightFailed => "SWAP_PREFLIGHT_FAILED",
             Self::SwapCalldataFailed => "SWAP_CALLDATA_FAILED",
             Self::OrdersQueryFailed => "ORDERS_QUERY_FAILED",
+            Self::TradesQueryFailed => "TRADES_QUERY_FAILED",
             Self::UpstreamUnavailable => "UPSTREAM_UNAVAILABLE",
         }
     }
@@ -62,7 +64,7 @@ impl ApiErrorCode {
             Self::NotFound | Self::SwapNoLiquidity => Status::NotFound,
             Self::RateLimited => Status::TooManyRequests,
             Self::NotYetIndexed => Status::Accepted,
-            Self::OrdersQueryFailed => Status::BadGateway,
+            Self::OrdersQueryFailed | Self::TradesQueryFailed => Status::BadGateway,
             Self::UpstreamUnavailable => Status::ServiceUnavailable,
             Self::InternalError | Self::SwapQuoteFailed | Self::SwapCalldataFailed => {
                 Status::InternalServerError
@@ -367,6 +369,7 @@ mod tests {
                 Status::InternalServerError,
             ),
             (ApiErrorCode::OrdersQueryFailed, Status::BadGateway),
+            (ApiErrorCode::TradesQueryFailed, Status::BadGateway),
             (
                 ApiErrorCode::UpstreamUnavailable,
                 Status::ServiceUnavailable,

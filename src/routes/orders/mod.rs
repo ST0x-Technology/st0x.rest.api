@@ -1,6 +1,7 @@
 mod get_by_owner;
 mod get_by_token;
 mod get_by_tx;
+mod query;
 
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
@@ -19,6 +20,7 @@ use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch as fetch_order_quotes_batch, RaindexOrderQuote,
 };
 use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrder};
+use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 use std::collections::BTreeMap;
@@ -33,6 +35,11 @@ type OrderQuoteResult = Result<Vec<RaindexOrderQuote>, ApiError>;
 type OrderQuoteBatchResult = Result<Vec<Vec<RaindexOrderQuote>>, ApiError>;
 type IndexedOrder = (usize, RaindexOrder);
 type GroupedOrders = BTreeMap<u32, Vec<IndexedOrder>>;
+
+enum OrderQuoteCacheResult {
+    ApiError(ApiError),
+    NotCacheable(Vec<RaindexOrderQuote>),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrderQuoteSummary {
@@ -75,6 +82,17 @@ pub(crate) trait OrdersListDataSource: Send + Sync {
     }
 }
 
+#[async_trait]
+pub(crate) trait BatchOrdersDataSource: OrdersListDataSource {
+    async fn get_orders_query(
+        &self,
+        chain_id: u32,
+        filters: GetOrdersFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<(Vec<RaindexOrder>, u32), ApiError>;
+}
+
 pub(crate) struct RaindexOrdersListDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
@@ -88,6 +106,13 @@ pub(crate) fn order_quote_cache_key(order: &RaindexOrder) -> String {
         order.raindex(),
         order.order_hash()
     )
+}
+
+fn quote_set_is_complete(quotes: &[RaindexOrderQuote]) -> bool {
+    !quotes.is_empty()
+        && quotes
+            .iter()
+            .all(|quote| quote.success && quote.error.is_none())
 }
 
 pub(crate) fn active_filter_for_state(state: Option<OrderState>) -> Option<bool> {
@@ -313,11 +338,25 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
             return fetch().await;
         }
 
-        self.caches
+        match self
+            .caches
             .order_quotes
-            .get_or_try_insert(order_quote_cache_key(order), fetch)
+            .get_or_try_insert(order_quote_cache_key(order), || async {
+                let quotes = fetch().await.map_err(OrderQuoteCacheResult::ApiError)?;
+                if quote_set_is_complete(&quotes) {
+                    Ok(quotes)
+                } else {
+                    Err(OrderQuoteCacheResult::NotCacheable(quotes))
+                }
+            })
             .await
-            .map_err(|e| (*e).clone())
+        {
+            Ok(quotes) => Ok(quotes),
+            Err(error) => match error.as_ref() {
+                OrderQuoteCacheResult::ApiError(error) => Err(error.clone()),
+                OrderQuoteCacheResult::NotCacheable(quotes) => Ok(quotes.clone()),
+            },
+        }
     }
 
     async fn get_order_quotes_batch_for_chain(
@@ -389,7 +428,11 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         }
 
         for ((index, key), quotes) in missed_keys.into_iter().zip(missed_quotes) {
-            self.caches.order_quotes.insert(key, quotes.clone()).await;
+            if quote_set_is_complete(&quotes) {
+                self.caches.order_quotes.insert(key, quotes.clone()).await;
+            } else {
+                tracing::warn!(chain_id, "incomplete order quote result will not be cached");
+            }
             ordered_quotes[index] = Some(quotes);
         }
 
@@ -416,6 +459,35 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
         Ok(wrap_ratio_values_from_responses(responses))
+    }
+}
+
+#[async_trait]
+impl BatchOrdersDataSource for RaindexOrdersListDataSource<'_> {
+    async fn get_orders_query(
+        &self,
+        chain_id: u32,
+        filters: GetOrdersFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
+        let result = self
+            .client
+            .get_orders(
+                Some(ChainIds(vec![chain_id])),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(chain_id, %error, "failed to batch query orders");
+                ApiError::coded(
+                    crate::error::ApiErrorCode::OrdersQueryFailed,
+                    "the order source could not serve this request",
+                )
+            })?;
+        Ok((result.orders().to_vec(), result.total_count()))
     }
 }
 
@@ -634,12 +706,14 @@ pub(crate) async fn current_wrap_ratios_for_orders(
 pub use get_by_owner::*;
 pub use get_by_token::*;
 pub use get_by_tx::*;
+pub use query::*;
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_orders_by_tx,
         get_by_owner::get_orders_by_address,
-        get_by_token::get_orders_by_token
+        get_by_token::get_orders_by_token,
+        query::post_orders_query
     ]
 }
 
@@ -1148,6 +1222,13 @@ _: custom-handle-io();"#,
                 max_output: Some("1".into()),
             }
         );
+    }
+
+    #[test]
+    fn quote_cache_accepts_only_complete_successful_results() {
+        assert!(quote_set_is_complete(&[mock_quote("1.25")]));
+        assert!(!quote_set_is_complete(&[]));
+        assert!(!quote_set_is_complete(&[mock_failed_quote()]));
     }
 
     #[test]

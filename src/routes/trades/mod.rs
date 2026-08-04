@@ -1,10 +1,10 @@
 pub(crate) mod get_by_address;
-pub(crate) mod get_by_order_hashes;
 pub(crate) mod get_by_taker;
 pub(crate) mod get_by_token;
 pub(crate) mod get_by_tx;
+pub(crate) mod query;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorCode};
 use crate::types::common::{Denomination, TokenRef};
 use crate::types::trades::{
     TradeByAddress, TradesByAddressResponse, TradesPagination, TradesPaginationParams,
@@ -19,7 +19,7 @@ use rain_orderbook_common::raindex_client::trades::{
     GetTradesByOrderHashesFilters, GetTradesFilters, GetTradesTokenFilter, OrderHashes,
     RaindexTrade, RaindexTradesByOrderHashResult, RaindexTradesListResult,
 };
-use rain_orderbook_common::raindex_client::types::{PaginationParams, TimeFilter};
+use rain_orderbook_common::raindex_client::types::{ChainIds, PaginationParams, TimeFilter};
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::serde::json::Json;
 use rocket::Route;
@@ -54,18 +54,30 @@ pub(crate) trait TradesDataSource: Send + Sync {
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
 
-    async fn get_trades_by_order_hashes(
-        &self,
-        order_hashes: Vec<B256>,
-        time_filter: TimeFilter,
-    ) -> Result<RaindexTradesByOrderHashResult, ApiError>;
-
     async fn get_current_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
     }
+}
+
+#[async_trait]
+pub(crate) trait BatchTradesDataSource: TradesDataSource {
+    async fn get_trades_query(
+        &self,
+        chain_id: u32,
+        filters: GetTradesFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<RaindexTradesListResult, ApiError>;
+
+    async fn get_trades_by_order_hashes_query(
+        &self,
+        chain_id: Option<u32>,
+        order_hashes: Vec<B256>,
+        filters: GetTradesByOrderHashesFilters,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError>;
 }
 
 pub(crate) struct RaindexTradesDataSource<'a> {
@@ -160,25 +172,6 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
             })
     }
 
-    async fn get_trades_by_order_hashes(
-        &self,
-        order_hashes: Vec<B256>,
-        time_filter: TimeFilter,
-    ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
-        let filters = GetTradesByOrderHashesFilters {
-            time_filter: Some(time_filter),
-            ..Default::default()
-        };
-
-        self.client
-            .get_trades_by_order_hashes(None, OrderHashes(order_hashes), Some(filters))
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to query trades by order hashes");
-                ApiError::Internal("failed to query trades".into())
-            })
-    }
-
     async fn get_current_wrap_ratios_for_tokens(
         &self,
         token_addresses: &[Address],
@@ -196,6 +189,55 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
         Ok(wrap_ratio_values_from_responses(responses))
+    }
+}
+
+#[async_trait]
+impl BatchTradesDataSource for RaindexTradesDataSource<'_> {
+    async fn get_trades_query(
+        &self,
+        chain_id: u32,
+        filters: GetTradesFilters,
+        page: u16,
+        page_size: u16,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.client
+            .get_trades(
+                Some(ChainIds(vec![chain_id])),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(chain_id, %error, "failed to batch query trades");
+                ApiError::coded(
+                    ApiErrorCode::TradesQueryFailed,
+                    "the trade source could not serve this request",
+                )
+            })
+    }
+
+    async fn get_trades_by_order_hashes_query(
+        &self,
+        chain_id: Option<u32>,
+        order_hashes: Vec<B256>,
+        filters: GetTradesByOrderHashesFilters,
+    ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
+        self.client
+            .get_trades_by_order_hashes(
+                chain_id.map(|chain_id| ChainIds(vec![chain_id])),
+                OrderHashes(order_hashes),
+                Some(filters),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(chain_id, %error, "failed to batch query trades by order hashes");
+                ApiError::coded(
+                    ApiErrorCode::TradesQueryFailed,
+                    "the trade source could not serve this request",
+                )
+            })
     }
 }
 
@@ -272,15 +314,33 @@ pub(super) async fn build_trades_list_response(
     page_size: u32,
     denomination: Denomination,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    build_trades_list_response_from_parts(
+        ds,
+        result.trades(),
+        result.total_count(),
+        page,
+        page_size,
+        denomination,
+    )
+    .await
+    .map(Json)
+}
+
+pub(super) async fn build_trades_list_response_from_parts(
+    ds: &dyn TradesDataSource,
+    indexed_trades: &[RaindexTrade],
+    total_trades: u64,
+    page: u32,
+    page_size: u32,
+    denomination: Denomination,
+) -> Result<TradesByAddressResponse, ApiError> {
     let trade_wrap_ratios =
-        current_wrap_ratios_for_trades(ds, denomination, result.trades()).await?;
-    let trades = result
-        .trades()
+        current_wrap_ratios_for_trades(ds, denomination, indexed_trades).await?;
+    let trades = indexed_trades
         .iter()
         .map(|trade| map_trade_for_list(trade, denomination, &trade_wrap_ratios))
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    let total_trades = result.total_count();
     let total_pages = if page_size > 0 {
         total_trades.div_ceil(u64::from(page_size))
     } else {
@@ -288,7 +348,7 @@ pub(super) async fn build_trades_list_response(
     };
     let has_more = u64::from(page) < total_pages;
 
-    Ok(Json(TradesByAddressResponse {
+    Ok(TradesByAddressResponse {
         trades,
         pagination: TradesPagination {
             page,
@@ -297,20 +357,25 @@ pub(super) async fn build_trades_list_response(
             total_pages,
             has_more,
         },
-    }))
+    })
 }
 
-pub(super) async fn current_wrap_ratios_for_trades(
+pub(super) async fn current_wrap_ratios_for_trades<'a>(
     ds: &dyn TradesDataSource,
     denomination: Denomination,
-    trades: &[RaindexTrade],
+    trades: impl IntoIterator<Item = &'a RaindexTrade>,
 ) -> Result<TradeWrapRatioMap, ApiError> {
-    if denomination == Denomination::Wrapped || trades.is_empty() {
+    if denomination == Denomination::Wrapped {
+        return Ok(HashMap::new());
+    }
+
+    let trades = trades.into_iter().collect::<Vec<_>>();
+    if trades.is_empty() {
         return Ok(HashMap::new());
     }
 
     let mut token_addresses = Vec::new();
-    for trade in trades {
+    for trade in &trades {
         token_addresses.push(trade.input_vault_balance_change().token().address());
         token_addresses.push(trade.output_vault_balance_change().token().address());
     }
@@ -383,7 +448,7 @@ pub(super) fn trades_pagination_params(
 pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_trades_by_tx,
-        get_by_order_hashes::get_trades_by_order_hashes,
+        query::post_trades_query,
         get_by_token::get_trades_by_token,
         get_by_taker::get_trades_by_taker,
         get_by_address::get_trades_by_address

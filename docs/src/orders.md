@@ -239,6 +239,57 @@ curl "https://api.st0x.io/v1/orders/token/0xTokenAddress?state=all&side=output&p
 
 The response shape is the same as list orders by owner.
 
+## Query Orders by Token Set
+
+```
+POST /v1/orders/query
+```
+
+Queries one network and one canonical token set through a single indexed SDK
+query. This is the preferred contract for network-wide orderbook views.
+
+```bash
+curl -X POST https://api.st0x.io/v1/orders/query \
+  -H "Authorization: Basic <credentials>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 8453,
+    "tokenAddresses": [
+      "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "0x4200000000000000000000000000000000000006"
+    ],
+    "state": "active",
+    "side": "output",
+    "page": 1,
+    "pageSize": 50,
+    "denomination": "wrapped"
+  }'
+```
+
+| Field              | Type                           | Default   | Bounds and behavior                                                               |
+| ------------------ | ------------------------------ | --------- | --------------------------------------------------------------------------------- |
+| `chainId`          | number                         | required  | Must be a network in the active Raindex registry                                  |
+| `tokenAddresses`   | string[]                       | `[]`      | At most 64; normalized and deduplicated; required unless `orderHash` is supplied  |
+| `ownerAddresses`   | string[]                       | `[]`      | Optional SDK owner filter; at most 64; normalized and deduplicated                |
+| `raindexAddresses` | string[]                       | `[]`      | Optional SDK contract filter; at most 64; normalized and deduplicated             |
+| `orderHash`        | string                         | -         | Optional exact hash. The pinned SDK supports one exact order hash, not a hash set |
+| `state`            | `active`, `inactive`, or `all` | `active`  | Same state semantics as the existing order list routes                            |
+| `side`             | `input` or `output`            | all sides | Match the canonical token set on the selected side                                |
+| `page`             | number                         | 1         | 1 through 1000                                                                    |
+| `pageSize`         | number                         | 20        | 1 through 50                                                                      |
+| `denomination`     | `wrapped` or `unwrapped`       | `wrapped` | Same amount and IO-ratio denomination semantics as the existing order list routes |
+
+The response is `OrdersListResponse`, the same stable REST-owned shape used by
+the existing list routes. Results are deduplicated by network, Raindex contract,
+and order hash, then ordered by `createdAt` descending with order hash and
+Raindex contract tie-breakers.
+
+Canonical address sets share the short-lived response cache regardless of input
+order, duplicate entries, or address case. Concurrent identical cold requests
+share one computation. The endpoint only caches complete responses: an indexed
+query, denomination conversion, or live quote failure fails the whole request
+and is not cached.
+
 ## List Orders by Transaction
 
 ```
