@@ -76,6 +76,12 @@ Provide exactly one of `priceCap` or `slippageBps`.
 The quote reflects current orderbook state. Prices may change between quoting
 and execution.
 
+Oracle-backed orders can be temporarily unavailable for evaluation, including
+when their external price session is unavailable. Quote endpoints then return
+HTTP 503 with `SWAP_ORACLE_UNAVAILABLE`. This is distinct from HTTP 404
+`SWAP_NO_LIQUIDITY`, which means the evaluated order set has no executable
+capacity for the request.
+
 ### Understanding Price Limits
 
 `priceCap`, `estimatedIoRatio`, `referenceIoRatio`, and `resolvedPriceCap`

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
-use rain_orderbook_common::take_orders::TakeOrderCandidate;
 
+use crate::routes::swap::SwapCandidateBuild;
 use crate::types::orders::OrdersListResponse;
 use crate::types::trades::TradesByAddressResponse;
 
@@ -55,7 +55,7 @@ pub(crate) struct RouteResponseCaches {
     enabled: bool,
     pub order_quotes: AppCache<String, Vec<RaindexOrderQuote>>,
     pub orders_by_token: AppCache<String, OrdersListResponse>,
-    pub swap_candidates: AppCache<String, Vec<TakeOrderCandidate>>,
+    pub swap_candidates: AppCache<String, SwapCandidateBuild>,
     pub trades_by_token: AppCache<String, TradesByAddressResponse>,
     pub trades_by_taker: AppCache<String, TradesByAddressResponse>,
     group: CacheGroup,
