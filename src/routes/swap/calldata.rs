@@ -552,12 +552,20 @@ async fn process_swap_calldata_build(
                     "no executable liquidity is available for this pair",
                 ));
             }
-            let candidates = ds
+            let candidate_build = ds
                 .build_candidates_for_pair(&orders, req.input_token, req.output_token, req.taker)
                 .await
                 .map_err(map_calldata_boundary_error)?;
+            if candidate_build.candidates.is_empty() {
+                return Err(candidate_build.unavailable_error().unwrap_or_else(|| {
+                    ApiError::coded(
+                        ApiErrorCode::SwapNoLiquidity,
+                        "no executable liquidity is available for this pair",
+                    )
+                }));
+            }
             let price_cap = super::slippage::resolve_slippage_price_cap(
-                candidates,
+                candidate_build.candidates,
                 req.mode,
                 &amount,
                 slippage_bps,
@@ -892,7 +900,7 @@ mod tests {
             input_token: Address,
             output_token: Address,
             counterparty: Address,
-        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+        ) -> Result<super::super::SwapCandidateBuild, ApiError> {
             *self.captured_counterparty.lock().unwrap() = Some(counterparty);
             self.base
                 .build_candidates_for_pair(orders, input_token, output_token, counterparty)

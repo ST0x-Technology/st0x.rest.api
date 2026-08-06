@@ -14,17 +14,19 @@ use crate::wrap_ratio::{
 };
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use rain_orderbook_common::raindex_client::order_quotes::{
+    get_order_quotes_batch_with_injector, RaindexOrderQuote,
+};
 use rain_orderbook_common::raindex_client::orders::{
     GetOrdersFilters, GetOrdersTokenFilter, RaindexOrder,
 };
+use rain_orderbook_common::raindex_client::take_orders::build_candidate_from_quote;
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
 use rain_orderbook_common::rpc_client::RpcClientError;
-use rain_orderbook_common::take_orders::{
-    build_take_order_candidates_for_pair, NoopInjector, TakeOrderCandidate, TakeOrdersMode,
-};
+use rain_orderbook_common::take_orders::{NoopInjector, TakeOrderCandidate, TakeOrdersMode};
 use rocket::Route;
 use std::collections::HashMap;
 use std::future::Future;
@@ -83,6 +85,63 @@ async fn capture_swap_outcome<T>(
     }
 }
 
+const ORACLE_FETCH_FAILURE_PREFIX: &str = "Oracle fetch failed for pair (";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SwapQuoteFailure {
+    OracleUnavailable,
+    QuoteFailed,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SwapCandidateBuild {
+    pub candidates: Vec<TakeOrderCandidate>,
+    pub failures: Vec<SwapQuoteFailure>,
+}
+
+impl SwapCandidateBuild {
+    pub(crate) fn unavailable_error(&self) -> Option<ApiError> {
+        if self.failures.contains(&SwapQuoteFailure::OracleUnavailable) {
+            return Some(ApiError::coded(
+                ApiErrorCode::SwapOracleUnavailable,
+                "the oracle required to evaluate this swap is temporarily unavailable",
+            ));
+        }
+        if self.failures.contains(&SwapQuoteFailure::QuoteFailed) {
+            return Some(ApiError::coded(
+                ApiErrorCode::SwapQuoteFailed,
+                "the swap quote could not be generated",
+            ));
+        }
+        None
+    }
+}
+
+fn classify_quote_failure(error: Option<&str>) -> SwapQuoteFailure {
+    match error {
+        Some(error) if error.starts_with(ORACLE_FETCH_FAILURE_PREFIX) => {
+            SwapQuoteFailure::OracleUnavailable
+        }
+        _ => SwapQuoteFailure::QuoteFailed,
+    }
+}
+
+fn quote_matches_pair(
+    order: &RaindexOrder,
+    quote: &RaindexOrderQuote,
+    input_token: Address,
+    output_token: Address,
+) -> Result<bool, RaindexError> {
+    let order: rain_orderbook_bindings::IRaindexV6::OrderV4 = order.try_into()?;
+    let Some(input) = order.validInputs.get(quote.pair.input_index as usize) else {
+        return Ok(false);
+    };
+    let Some(output) = order.validOutputs.get(quote.pair.output_index as usize) else {
+        return Ok(false);
+    };
+    Ok(input.token == input_token && output.token == output_token)
+}
+
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
     async fn validate_supported_tokens(
@@ -103,7 +162,7 @@ pub(crate) trait SwapDataSource: Send + Sync {
         input_token: Address,
         output_token: Address,
         counterparty: Address,
-    ) -> Result<Vec<TakeOrderCandidate>, ApiError>;
+    ) -> Result<SwapCandidateBuild, ApiError>;
 
     async fn get_calldata(
         &self,
@@ -215,12 +274,10 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         input_token: Address,
         output_token: Address,
         counterparty: Address,
-    ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
+    ) -> Result<SwapCandidateBuild, ApiError> {
         let fetch = || async {
-            build_take_order_candidates_for_pair(
+            let quotes = get_order_quotes_batch_with_injector(
                 orders,
-                input_token,
-                output_token,
                 None,
                 None,
                 counterparty,
@@ -228,12 +285,79 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             )
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "failed to build order candidates");
+                tracing::error!(error = %e, "failed to fetch quotes for order candidates");
                 ApiError::coded(
                     ApiErrorCode::SwapQuoteFailed,
                     "the swap quote could not be generated",
                 )
-            })
+            })?;
+            if quotes.len() != orders.len() {
+                tracing::error!(
+                    order_count = orders.len(),
+                    quote_set_count = quotes.len(),
+                    "order candidate quote count mismatch"
+                );
+                return Err(ApiError::coded(
+                    ApiErrorCode::SwapQuoteFailed,
+                    "the swap quote could not be generated",
+                ));
+            }
+
+            let mut result = SwapCandidateBuild::default();
+            for (order, order_quotes) in orders.iter().zip(quotes) {
+                for quote in &order_quotes {
+                    let matches_pair = quote_matches_pair(order, quote, input_token, output_token)
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "failed to inspect order quote");
+                            ApiError::coded(
+                                ApiErrorCode::SwapQuoteFailed,
+                                "the swap quote could not be generated",
+                            )
+                        })?;
+                    if !matches_pair {
+                        continue;
+                    }
+
+                    if !quote.success || quote.data.is_none() {
+                        result
+                            .failures
+                            .push(classify_quote_failure(quote.error.as_deref()));
+                        continue;
+                    }
+
+                    if let Some(candidate) =
+                        build_candidate_from_quote(order, quote).map_err(|e| {
+                            tracing::error!(error = %e, "failed to build order candidate");
+                            ApiError::coded(
+                                ApiErrorCode::SwapQuoteFailed,
+                                "the swap quote could not be generated",
+                            )
+                        })?
+                    {
+                        result.candidates.push(candidate);
+                    }
+                }
+            }
+
+            tracing::info!(
+                order_count = orders.len(),
+                candidate_count = result.candidates.len(),
+                oracle_unavailable_count = result
+                    .failures
+                    .iter()
+                    .filter(|failure| **failure == SwapQuoteFailure::OracleUnavailable)
+                    .count(),
+                quote_failure_count = result
+                    .failures
+                    .iter()
+                    .filter(|failure| **failure == SwapQuoteFailure::QuoteFailed)
+                    .count(),
+                input_token = %input_token,
+                output_token = %output_token,
+                "built REST swap candidates"
+            );
+
+            Ok(result)
         };
 
         if !self.caches.is_enabled() || counterparty != Address::ZERO {
@@ -433,8 +557,8 @@ pub fn routes_v2() -> Vec<Route> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
-        swap_candidates_cache_key, swap_chain_ids,
+        classify_quote_failure, ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
+        swap_candidates_cache_key, swap_chain_ids, SwapQuoteFailure,
     };
     use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
@@ -515,6 +639,28 @@ mod tests {
     }
 
     #[test]
+    fn test_only_upstream_oracle_fetch_failures_are_classified_as_oracle_unavailable() {
+        assert_eq!(
+            classify_quote_failure(Some(
+                "Oracle fetch failed for pair (0, 1): HTTP request failed: 404 Not Found"
+            )),
+            SwapQuoteFailure::OracleUnavailable
+        );
+
+        for unrelated in [
+            "Unknown oracle session",
+            "StalePrice",
+            "HTTP request failed: 404 Not Found",
+            "quote reverted: Oracle fetch failed for pair (0, 1)",
+        ] {
+            assert_eq!(
+                classify_quote_failure(Some(unrelated)),
+                SwapQuoteFailure::QuoteFailed
+            );
+        }
+    }
+
+    #[test]
     fn test_raindex_no_liquidity_maps_to_stable_code() {
         assert!(matches!(
             map_raindex_error(RaindexError::NoLiquidity),
@@ -570,7 +716,7 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use super::SwapDataSource;
+    use super::{SwapCandidateBuild, SwapDataSource};
     use crate::error::ApiError;
     use crate::types::swap::SwapCalldataResponse;
     use alloy::primitives::Address;
@@ -613,8 +759,11 @@ pub(crate) mod test_fixtures {
             _input_token: Address,
             _output_token: Address,
             _counterparty: Address,
-        ) -> Result<Vec<TakeOrderCandidate>, ApiError> {
-            Ok(self.candidates.clone())
+        ) -> Result<SwapCandidateBuild, ApiError> {
+            Ok(SwapCandidateBuild {
+                candidates: self.candidates.clone(),
+                failures: Vec::new(),
+            })
         }
 
         async fn get_calldata(

@@ -598,6 +598,7 @@ mod tests {
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
         let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+        let swap_quote_v1_path = &openapi["paths"]["/v1/swap/quote"]["post"];
         let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
 
@@ -622,6 +623,14 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
         assert_eq!(swap_quote_v2_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_quote_v1_path["responses"]["503"]["description"],
+            "Required swap oracle unavailable"
+        );
+        assert_eq!(
+            swap_quote_v2_path["responses"]["503"]["description"],
+            "Required swap oracle unavailable"
+        );
         assert_eq!(
             swap_quote_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/SwapQuoteV2RequestBody"

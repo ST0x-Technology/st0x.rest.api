@@ -43,20 +43,26 @@ Swap and token-order endpoints emit the following stable codes at understood
 failure boundaries. Consumers should still handle generic fallback codes for
 unexpected failures outside those boundaries.
 
-| HTTP Status | Code                     | Description                                   |
-| ----------- | ------------------------ | --------------------------------------------- |
-| 400         | `SWAP_SAME_TOKEN`        | Input and output swap tokens are identical    |
-| 400         | `SWAP_UNSUPPORTED_TOKEN` | One or both swap tokens are unsupported       |
-| 404         | `SWAP_NO_LIQUIDITY`      | No executable liquidity is available          |
-| 500         | `SWAP_QUOTE_FAILED`      | Quote generation failed unexpectedly          |
-| 500         | `SWAP_CALLDATA_FAILED`   | Calldata generation failed unexpectedly       |
-| 502         | `ORDERS_QUERY_FAILED`    | The order source could not serve the request  |
-| 503         | `UPSTREAM_UNAVAILABLE`   | A required upstream dependency is unavailable |
+| HTTP Status | Code                      | Description                                   |
+| ----------- | ------------------------- | --------------------------------------------- |
+| 400         | `SWAP_SAME_TOKEN`         | Input and output swap tokens are identical    |
+| 400         | `SWAP_UNSUPPORTED_TOKEN`  | One or both swap tokens are unsupported       |
+| 404         | `SWAP_NO_LIQUIDITY`       | No executable liquidity is available          |
+| 500         | `SWAP_QUOTE_FAILED`       | Quote generation failed unexpectedly          |
+| 500         | `SWAP_CALLDATA_FAILED`    | Calldata generation failed unexpectedly       |
+| 502         | `ORDERS_QUERY_FAILED`     | The order source could not serve the request  |
+| 503         | `SWAP_ORACLE_UNAVAILABLE` | A required swap oracle is unavailable         |
+| 503         | `UPSTREAM_UNAVAILABLE`    | A required upstream dependency is unavailable |
 
 `SWAP_PREFLIGHT_FAILED` is reserved for a future typed preflight rejection
 boundary. The current Raindex dependency combines execution rejections with
 provider failures in one error variant, so the API conservatively emits
 `SWAP_CALLDATA_FAILED` instead of presenting ambiguous failures as HTTP 400.
+
+`SWAP_ORACLE_UNAVAILABLE` does not assert that a market is closed. It means an
+oracle-backed order could not be evaluated because its external context endpoint
+was unavailable. Quote failures that are not identified as oracle fetch failures
+remain `SWAP_QUOTE_FAILED`.
 
 Domain codes are assigned at the boundary where the failure is understood.
 Detailed dependency logs and the coded response event share the same
