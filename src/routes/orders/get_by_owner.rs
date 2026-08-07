@@ -28,7 +28,6 @@ pub(crate) async fn process_get_orders_by_owner(
     let filters = GetOrdersFilters {
         owners: vec![address],
         active: active_filter,
-        has_positive_output_vault_balance: (active_filter == Some(true)).then_some(true),
         ..Default::default()
     };
 
@@ -273,6 +272,30 @@ mod tests {
         let filters = ds.filters.lock().expect("lock filters");
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].active, None);
+        assert_eq!(filters[0].has_positive_output_vault_balance, None);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_active_state_omits_vault_balance_filter() {
+        let ds = RecordingOrdersListDataSource::default();
+        let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            .parse()
+            .unwrap();
+
+        let result = process_get_orders_by_owner(
+            &ds,
+            addr,
+            Some(OrderState::Active),
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let filters = ds.filters.lock().expect("lock filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].active, Some(true));
         assert_eq!(filters[0].has_positive_output_vault_balance, None);
     }
 
