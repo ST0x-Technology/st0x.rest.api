@@ -25,8 +25,51 @@ use rain_orderbook_common::take_orders::{
 };
 use rocket::serde::json::Json;
 use rocket::State;
-use std::ops::Div;
+use std::ops::{Div, Sub};
 use tracing::Instrument;
+
+/// Relative shortfall at or below this is treated as a full fill.
+///
+/// Raindex / Float walks often return `target − ε` (e.g. `0.05` vs
+/// `0.049999…`). Exact `Float::eq` then falsely reports `fullyFilled: false`
+/// and the DEX UI shows a liquidity warning. 1e-9 is far below any real
+/// partial fill while covering typical dust.
+const FILL_DUST_RELATIVE: &str = "0.000000001";
+
+/// True when `achieved` meets `target`, or undershoots only by Float dust.
+fn is_fully_filled(achieved: Float, target: Float) -> Result<bool, ApiError> {
+    if achieved.gte(target).map_err(|error| {
+        tracing::error!(%error, "failed to compare swap quote fill amount (gte)");
+        quote_failed_error()
+    })? {
+        return Ok(true);
+    }
+
+    let target_is_zero = target.is_zero().map_err(|error| {
+        tracing::error!(%error, "failed to check zero target fill amount");
+        quote_failed_error()
+    })?;
+    if target_is_zero {
+        return Ok(false);
+    }
+
+    let shortfall = target.sub(achieved).map_err(|error| {
+        tracing::error!(%error, "failed to compute swap quote fill shortfall");
+        quote_failed_error()
+    })?;
+    let relative = shortfall.div(target).map_err(|error| {
+        tracing::error!(%error, "failed to compute relative fill shortfall");
+        quote_failed_error()
+    })?;
+    let dust = Float::parse(FILL_DUST_RELATIVE.to_string()).map_err(|error| {
+        tracing::error!(%error, "failed to parse fill dust threshold");
+        quote_failed_error()
+    })?;
+    relative.lte(dust).map_err(|error| {
+        tracing::error!(%error, "failed to compare relative fill shortfall");
+        quote_failed_error()
+    })
+}
 
 #[utoipa::path(
     post,
@@ -384,10 +427,7 @@ async fn process_swap_quote_v2(
     } else {
         simulation.total_input
     };
-    let fully_filled = achieved_amount.eq(target_amount).map_err(|error| {
-        tracing::error!(%error, "failed to compare swap quote fill amount");
-        quote_failed_error()
-    })?;
+    let fully_filled = is_fully_filled(achieved_amount, target_amount)?;
     if is_exact_mode && !fully_filled {
         let requested = target_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format requested quote amount");
@@ -527,6 +567,32 @@ mod tests {
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
     use crate::types::swap::{SwapCalldataMode, SwapDenomination};
+
+    #[test]
+    fn is_fully_filled_treats_dust_underfill_as_complete() {
+        let target = Float::parse("0.05".to_string()).unwrap();
+        let dust_short = Float::parse(
+            "0.04999999999999999999999999999999999999999999999999999999999999999".to_string(),
+        )
+        .unwrap();
+        assert!(is_fully_filled(dust_short, target).unwrap());
+        assert!(is_fully_filled(target, target).unwrap());
+    }
+
+    #[test]
+    fn is_fully_filled_keeps_real_partials_incomplete() {
+        let target = Float::parse("0.05".to_string()).unwrap();
+        let partial = Float::parse("0.049".to_string()).unwrap(); // 2% short — not dust
+        assert!(!is_fully_filled(partial, target).unwrap());
+    }
+
+    #[test]
+    fn is_fully_filled_accepts_overfill() {
+        let target = Float::parse("0.05".to_string()).unwrap();
+        let over = Float::parse("0.05000000000000001".to_string()).unwrap();
+        assert!(is_fully_filled(over, target).unwrap());
+    }
+
     use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::address;
     use async_trait::async_trait;
