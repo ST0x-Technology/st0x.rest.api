@@ -21,7 +21,7 @@ pub struct OrdersPaginationParams {
     pub denomination: Option<Denomination>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromFormField, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, FromFormField, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderSide {
     #[field(value = "input")]
@@ -66,6 +66,49 @@ pub struct OrdersByTokenParams {
     pub page_size: Option<u16>,
     #[field(name = "denomination")]
     #[param(example = "wrapped")]
+    pub denomination: Option<Denomination>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OrdersQueryRequest {
+    /// Network to query. The ID must exist in the active Raindex registry.
+    #[schema(example = 8453)]
+    pub chain_id: u32,
+    /// Match any of these tokens on the selected side. Addresses are
+    /// case-normalized and deduplicated before querying.
+    #[schema(
+        value_type = Vec<String>,
+        example = json!([
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "0x4200000000000000000000000000000000000006"
+        ])
+    )]
+    #[serde(default)]
+    pub token_addresses: Vec<String>,
+    /// Optional owner filter. Addresses are case-normalized and deduplicated.
+    #[serde(default)]
+    #[schema(value_type = Vec<String>)]
+    pub owner_addresses: Vec<String>,
+    /// Optional Raindex contract filter. Addresses are case-normalized and
+    /// deduplicated.
+    #[serde(default)]
+    #[schema(value_type = Vec<String>)]
+    pub raindex_addresses: Vec<String>,
+    /// Optional exact order hash. The pinned SDK exposes one exact hash on
+    /// `GetOrdersFilters`; it does not expose an order-hash set.
+    #[schema(
+        value_type = Option<String>,
+        example = "0x000000000000000000000000000000000000000000000000000000000000abcd"
+    )]
+    pub order_hash: Option<String>,
+    pub state: Option<OrderState>,
+    pub side: Option<OrderSide>,
+    #[schema(example = 1, minimum = 1)]
+    pub page: Option<u16>,
+    #[schema(example = 20, minimum = 1, maximum = 50)]
+    pub page_size: Option<u16>,
+    #[schema(example = "wrapped")]
     pub denomination: Option<Denomination>,
 }
 
