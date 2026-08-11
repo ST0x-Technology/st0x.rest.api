@@ -15,9 +15,11 @@ set -uo pipefail
 API_URL="${API_URL:-https://api.staging.st0x.io}"
 API_KEY="${API_KEY:-}"
 API_SECRET="${API_SECRET:-}"
+SMOKE_CHAIN_ID="${SMOKE_CHAIN_ID:-8453}"
 
 # Tokens to probe. Override via env if the registry changes.
 USDC_BASE="${SMOKE_USDC:-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913}"
+SAMPLE_ST0X="${SMOKE_ST0X:-0xfb5b41acdba20a3230f84be995173cfb98b8d6e7}"
 SAMPLE_OWNER="${SMOKE_OWNER:-0x71b94911fd1ce621fc40970450004c544e5287a8}"
 
 # Latency budget per endpoint, in ms. Failures over budget are warnings, not
@@ -54,8 +56,8 @@ probe() {
 
     local tmp
     tmp=$(mktemp)
-    # shellcheck disable=SC2086
     local result
+    # shellcheck disable=SC2086
     result=$(curl -sS -X "$method" $auth_header \
         -o "$tmp" \
         -w '%{http_code} %{time_total}\n' \
@@ -119,19 +121,21 @@ probe "GET /health/detailed has cache_warmer" GET "/health/detailed" 200 '.cache
 # 2. Protected endpoints reject missing/invalid auth
 SAVED_KEY="$API_KEY"; SAVED_SECRET="$API_SECRET"
 API_KEY="" API_SECRET=""
-probe "GET /v1/tokens (no auth)"             GET "/v1/tokens" 401
+probe "GET /v2/tokens (no auth)"             GET "/v2/tokens?chainId=$SMOKE_CHAIN_ID" 401
 API_KEY="$SAVED_KEY"; API_SECRET="$SAVED_SECRET"
 
 # 3. Authenticated endpoints — only run if creds are set
 if [[ -n "$API_KEY" && -n "$API_SECRET" ]]; then
-    probe "GET /v1/tokens"                       GET "/v1/tokens" 200 'type == "array"'
-    probe "GET /v1/orders/token/{usdc}"          GET "/v1/orders/token/$USDC_BASE" 200 '.orders | type == "array" and .pagination'
-    probe "GET /v1/orders/owner/{owner}"         GET "/v1/orders/owner/$SAMPLE_OWNER" 200 '.orders | type == "array"'
-    probe "GET /v1/trades/token/{usdc}"          GET "/v1/trades/token/$USDC_BASE?pageSize=10" 200 '.trades | type == "array"'
-    probe "GET /v1/trades/{owner}"               GET "/v1/trades/$SAMPLE_OWNER?pageSize=10" 200 '.trades | type == "array"'
+    probe "GET /v2/tokens"                       GET "/v2/tokens?chainId=$SMOKE_CHAIN_ID" 200 'type == "array"'
+    probe "GET /v2/prices"                       GET "/v2/prices?chainId=$SMOKE_CHAIN_ID" 200 '.data | type == "array"'
+    probe "GET /v2/prices/{token}/history"       GET "/v2/prices/$SAMPLE_ST0X/history?chainId=$SMOKE_CHAIN_ID" 200 '.points | type == "array"'
+    probe "GET /v2/orders/token/{usdc}"          GET "/v2/orders/token/$USDC_BASE?chainId=$SMOKE_CHAIN_ID" 200 '.orders | type == "array" and .pagination'
+    probe "GET /v2/orders/owner/{owner}"         GET "/v2/orders/owner/$SAMPLE_OWNER?chainId=$SMOKE_CHAIN_ID" 200 '.orders | type == "array"'
+    probe "GET /v2/trades/token/{usdc}"          GET "/v2/trades/token/$USDC_BASE?chainId=$SMOKE_CHAIN_ID&pageSize=10" 200 '.trades | type == "array"'
+    probe "GET /v2/trades/{owner}"               GET "/v2/trades/$SAMPLE_OWNER?chainId=$SMOKE_CHAIN_ID&pageSize=10" 200 '.trades | type == "array"'
     # Path validation only kicks in after auth succeeds — Rocket auth fairing
     # runs first, so an invalid-address probe without auth would 401.
-    probe "GET /v1/orders/token/<bad>"           GET "/v1/orders/token/not-an-address" 422
+    probe "GET /v2/orders/token/<bad>"           GET "/v2/orders/token/not-an-address?chainId=$SMOKE_CHAIN_ID" 422
 else
     echo "  (skipping authenticated checks; set API_KEY + API_SECRET to enable)"
 fi

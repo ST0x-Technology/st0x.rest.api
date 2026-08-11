@@ -1,7 +1,10 @@
 pub mod admin;
+pub mod attribution_admin;
+pub(crate) mod batch_query;
 pub mod health;
 pub mod order;
 pub mod orders;
+pub mod prices;
 pub mod registry;
 pub mod swap;
 pub mod tokens;
@@ -9,14 +12,23 @@ pub mod trades;
 pub mod vaults;
 
 use crate::error::ApiError;
-use rain_orderbook_app_settings::yaml::raindex::RaindexYaml;
+use rain_orderbook_app_settings::yaml::{raindex::RaindexYaml, FieldErrorKind, YamlError};
 use rain_orderbook_common::raindex_client::vaults::{RaindexVault, RaindexVaultType};
 
 pub(crate) fn configured_chain_ids(raindex_yaml: &RaindexYaml) -> Result<Vec<u32>, ApiError> {
-    let networks = raindex_yaml.get_networks().map_err(|error| {
-        tracing::error!(error = %error, "failed to read configured networks");
-        ApiError::Internal("failed to read configured networks".into())
-    })?;
+    let networks = match raindex_yaml.get_networks() {
+        Ok(networks) => networks,
+        Err(YamlError::Field {
+            kind: FieldErrorKind::Missing(field),
+            ..
+        }) if field == "networks" => Default::default(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to read configured networks");
+            return Err(ApiError::Internal(
+                "failed to read configured networks".into(),
+            ));
+        }
+    };
     let mut chain_ids = networks
         .values()
         .map(|network| network.chain_id)

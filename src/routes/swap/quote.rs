@@ -1,17 +1,38 @@
-use super::{RaindexSwapDataSource, SwapDataSource};
+use super::{
+    capture_swap_outcome, ensure_distinct_tokens, request_chain_id, snapshot_swap_context,
+    RaindexSwapDataSource, SwapAnalyticsContext, SwapDataSource,
+};
+use crate::analytics::{
+    swap_quote_failed_event, swap_quoted_event, swap_quoted_v2_event, Analytics, ApiVersion,
+};
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
-use crate::routes::swap::denomination::normalize_quote_amounts;
-use crate::types::swap::{SwapQuoteRequest, SwapQuoteResponse};
+use crate::routes::swap::denomination::{
+    denormalize_calldata_price_cap, normalize_calldata_price_cap,
+    normalize_calldata_request_amount, normalize_quote_amounts, CalldataAmountNormalization,
+};
+use crate::types::swap::{
+    SwapQuoteRequest, SwapQuoteResponse, SwapQuoteV2Request, SwapQuoteV2RequestBody,
+    SwapQuoteV2Response,
+};
+use alloy::primitives::{fixed_bytes, Address};
 use rain_math_float::Float;
-use rain_orderbook_common::take_orders::simulate_buy_over_candidates;
+use rain_orderbook_common::take_orders::{
+    simulate_buy_over_candidates, ParsedTakeOrdersMode, TakeOrdersMode,
+};
 use rocket::serde::json::Json;
 use rocket::State;
-use std::ops::Div;
+use std::ops::{Div, Sub};
 use tracing::Instrument;
+
+// Up-to modes can be microscopically under target because DecimalFloat arithmetic
+// rounds. One part per billion is presentation dust; exact modes remain strict.
+const FULL_FILL_RELATIVE_TOLERANCE: Float = Float::from_raw(fixed_bytes!(
+    "fffffff700000000000000000000000000000000000000000000000000000001"
+));
 
 #[utoipa::path(
     post,
@@ -27,30 +48,51 @@ use tracing::Instrument;
         (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
+#[allow(clippy::too_many_arguments)] // Rocket handler: args are guards + managed state + body.
 pub async fn post_swap_quote(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
+    analytics: &State<Analytics>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
-    let req = request.into_inner();
-    handle_swap_quote(shared_raindex, app_state, pool, span, req).await
+    async move {
+        let mut req = request.into_inner();
+        tracing::info!(body = ?req, "request received");
+        let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
+        req.chain_id = Some(chain_id);
+        let ds = RaindexSwapDataSource {
+            client: raindex.client(),
+            caches: &app_state.response_caches,
+            pool: pool.inner(),
+        };
+        let response = handle_swap_quote(&ds, &key, analytics.inner(), req).await?;
+
+        Ok(Json(response))
+    }
+    .instrument(span.0)
+    .await
 }
 
 #[utoipa::path(
     post,
     path = "/v2/swap/quote",
     tag = "Swap",
+    summary = "Simulate a mode-based swap",
+    description = "Returns the SDK-backed executable-route simulation used by V2 calldata. Provide exactly one of priceCap or slippageBps. referenceIoRatio is an optional input-token-per-output-token guard that is valid only with slippageBps.",
     security(("basicAuth" = [])),
-    request_body = SwapQuoteRequest,
+    request_body = SwapQuoteV2RequestBody,
     responses(
-        (status = 200, description = "Swap quote", body = SwapQuoteResponse),
+        (status = 200, description = "Mode-based swap quote", body = SwapQuoteV2Response),
         (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "No liquidity found", body = ApiErrorResponse),
@@ -60,67 +102,131 @@ pub async fn post_swap_quote(
     )
 )]
 #[post("/quote", data = "<request>")]
+#[allow(clippy::too_many_arguments)] // Rocket handler: args are guards + managed state + body.
 pub async fn post_swap_quote_v2(
     _global: GlobalRateLimit,
-    _key: AuthenticatedKey,
+    key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
+    analytics: &State<Analytics>,
     span: TracingSpan,
-    request: Json<SwapQuoteRequest>,
-) -> Result<Json<SwapQuoteResponse>, ApiError> {
-    let req = request.into_inner();
-    handle_swap_quote(shared_raindex, app_state, pool, span, req).await
-}
-
-async fn handle_swap_quote(
-    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
-    app_state: &State<ApplicationState>,
-    pool: &State<DbPool>,
-    span: TracingSpan,
-    req: SwapQuoteRequest,
-) -> Result<Json<SwapQuoteResponse>, ApiError> {
+    request: Json<SwapQuoteV2Request>,
+) -> Result<Json<SwapQuoteV2Response>, ApiError> {
     async move {
-        tracing::info!(body = ?req, "request received");
+        let mut req = request.into_inner();
+        tracing::info!(
+            mode = ?req.mode,
+            denomination = ?req.denomination,
+            has_taker = req.taker.is_some(),
+            "request received"
+        );
         let raindex = shared_raindex.read().await;
         let chain_id =
             crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
+        req.chain_id = Some(chain_id);
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
             pool: pool.inner(),
         };
-        let response = process_swap_quote(&ds, req, chain_id).await?;
+        let response = handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await?;
+
         Ok(Json(response))
     }
     .instrument(span.0)
     .await
 }
 
+async fn handle_swap_quote(
+    ds: &dyn SwapDataSource,
+    key: &AuthenticatedKey,
+    analytics: &Analytics,
+    req: SwapQuoteRequest,
+) -> Result<SwapQuoteResponse, ApiError> {
+    let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
+        input_token: req.input_token,
+        output_token: req.output_token,
+        requested_amount: req.output_amount.clone(),
+        denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        api_version: ApiVersion::V1,
+        mode: None,
+        taker: None,
+    });
+
+    capture_swap_outcome(
+        analytics,
+        analytics_context,
+        process_swap_quote(ds, req),
+        |context, error| swap_quote_failed_event(key, context.failure(), error),
+        |_context, response| {
+            swap_quoted_event(
+                key,
+                response.input_token,
+                response.output_token,
+                serde_json::to_value(response.denomination).unwrap_or(serde_json::Value::Null),
+                response,
+            )
+        },
+    )
+    .await
+}
+
+async fn handle_swap_quote_v2(
+    ds: &dyn SwapDataSource,
+    key: &AuthenticatedKey,
+    analytics: &Analytics,
+    req: SwapQuoteV2Request,
+) -> Result<SwapQuoteV2Response, ApiError> {
+    let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
+        input_token: req.input_token,
+        output_token: req.output_token,
+        requested_amount: req.amount.clone(),
+        denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
+        api_version: ApiVersion::V2,
+        mode: serde_json::to_value(req.mode).ok(),
+        taker: None,
+    });
+
+    capture_swap_outcome(
+        analytics,
+        analytics_context,
+        process_swap_quote_v2(ds, req),
+        |context, error| swap_quote_failed_event(key, context.failure(), error),
+        |_context, response| swap_quoted_v2_event(key, response),
+    )
+    .await
+}
+
 async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
-    chain_id: u32,
 ) -> Result<SwapQuoteResponse, ApiError> {
-    ds.validate_supported_tokens(chain_id, req.input_token, req.output_token)
-        .await?;
+    let chain_id = request_chain_id(req.chain_id)?;
+    ensure_distinct_tokens(req.input_token, req.output_token)?;
+
+    ds.validate_supported_tokens_on_chain(chain_id, req.input_token, req.output_token)
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let orders = ds
-        .get_orders_for_pair(chain_id, req.input_token, req.output_token)
-        .await?;
+        .get_orders_for_pair_on_chain(chain_id, req.input_token, req.output_token)
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
 
     if orders.is_empty() {
-        return Err(ApiError::NotFound(
-            "no liquidity found for this pair".into(),
-        ));
+        return Err(no_liquidity_error());
     }
 
     let candidates = ds
-        .build_candidates_for_pair(&orders, req.input_token, req.output_token)
-        .await?;
+        .build_candidates_for_pair(&orders, req.input_token, req.output_token, Address::ZERO)
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     if candidates.is_empty() {
-        return Err(ApiError::NotFound("no valid quotes available".into()));
+        return Err(no_liquidity_error());
     }
 
     let buy_target = Float::parse(req.output_amount.clone()).map_err(|e| {
@@ -130,46 +236,48 @@ async fn process_swap_quote(
 
     let price_cap = Float::max_positive_value().map_err(|e| {
         tracing::error!(error = %e, "failed to create price cap");
-        ApiError::Internal("failed to create price cap".into())
+        quote_failed_error()
     })?;
 
     let sim = simulate_buy_over_candidates(candidates, buy_target, price_cap).map_err(|e| {
         tracing::error!(error = %e, "failed to simulate swap");
-        ApiError::Internal("failed to simulate swap".into())
+        quote_failed_error()
     })?;
 
     if sim.legs.is_empty() {
-        return Err(ApiError::NotFound("no valid quotes available".into()));
+        return Err(no_liquidity_error());
     }
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
         ds,
+        chain_id,
         req.denomination,
         req.input_token,
         req.output_token,
         sim.total_input,
         sim.total_output,
     )
-    .await?;
+    .await
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let blended_ratio = estimated_input.div(estimated_output).map_err(|e| {
         tracing::error!(error = %e, "failed to compute blended ratio");
-        ApiError::Internal("failed to compute ratio".into())
+        quote_failed_error()
     })?;
 
     let formatted_output = estimated_output.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated output");
-        ApiError::Internal("failed to format estimated output".into())
+        quote_failed_error()
     })?;
 
     let formatted_input = estimated_input.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format estimated input");
-        ApiError::Internal("failed to format estimated input".into())
+        quote_failed_error()
     })?;
 
     let formatted_ratio = blended_ratio.format().map_err(|e| {
         tracing::error!(error = %e, "failed to format ratio");
-        ApiError::Internal("failed to format ratio".into())
+        quote_failed_error()
     })?;
 
     Ok(SwapQuoteResponse {
@@ -184,20 +292,306 @@ async fn process_swap_quote(
     })
 }
 
+async fn process_swap_quote_v2(
+    ds: &dyn SwapDataSource,
+    req: SwapQuoteV2Request,
+) -> Result<SwapQuoteV2Response, ApiError> {
+    let chain_id = request_chain_id(req.chain_id)?;
+    ensure_distinct_tokens(req.input_token, req.output_token)?;
+    let price_limit = validate_quote_v2_price_limit(&req)?;
+
+    ds.validate_supported_tokens_on_chain(chain_id, req.input_token, req.output_token)
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+
+    let mode: TakeOrdersMode = req.mode.into();
+    let (amount, wrap_ratios) = normalize_calldata_request_amount(
+        ds,
+        CalldataAmountNormalization {
+            chain_id,
+            denomination: req.denomination,
+            input_token: req.input_token,
+            output_token: req.output_token,
+            mode,
+            amount: req.amount.clone(),
+            amount_field: "amount",
+        },
+    )
+    .await
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+    let parsed_mode =
+        ParsedTakeOrdersMode::parse(mode, &amount).map_err(super::map_raindex_error)?;
+
+    let orders = ds
+        .get_orders_for_pair_on_chain(chain_id, req.input_token, req.output_token)
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
+    if orders.is_empty() {
+        return Err(no_liquidity_error());
+    }
+
+    let candidates = ds
+        .build_candidates_for_pair(
+            &orders,
+            req.input_token,
+            req.output_token,
+            req.taker.unwrap_or(Address::ZERO),
+        )
+        .await
+        .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+    if candidates.is_empty() {
+        return Err(no_liquidity_error());
+    }
+
+    let price_cap = match price_limit {
+        QuoteV2PriceLimit::Fixed(price_cap) => {
+            let normalized = normalize_calldata_price_cap(
+                price_cap.to_string(),
+                "price_cap",
+                req.denomination,
+                req.input_token,
+                req.output_token,
+                &wrap_ratios,
+            )?;
+            Float::parse(normalized).map_err(|error| {
+                tracing::warn!(%error, "swap quote rejected for invalid price_cap");
+                ApiError::BadRequest("invalid price_cap".into())
+            })?
+        }
+        QuoteV2PriceLimit::Slippage {
+            slippage_bps,
+            reference_io_ratio,
+        } => {
+            let reference_io_ratio = reference_io_ratio
+                .map(|reference_io_ratio| {
+                    normalize_calldata_price_cap(
+                        reference_io_ratio.to_string(),
+                        "reference_io_ratio",
+                        req.denomination,
+                        req.input_token,
+                        req.output_token,
+                        &wrap_ratios,
+                    )
+                    .and_then(|normalized| {
+                        Float::parse(normalized).map_err(|error| {
+                            tracing::warn!(
+                                %error,
+                                "swap quote rejected for invalid reference_io_ratio"
+                            );
+                            ApiError::BadRequest("invalid reference_io_ratio".into())
+                        })
+                    })
+                })
+                .transpose()?;
+            super::slippage::resolve_slippage_price_cap(
+                candidates.clone(),
+                mode,
+                &amount,
+                slippage_bps,
+                reference_io_ratio,
+            )?
+        }
+    };
+
+    let is_buy_mode = parsed_mode.is_buy_mode();
+    let is_exact_mode = parsed_mode.is_exact_mode();
+    let target_amount = parsed_mode.target_amount();
+    let simulation =
+        super::slippage::select_best_raindex_simulation(candidates, parsed_mode, price_cap)?;
+    let achieved_amount = if is_buy_mode {
+        simulation.total_output
+    } else {
+        simulation.total_input
+    };
+    let fully_filled = is_quote_fully_filled(achieved_amount, target_amount, is_exact_mode)?;
+    if is_exact_mode && !fully_filled {
+        let requested = target_amount.format().map_err(|error| {
+            tracing::error!(%error, "failed to format requested quote amount");
+            quote_failed_error()
+        })?;
+        let available = achieved_amount.format().map_err(|error| {
+            tracing::error!(%error, "failed to format available quote amount");
+            quote_failed_error()
+        })?;
+        tracing::warn!(%requested, %available, "insufficient executable liquidity");
+        return Err(no_liquidity_error());
+    }
+
+    let (estimated_input, estimated_output) = normalize_quote_amounts(
+        ds,
+        chain_id,
+        req.denomination,
+        req.input_token,
+        req.output_token,
+        simulation.total_input,
+        simulation.total_output,
+    )
+    .await
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+    let estimated_io_ratio = estimated_input.div(estimated_output).map_err(|error| {
+        tracing::error!(%error, "failed to compute v2 swap quote ratio");
+        quote_failed_error()
+    })?;
+    let resolved_price_cap = denormalize_calldata_price_cap(
+        price_cap,
+        req.denomination,
+        req.input_token,
+        req.output_token,
+        &wrap_ratios,
+    )
+    .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+
+    let format_estimate = |value: Float, label: &str| {
+        value.format().map_err(|error| {
+            tracing::error!(%error, label, "failed to format v2 swap quote");
+            quote_failed_error()
+        })
+    };
+
+    Ok(SwapQuoteV2Response {
+        chain_id,
+        input_token: req.input_token,
+        output_token: req.output_token,
+        mode: req.mode,
+        amount: req.amount,
+        denomination: req.denomination,
+        estimated_input: format_estimate(estimated_input, "estimated input")?,
+        estimated_output: format_estimate(estimated_output, "estimated output")?,
+        estimated_io_ratio: format_estimate(estimated_io_ratio, "estimated IO ratio")?,
+        fully_filled,
+        resolved_price_cap,
+    })
+}
+
+fn is_quote_fully_filled(
+    achieved: Float,
+    target: Float,
+    is_exact_mode: bool,
+) -> Result<bool, ApiError> {
+    if is_exact_mode {
+        return achieved.eq(target).map_err(|error| {
+            tracing::error!(%error, "failed to compare exact swap quote fill amount");
+            quote_failed_error()
+        });
+    }
+
+    let relative_shortfall = target
+        .sub(achieved)
+        .and_then(|shortfall| shortfall.div(target))
+        .map_err(|error| {
+            tracing::error!(%error, "failed to compute relative swap quote fill shortfall");
+            quote_failed_error()
+        })?;
+    relative_shortfall
+        .lte(FULL_FILL_RELATIVE_TOLERANCE)
+        .map_err(|error| {
+            tracing::error!(%error, "failed to compare relative swap quote fill shortfall");
+            quote_failed_error()
+        })
+}
+
+enum QuoteV2PriceLimit<'a> {
+    Fixed(&'a str),
+    Slippage {
+        slippage_bps: u16,
+        reference_io_ratio: Option<&'a str>,
+    },
+}
+
+fn validate_quote_v2_price_limit(
+    req: &SwapQuoteV2Request,
+) -> Result<QuoteV2PriceLimit<'_>, ApiError> {
+    match (
+        req.price_cap.as_deref(),
+        req.slippage_bps,
+        req.reference_io_ratio.as_deref(),
+    ) {
+        (Some(price_cap), None, None) => Ok(QuoteV2PriceLimit::Fixed(price_cap)),
+        (Some(_), None, Some(_)) => {
+            tracing::warn!(
+                "swap quote rejected because reference_io_ratio was provided without slippage_bps"
+            );
+            Err(ApiError::BadRequest(
+                "reference_io_ratio requires slippage_bps".into(),
+            ))
+        }
+        (None, Some(slippage_bps @ 1..=5000), reference_io_ratio) => {
+            Ok(QuoteV2PriceLimit::Slippage {
+                slippage_bps,
+                reference_io_ratio,
+            })
+        }
+        (None, Some(_), _) => {
+            tracing::warn!("swap quote rejected for out-of-range slippage_bps");
+            Err(ApiError::BadRequest(
+                "slippage_bps must be between 1 and 5000".into(),
+            ))
+        }
+        _ => {
+            tracing::warn!("swap quote rejected without exactly one price limit");
+            Err(ApiError::BadRequest(
+                "provide exactly one of price_cap or slippage_bps".into(),
+            ))
+        }
+    }
+}
+
+fn no_liquidity_error() -> ApiError {
+    ApiError::coded(
+        ApiErrorCode::SwapNoLiquidity,
+        "no executable liquidity is available for this pair",
+    )
+}
+
+fn quote_failed_error() -> ApiError {
+    ApiError::coded(
+        ApiErrorCode::SwapQuoteFailed,
+        "the swap quote could not be generated",
+    )
+}
+
+fn map_quote_boundary_error(error: ApiError, fallback_code: ApiErrorCode) -> ApiError {
+    if matches!(error, ApiError::Coded { .. } | ApiError::BadRequest(_)) {
+        return error;
+    }
+    tracing::error!(%error, code = %fallback_code, "swap quote boundary failed");
+    match fallback_code {
+        ApiErrorCode::OrdersQueryFailed => ApiError::coded(
+            fallback_code,
+            "the order source could not serve this request",
+        ),
+        _ => quote_failed_error(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::{Analytics, RecordingSink};
+    use crate::auth::AuthenticatedKey;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
-    use crate::types::swap::SwapDenomination;
+    use crate::types::swap::{SwapCalldataMode, SwapDenomination};
     use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::address;
     use async_trait::async_trait;
     use rocket::http::{ContentType, Status};
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     const USDC: alloy::primitives::Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: alloy::primitives::Address = address!("4200000000000000000000000000000000000006");
+    const TAKER: alloy::primitives::Address = address!("1111111111111111111111111111111111111111");
+
+    fn test_key() -> AuthenticatedKey {
+        AuthenticatedKey {
+            id: 1,
+            key_id: "test-client".to_string(),
+            label: "Test client".to_string(),
+            owner: "test-owner".to_string(),
+            is_admin: false,
+        }
+    }
 
     fn quote_request(output_amount: &str) -> SwapQuoteRequest {
         SwapQuoteRequest {
@@ -207,6 +601,63 @@ mod tests {
             output_amount: output_amount.to_string(),
             denomination: SwapDenomination::Wrapped,
         }
+    }
+
+    fn quote_v2_request(mode: SwapCalldataMode, amount: &str) -> SwapQuoteV2Request {
+        SwapQuoteV2Request {
+            chain_id: Some(8453),
+            taker: None,
+            input_token: USDC,
+            output_token: WETH,
+            mode,
+            amount: amount.to_string(),
+            price_cap: Some("2".to_string()),
+            slippage_bps: None,
+            reference_io_ratio: None,
+            denomination: SwapDenomination::Wrapped,
+        }
+    }
+
+    #[test]
+    fn test_full_fill_tolerance_accepts_incident_rounding_dust() {
+        let achieved = Float::parse(
+            "0.04999999999999999999999999999999999999999999999999999999999999999999".to_string(),
+        )
+        .unwrap();
+        let target = Float::parse("0.05".to_string()).unwrap();
+
+        assert!(is_quote_fully_filled(achieved, target, false).unwrap());
+        assert!(!is_quote_fully_filled(achieved, target, true).unwrap());
+    }
+
+    #[test]
+    fn test_full_fill_tolerance_rejects_incident_executable_shortfall() {
+        let achieved = Float::parse(
+            "0.04310434222334697689407343024988324343123847171843280166595003948319".to_string(),
+        )
+        .unwrap();
+        let target = Float::parse("0.05".to_string()).unwrap();
+
+        assert!(!is_quote_fully_filled(achieved, target, false).unwrap());
+    }
+
+    #[test]
+    fn test_full_fill_tolerance_accepts_boundary_and_overfill() {
+        let target = Float::parse("1".to_string()).unwrap();
+        let boundary = Float::parse("0.999999999".to_string()).unwrap();
+        let beyond = Float::parse("0.9999999989".to_string()).unwrap();
+        let overfill = Float::parse("1.01".to_string()).unwrap();
+
+        assert!(is_quote_fully_filled(boundary, target, false).unwrap());
+        assert!(!is_quote_fully_filled(beyond, target, false).unwrap());
+        assert!(is_quote_fully_filled(overfill, target, false).unwrap());
+    }
+
+    fn assert_error_code<T>(result: Result<T, ApiError>, expected: ApiErrorCode) {
+        assert!(matches!(
+            result,
+            Err(ApiError::Coded { code, .. }) if code == expected
+        ));
     }
 
     fn unwrapped_quote_request(
@@ -238,28 +689,31 @@ mod tests {
         wrap_ratios: HashMap<alloy::primitives::Address, WrapRatioValue>,
     }
 
+    struct RecordingCounterpartyDataSource {
+        base: MockSwapDataSource,
+        counterparties: Mutex<Vec<alloy::primitives::Address>>,
+    }
+
     #[async_trait]
-    impl SwapDataSource for MockQuoteDataSource {
+    impl SwapDataSource for RecordingCounterpartyDataSource {
         async fn validate_supported_tokens(
             &self,
-            chain_id: u32,
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
         ) -> Result<(), ApiError> {
             self.base
-                .validate_supported_tokens(chain_id, input_token, output_token)
+                .validate_supported_tokens(input_token, output_token)
                 .await
         }
 
         async fn get_orders_for_pair(
             &self,
-            chain_id: u32,
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
         ) -> Result<Vec<rain_orderbook_common::raindex_client::orders::RaindexOrder>, ApiError>
         {
             self.base
-                .get_orders_for_pair(chain_id, input_token, output_token)
+                .get_orders_for_pair(input_token, output_token)
                 .await
         }
 
@@ -268,9 +722,57 @@ mod tests {
             orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
+            counterparty: alloy::primitives::Address,
+        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+            self.counterparties
+                .lock()
+                .map_err(|_| ApiError::Internal("counterparty recorder poisoned".into()))?
+                .push(counterparty);
+            self.base
+                .build_candidates_for_pair(orders, input_token, output_token, counterparty)
+                .await
+        }
+
+        async fn get_calldata(
+            &self,
+            request: rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest,
+        ) -> Result<crate::types::swap::SwapCalldataResponse, ApiError> {
+            self.base.get_calldata(request).await
+        }
+    }
+
+    #[async_trait]
+    impl SwapDataSource for MockQuoteDataSource {
+        async fn validate_supported_tokens(
+            &self,
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<(), ApiError> {
+            self.base
+                .validate_supported_tokens(input_token, output_token)
+                .await
+        }
+
+        async fn get_orders_for_pair(
+            &self,
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<Vec<rain_orderbook_common::raindex_client::orders::RaindexOrder>, ApiError>
+        {
+            self.base
+                .get_orders_for_pair(input_token, output_token)
+                .await
+        }
+
+        async fn build_candidates_for_pair(
+            &self,
+            orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+            counterparty: alloy::primitives::Address,
         ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
             self.base
-                .build_candidates_for_pair(orders, input_token, output_token)
+                .build_candidates_for_pair(orders, input_token, output_token, counterparty)
                 .await
         }
 
@@ -304,11 +806,8 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453)
-            .await
-            .unwrap();
+        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
-        assert_eq!(result.chain_id, 8453);
         assert_eq!(result.input_token, USDC);
         assert_eq!(result.output_token, WETH);
         assert_eq!(result.output_amount, "100");
@@ -319,6 +818,344 @@ mod tests {
     }
 
     #[rocket::async_test]
+    async fn test_process_swap_quote_v2_buy_up_to() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("5", "1"), mock_candidate("5", "2")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+
+        let result = process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::BuyUpTo, "8"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.estimated_input, "11");
+        assert_eq!(result.estimated_output, "8");
+        assert_eq!(result.estimated_io_ratio, "1.375");
+        assert!(result.fully_filled);
+        assert_eq!(result.resolved_price_cap, "2");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_spend_up_to() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("5", "1"), mock_candidate("5", "2")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+
+        let result = process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendUpTo, "8"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.estimated_input, "8");
+        assert_eq!(result.estimated_output, "6.5");
+        assert_eq!(
+            result.estimated_io_ratio,
+            "1.2307692307692307692307692307692307692307692307692307692307692307692"
+        );
+        assert!(result.fully_filled);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_reports_partial_up_to_fill() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("3", "2")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+
+        let result = process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::BuyUpTo, "5"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.estimated_input, "6");
+        assert_eq!(result.estimated_output, "3");
+        assert!(!result.fully_filled);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_rejects_partial_exact_fill() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("3", "2")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+
+        let result =
+            process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendExact, "8")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_resolves_same_slippage_cap_as_calldata() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("5", "1"), mock_candidate("5", "2")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let mut request = quote_v2_request(SwapCalldataMode::BuyUpTo, "8");
+        request.price_cap = None;
+        request.slippage_bps = Some(100);
+
+        let result = process_swap_quote_v2(&ds, request).await.unwrap();
+
+        assert_eq!(result.resolved_price_cap, "2.02");
+        assert_eq!(result.estimated_input, "11");
+        assert_eq!(result.estimated_output, "8");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_uses_taker_for_oracle_candidates() {
+        let taker = address!("1234567890AbcdEF1234567890aBcdef12345678");
+        let ds = RecordingCounterpartyDataSource {
+            base: MockSwapDataSource {
+                supported_tokens: Ok(()),
+                orders: Ok(vec![mock_order()]),
+                candidates: vec![mock_candidate("5", "1")],
+                calldata_result: Err(ApiError::Internal("unused".into())),
+            },
+            counterparties: Mutex::new(Vec::new()),
+        };
+        let mut request = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        request.taker = Some(taker);
+
+        process_swap_quote_v2(&ds, request).await.unwrap();
+
+        assert_eq!(
+            *ds.counterparties.lock().unwrap(),
+            vec![taker],
+            "quote candidates must use the wallet context passed by the website"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_validates_price_limit_options() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("data source must not be reached".into())),
+            orders: Err(ApiError::Internal("data source must not be reached".into())),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("data source must not be reached".into())),
+        };
+
+        let mut both = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        both.slippage_bps = Some(100);
+        assert!(matches!(
+            process_swap_quote_v2(&ds, both).await,
+            Err(ApiError::BadRequest(message))
+                if message.contains("exactly one")
+        ));
+
+        let mut neither = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        neither.price_cap = None;
+        assert!(matches!(
+            process_swap_quote_v2(&ds, neither).await,
+            Err(ApiError::BadRequest(message))
+                if message.contains("exactly one")
+        ));
+
+        let mut out_of_range = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        out_of_range.price_cap = None;
+        out_of_range.slippage_bps = Some(5001);
+        assert!(matches!(
+            process_swap_quote_v2(&ds, out_of_range).await,
+            Err(ApiError::BadRequest(message))
+                if message.contains("between 1 and 5000")
+        ));
+
+        let mut reference_without_slippage = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        reference_without_slippage.reference_io_ratio = Some("1".to_string());
+        assert!(matches!(
+            process_swap_quote_v2(&ds, reference_without_slippage).await,
+            Err(ApiError::BadRequest(message))
+                if message.contains("requires slippage_bps")
+        ));
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_v2_captures_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("5", "1")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let response = handle_swap_quote_v2(
+            &ds,
+            &test_key(),
+            &analytics,
+            quote_v2_request(SwapCalldataMode::BuyUpTo, "5"),
+        )
+        .await
+        .expect("successful quote");
+
+        assert!(response.fully_filled);
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quoted")
+            .expect("swap_quoted event");
+        assert_eq!(event.distinct_id, "client:test-client");
+        assert_eq!(event.properties["estimated_output"], "5");
+        assert_eq!(event.properties["fully_filled"], true);
+        assert_eq!(event.properties["api_version"], "v2");
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_captures_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let response = handle_swap_quote(&ds, &test_key(), &analytics, quote_request("100"))
+            .await
+            .expect("successful quote");
+
+        assert_eq!(response.estimated_input, "150");
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quoted")
+            .expect("swap_quoted event");
+        assert_eq!(event.distinct_id, "client:test-client");
+        assert_eq!(event.properties["estimated_input"], "150");
+        assert_eq!(event.properties["api_client_owner"], "test-owner");
+        assert_eq!(event.properties["api_version"], "v1");
+    }
+
+    /// A failing quote must still report the pair that failed. Without this the only
+    /// signal is an `api_request` 404 with no tokens on it, which is what made a
+    /// 100%-failing integrator indistinguishable from one sending no traffic.
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_captures_failure_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]), // no orders for the pair -> SWAP_NO_LIQUIDITY
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let result = handle_swap_quote(&ds, &test_key(), &analytics, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quote_failed")
+            .expect("swap_quote_failed event");
+        assert_eq!(event.distinct_id, "client:test-client");
+        assert_eq!(event.properties["api_client_owner"], "test-owner");
+        assert_eq!(
+            event.properties["input_token"],
+            USDC.to_string().to_lowercase()
+        );
+        assert_eq!(
+            event.properties["output_token"],
+            WETH.to_string().to_lowercase()
+        );
+        assert_eq!(event.properties["requested_amount"], "100");
+        assert_eq!(event.properties["error_code"], "SWAP_NO_LIQUIDITY");
+        assert_eq!(event.properties["status_code"], 404);
+        assert_eq!(event.properties["same_token"], false);
+        assert_eq!(event.properties["api_version"], "v1");
+        // No swap_quoted on the failure path: success and failure stay disjoint so a
+        // success rate computed from these two events is meaningful.
+        assert!(!recording
+            .events()
+            .iter()
+            .any(|event| event.event == "swap_quoted"));
+    }
+
+    /// The guard must run before any data-source call: the whole point is to avoid the
+    /// full-book RPC sweep a same-token pair would otherwise trigger. A data source
+    /// that errors on first use proves it was never reached.
+    #[rocket::async_test]
+    async fn test_same_token_pair_is_rejected_before_touching_the_data_source() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("data source must not be reached".into())),
+            orders: Err(ApiError::Internal("data source must not be reached".into())),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let mut req = quote_request("100");
+        req.output_token = req.input_token;
+
+        assert_error_code(
+            process_swap_quote(&ds, req).await,
+            ApiErrorCode::SwapSameToken,
+        );
+    }
+
+    #[rocket::async_test]
+    async fn test_same_token_failure_is_flagged_in_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+        let mut req = quote_request("100");
+        req.output_token = req.input_token;
+
+        let result = handle_swap_quote(&ds, &test_key(), &analytics, req).await;
+        assert_error_code(result, ApiErrorCode::SwapSameToken);
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quote_failed")
+            .expect("swap_quote_failed event");
+        assert_eq!(event.properties["same_token"], true);
+        assert_eq!(event.properties["error_code"], "SWAP_SAME_TOKEN");
+        assert_eq!(event.properties["status_code"], 400);
+    }
+
+    #[rocket::async_test]
+    async fn test_handle_swap_quote_v2_captures_failure_analytics() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let recording = RecordingSink::new();
+        let analytics = Analytics::new(Arc::new(recording.clone()));
+
+        let mut request = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
+        request.taker = Some(TAKER);
+        let result = handle_swap_quote_v2(&ds, &test_key(), &analytics, request).await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+
+        let event = recording
+            .events()
+            .into_iter()
+            .find(|event| event.event == "swap_quote_failed")
+            .expect("swap_quote_failed event");
+        assert_eq!(event.properties["api_version"], "v2");
+        assert_eq!(event.properties["requested_amount"], "5");
+        assert_eq!(event.properties["error_code"], "SWAP_NO_LIQUIDITY");
+        assert!(event.properties.get("taker").is_none());
+    }
+
+    #[rocket::async_test]
     async fn test_process_swap_quote_multi_leg() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
@@ -326,9 +1163,7 @@ mod tests {
             candidates: vec![mock_candidate("50", "2"), mock_candidate("50", "3")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453)
-            .await
-            .unwrap();
+        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "100");
@@ -344,9 +1179,7 @@ mod tests {
             candidates: vec![mock_candidate("30", "2")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453)
-            .await
-            .unwrap();
+        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
 
         assert_eq!(result.output_amount, "100");
         assert_eq!(result.estimated_output, "30");
@@ -365,9 +1198,7 @@ mod tests {
             ],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("10"), 8453)
-            .await
-            .unwrap();
+        let result = process_swap_quote(&ds, quote_request("10")).await.unwrap();
 
         assert_eq!(result.estimated_io_ratio, "1.5");
         assert_eq!(result.estimated_input, "15");
@@ -386,7 +1217,7 @@ mod tests {
             wrap_ratios: HashMap::from([(wt_mstr, wrap_ratio(wt_mstr, "2"))]),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, WETH, "100"), 8453)
+        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, WETH, "100"))
             .await
             .unwrap();
 
@@ -410,7 +1241,7 @@ mod tests {
             wrap_ratios: HashMap::from([(wt_mstr, wrap_ratio(wt_mstr, "2"))]),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, wt_mstr, "100"), 8453)
+        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, wt_mstr, "100"))
             .await
             .unwrap();
 
@@ -438,10 +1269,9 @@ mod tests {
             ]),
         };
 
-        let result =
-            process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, wt_coin, "100"), 8453)
-                .await
-                .unwrap();
+        let result = process_swap_quote(&ds, unwrapped_quote_request(wt_mstr, wt_coin, "100"))
+            .await
+            .unwrap();
 
         assert_eq!(result.denomination, SwapDenomination::Unwrapped);
         assert_eq!(result.output_amount, "100");
@@ -462,7 +1292,7 @@ mod tests {
             wrap_ratios: HashMap::new(),
         };
 
-        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, WETH, "100"), 8453)
+        let result = process_swap_quote(&ds, unwrapped_quote_request(USDC, WETH, "100"))
             .await
             .unwrap();
 
@@ -481,8 +1311,8 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
-        assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no liquidity")));
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
@@ -493,8 +1323,8 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
-        assert!(matches!(result, Err(ApiError::NotFound(msg)) if msg.contains("no valid quotes")));
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
@@ -505,7 +1335,7 @@ mod tests {
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("not-a-number"), 8453).await;
+        let result = process_swap_quote(&ds, quote_request("not-a-number")).await;
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -517,43 +1347,42 @@ mod tests {
             candidates: vec![],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
-        assert!(matches!(result, Err(ApiError::Internal(_))));
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::OrdersQueryFailed);
     }
 
     #[rocket::async_test]
     async fn test_process_swap_quote_rejects_unsupported_tokens() {
         let ds = MockSwapDataSource {
-            supported_tokens: Err(ApiError::BadRequest(
-                "unsupported token for this API".into(),
+            supported_tokens: Err(ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
             )),
             orders: Ok(vec![mock_order()]),
             candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("unused".into())),
         };
-        let result = process_swap_quote(&ds, quote_request("100"), 8453).await;
-        assert!(
-            matches!(result, Err(ApiError::BadRequest(msg)) if msg.contains("unsupported token"))
-        );
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapUnsupportedToken);
     }
 
     #[rocket::async_test]
-    async fn test_swap_quote_v1_401_without_auth() {
-        let client = TestClientBuilder::new().build().await;
-        let response = client
-            .post("/v1/swap/quote")
-            .header(ContentType::JSON)
-            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Unauthorized);
+    async fn test_process_swap_quote_registry_failure_is_not_retryable() {
+        let ds = MockSwapDataSource {
+            supported_tokens: Err(ApiError::Internal("invalid local registry".into())),
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
+            calldata_result: Err(ApiError::Internal("unused".into())),
+        };
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+        assert_error_code(result, ApiErrorCode::SwapQuoteFailed);
     }
 
     #[rocket::async_test]
     async fn test_swap_quote_401_without_auth() {
         let client = TestClientBuilder::new().build().await;
         let response = client
-            .post("/v2/swap/quote")
+            .post("/v1/swap/quote")
             .header(ContentType::JSON)
             .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
             .dispatch()
@@ -567,13 +1396,16 @@ mod tests {
         let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
         let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
         let response = client
-            .post("/v2/swap/quote")
+            .post("/v1/swap/quote")
             .header(ContentType::JSON)
             .header(rocket::http::Header::new("Authorization", header))
             .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100"}"#)
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_json::<ApiErrorResponse>().await.unwrap();
+        assert_eq!(body.error.code, ApiErrorCode::SwapUnsupportedToken);
+        assert!(!body.request_id.is_empty());
     }
 
     #[rocket::async_test]
@@ -582,7 +1414,7 @@ mod tests {
         let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
         let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
         let response = client
-            .post("/v2/swap/quote")
+            .post("/v1/swap/quote")
             .header(ContentType::JSON)
             .header(rocket::http::Header::new("Authorization", header))
             .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","outputAmount":"100","denomination":"invalid"}"#)

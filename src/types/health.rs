@@ -27,6 +27,9 @@ pub struct DetailedHealthResponse {
 
     /// raindex local database sync status
     pub raindex: RaindexSyncStatus,
+
+    /// Background ST0x market price sampler status
+    pub market_prices: MarketPriceHealthStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -49,6 +52,31 @@ pub struct DbStatus {
 pub enum DbHealthStatus {
     Ok,
     Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketPriceHealthStatus {
+    #[schema(example = true)]
+    pub enabled: bool,
+
+    #[schema(example = true)]
+    pub healthy: bool,
+
+    #[schema(example = true)]
+    pub running: bool,
+
+    #[schema(nullable = true, example = 1784800000)]
+    pub last_attempt_at: Option<i64>,
+
+    #[schema(nullable = true, example = 1784800000)]
+    pub last_success_at: Option<i64>,
+
+    #[schema(example = 0)]
+    pub consecutive_failures: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

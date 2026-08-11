@@ -8,7 +8,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     post,
-    path = "/v1/order/solver",
+    path = "/v2/order/solver",
     tag = "Order",
     security(("basicAuth" = [])),
     request_body = DeploySolverOrderRequest,
@@ -31,7 +31,9 @@ pub async fn post_order_solver(
     let req = request.into_inner();
     async move {
         tracing::info!(body = ?req, "request received");
-        let _raindex = shared_raindex.read().await;
+        let raindex = shared_raindex.read().await;
+        let _chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
         todo!()
     }
     .instrument(span.0)

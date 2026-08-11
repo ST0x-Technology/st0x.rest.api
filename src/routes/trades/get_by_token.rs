@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/token/{address}",
+    path = "/v2/trades/token/{address}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
@@ -46,19 +46,18 @@ pub async fn get_trades_by_token(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
-        let client = {
+        let (client, chain_ids) = {
             let raindex = shared_raindex.read().await;
             let chain_ids =
                 crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
             (raindex.client().clone(), chain_ids)
         };
-        let (client, chain_ids) = client;
         if !app_state.response_caches.is_enabled() {
             let ds = RaindexTradesDataSource {
                 client: &client,
                 pool: pool.inner(),
             };
-            return process_get_trades_by_token(&ds, chain_ids, addr, params).await;
+            return process_get_trades_by_token_for_chains(&ds, chain_ids, addr, params).await;
         }
 
         let cache_key = trades_cache_key("trades/token", addr, &params);
@@ -70,7 +69,7 @@ pub async fn get_trades_by_token(
                     client: &client,
                     pool: pool.inner(),
                 };
-                process_get_trades_by_token(&ds, chain_ids, addr, params)
+                process_get_trades_by_token_for_chains(&ds, chain_ids, addr, params)
                     .await
                     .map(Json::into_inner)
             })
@@ -91,7 +90,7 @@ pub(super) fn trades_cache_key(
         "{route}/{}/{}/{}/{}/{}/{}/{:?}",
         params
             .chain_id
-            .map(|value| value.to_string())
+            .map(|chain_id| chain_id.to_string())
             .unwrap_or_else(|| "all".to_string()),
         address.to_string().to_ascii_lowercase(),
         params.page.unwrap_or(1),
@@ -108,7 +107,16 @@ pub(super) fn trades_cache_key(
     )
 }
 
+#[cfg(test)]
 pub(super) async fn process_get_trades_by_token(
+    ds: &dyn TradesDataSource,
+    token: Address,
+    params: TradesPaginationParams,
+) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    process_get_trades_by_token_for_chains(ds, None, token, params).await
+}
+
+async fn process_get_trades_by_token_for_chains(
     ds: &dyn TradesDataSource,
     chain_ids: Option<Vec<u32>>,
     token: Address,
@@ -119,7 +127,7 @@ pub(super) async fn process_get_trades_by_token(
 
     tracing::info!(token = ?token, page, page_size, "querying trades by token");
     let result = ds
-        .get_trades_for_token(chain_ids, token, sdk_page, sdk_page_size, time_filter)
+        .get_trades_for_token_on_chains(chain_ids, token, sdk_page, sdk_page_size, time_filter)
         .await?;
 
     build_trades_list_response(ds, result, page, page_size, denomination).await
@@ -147,7 +155,6 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
@@ -155,7 +162,6 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -165,7 +171,6 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -179,24 +184,11 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _taker: Address,
             _page: u16,
             _page_size: u16,
             _time_filter: TimeFilter,
         ) -> Result<RaindexTradesListResult, ApiError> {
-            unimplemented!()
-        }
-
-        async fn get_trades_by_order_hashes(
-            &self,
-            _chain_ids: Option<Vec<u32>>,
-            _order_hashes: Vec<B256>,
-            _time_filter: TimeFilter,
-        ) -> Result<
-            rain_orderbook_common::raindex_client::trades::RaindexTradesByOrderHashResult,
-            ApiError,
-        > {
             unimplemented!()
         }
     }
@@ -216,7 +208,6 @@ mod tests {
         };
         let result = process_get_trades_by_token(
             &ds,
-            None,
             address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             params,
         )
@@ -282,7 +273,6 @@ mod tests {
         };
         let result = process_get_trades_by_token(
             &ds,
-            None,
             address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             params,
         )
@@ -311,7 +301,6 @@ mod tests {
         };
         let result = process_get_trades_by_token(
             &ds,
-            None,
             address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             params,
         )

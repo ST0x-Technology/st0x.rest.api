@@ -60,13 +60,68 @@ jobs:
         run: |
           host_key=$(nix eval --raw --file keys.nix keys.host)
           echo "$HOST_IP $host_key" > ~/.ssh/known_hosts
+      - name: Install attribution signer credential
+        env:
+          ST0X_GATING_SIGNER_KEY: ${{ secrets.ST0X_GATING_SIGNER_KEY }}
+        run: |
+          if [ -z "$ST0X_GATING_SIGNER_KEY" ]; then
+            echo "ST0X_GATING_SIGNER_KEY secret is required" >&2
+            exit 1
+          fi
+          printf '%s\n' "$ST0X_GATING_SIGNER_KEY" | ssh "root@$HOST_IP" \
+            'install -d -m 700 /mnt/data/st0x-rest-api/secrets && umask 077 && tee /mnt/data/st0x-rest-api/secrets/.attribution-signer.tmp >/dev/null && test -s /mnt/data/st0x-rest-api/secrets/.attribution-signer.tmp && mv /mnt/data/st0x-rest-api/secrets/.attribution-signer.tmp /mnt/data/st0x-rest-api/secrets/attribution-signer'
+      - name: Check attribution system prerequisites
+        if: (inputs.deploy_scope || 'service') == 'service'
+        run: |
+          expected_attribution_config="$(grep '^attribution_' config/prod.toml)"
+          deployed_attribution_config="$(ssh "root@$HOST_IP" \
+            "grep '^attribution_' /etc/st0x-rest-api/config.toml 2>/dev/null || true")"
+          if ssh "root@$HOST_IP" \
+              'systemctl cat rest-api.service 2>/dev/null | grep -q attribution-signer' \
+            && [ "$deployed_attribution_config" = "$expected_attribution_config" ]; then
+            echo "NEEDS_ATTRIBUTION_SYSTEM_DEPLOY=false" >> "$GITHUB_ENV"
+          else
+            echo "NEEDS_ATTRIBUTION_SYSTEM_DEPLOY=true" >> "$GITHUB_ENV"
+          fi
       - run: ./prep.sh
+      - name: Deploy attribution system prerequisites
+        if: (inputs.deploy_scope || 'service') == 'service' && env.NEEDS_ATTRIBUTION_SYSTEM_DEPLOY == 'true'
+        run: nix run .#deployNixos
       - name: Deploy service
         if: (inputs.deploy_scope || 'service') == 'service'
         run: nix run .#deployService -- rest-api
       - name: Deploy system
         if: (inputs.deploy_scope || 'service') == 'system'
-        run: nix run .#deployNixos
+        run: |
+          nix run .#deployNixos
+          ssh "root@$HOST_IP" 'systemctl try-restart rest-api.service'
       - name: Deploy system and service
         if: (inputs.deploy_scope || 'service') == 'all'
         run: nix run .#deployAll
+      - name: Verify attribution-enabled service
+        run: |
+          invocation_id=$(ssh "root@$HOST_IP" \
+            'systemctl show --property=InvocationID --value rest-api.service')
+          if [[ ! "$invocation_id" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "Unable to identify the deployed rest-api invocation" >&2
+            exit 1
+          fi
+
+          for _ in $(seq 1 30); do
+            if ssh "root@$HOST_IP" \
+              "journalctl _SYSTEMD_INVOCATION_ID=$invocation_id --no-pager | grep -Fq 'attribution signer loaded'" \
+              && curl --fail --silent --max-time 3 \
+                https://api.st0x.io/health >/dev/null \
+              && ssh "root@$HOST_IP" \
+                'systemctl is-active --quiet rest-api.service'; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          ssh "root@$HOST_IP" \
+            'systemctl status rest-api.service --no-pager' || true
+          ssh "root@$HOST_IP" \
+            "journalctl _SYSTEMD_INVOCATION_ID=$invocation_id --no-pager" || true
+          echo "Attribution-enabled service verification timed out" >&2
+          exit 1

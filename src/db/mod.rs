@@ -1,3 +1,5 @@
+pub(crate) mod attribution;
+pub(crate) mod market_price_history;
 mod migrate;
 mod pool;
 pub(crate) mod registry_history;

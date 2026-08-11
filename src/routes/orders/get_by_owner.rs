@@ -66,7 +66,7 @@ pub(crate) async fn process_get_orders_by_owner(
 
 #[utoipa::path(
     get,
-    path = "/v1/orders/owner/{address}",
+    path = "/v2/orders/owner/{address}",
     tag = "Orders",
     security(("basicAuth" = [])),
     params(

@@ -4,6 +4,7 @@
 - [Getting Started](./getting-started.md)
 - [Authentication](./authentication.md)
 - [Tokens](./tokens.md)
+- [Market Prices](./prices.md)
 - [Swap Flow](./swap-flow.md)
 - [Order Management](./orders.md)
 - [Vaults](./vaults.md)

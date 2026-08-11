@@ -110,7 +110,9 @@ jobs:
         run: |
           set -euxo pipefail
           if [ "${{ matrix.run_static }}" = "true" ]; then
+            nix build --impure .#st0x-rest-api --no-link
             nix develop -c rainix-rs-static
+            nix develop -c cargo test --features oracle-integration-tests test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution
           fi
           nix develop -c cargo nextest run --workspace --partition hash:${{ matrix.partition }}/4
   rust-checks:

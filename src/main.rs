@@ -1,7 +1,10 @@
 #[macro_use]
 extern crate rocket;
 
+mod analytics;
 mod app_state;
+mod attribution;
+mod attribution_reporting;
 mod auth;
 mod cache;
 mod catchers;
@@ -12,6 +15,8 @@ mod denomination;
 mod erc4626;
 mod error;
 mod fairings;
+mod market_price;
+mod metrics;
 mod raindex;
 mod registry_artifact;
 mod routes;
@@ -53,6 +58,34 @@ enum StartupError {
     Cors(#[from] rocket_cors::Error),
 }
 
+const ATTRIBUTION_SIGNER_CREDENTIAL: &str = "attribution-signer";
+
+fn load_attribution_signer_key() -> Result<String, String> {
+    if let Ok(key) = std::env::var("ST0X_GATING_SIGNER_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Ok(key.to_string());
+        }
+    }
+
+    let credentials_directory = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
+        "ST0X_GATING_SIGNER_KEY or a systemd attribution-signer credential is required".to_string()
+    })?;
+    let credential_path =
+        std::path::Path::new(&credentials_directory).join(ATTRIBUTION_SIGNER_CREDENTIAL);
+    let key = std::fs::read_to_string(&credential_path).map_err(|error| {
+        format!(
+            "failed to read attribution signer credential {}: {error}",
+            credential_path.display()
+        )
+    })?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("attribution signer credential is empty".to_string());
+    }
+    Ok(key.to_string())
+}
+
 #[derive(Debug, thiserror::Error)]
 enum StartupRegistryError {
     #[error("failed to read private registry artifact")]
@@ -85,9 +118,11 @@ enum StartupRegistryError {
         routes::tokens::get_token_details,
         routes::tokens::get_token_details_by_address,
         routes::tokens::get_token_proofs,
+        routes::prices::get_prices,
+        routes::prices::get_price_history,
         routes::swap::post_swap_quote,
-        routes::swap::post_swap_calldata,
         routes::swap::post_swap_quote_v2,
+        routes::swap::post_swap_calldata,
         routes::swap::post_swap_calldata_v2,
         routes::order::post_order_dca,
         routes::order::post_order_solver,
@@ -96,11 +131,14 @@ enum StartupRegistryError {
         routes::orders::get_orders_by_tx,
         routes::orders::get_orders_by_address,
         routes::orders::get_orders_by_token,
+        routes::orders::post_orders_query,
         routes::vaults::get_vaults,
         routes::vaults::get_vault_totals,
         routes::admin::put_registry,
+        routes::attribution_admin::get_attributed_executions,
+        routes::attribution_admin::get_attribution_volume,
         routes::trades::get_by_tx::get_trades_by_tx,
-        routes::trades::get_by_order_hashes::get_trades_by_order_hashes,
+        routes::trades::query::post_trades_query,
         routes::trades::get_by_token::get_trades_by_token,
         routes::trades::get_by_taker::get_trades_by_taker,
         routes::trades::get_by_address::get_trades_by_address,
@@ -112,6 +150,7 @@ enum StartupRegistryError {
     tags(
         (name = "Health", description = "Health check endpoints"),
         (name = "Tokens", description = "Token information endpoints"),
+        (name = "Prices", description = "ST0x market price endpoints"),
         (name = "Swap", description = "Swap quote and calldata endpoints"),
         (name = "Order", description = "Order deployment and management endpoints"),
         (name = "Orders", description = "Order listing and query endpoints"),
@@ -153,14 +192,28 @@ fn configure_cors() -> Result<rocket_cors::Cors, StartupError> {
     .to_cors()?)
 }
 
-pub(crate) fn rocket(
+pub(crate) struct RocketDependencies {
     pool: db::DbPool,
     rate_limiter: fairings::RateLimiter,
     raindex_config: raindex::SharedRaindexProvider,
     app_state: app_state::ApplicationState,
+    analytics: analytics::Analytics,
+    market_price_state: market_price::MarketPriceState,
+}
+
+pub(crate) fn rocket(
+    dependencies: RocketDependencies,
     docs_dir: String,
     usage_log_max_concurrency: usize,
 ) -> Result<rocket::Rocket<rocket::Build>, StartupError> {
+    let RocketDependencies {
+        pool,
+        rate_limiter,
+        raindex_config,
+        app_state,
+        analytics,
+        market_price_state,
+    } = dependencies;
     let cors = configure_cors()?;
 
     let figment = rocket::Config::figment().merge((rocket::Config::LOG_LEVEL, "normal"));
@@ -172,9 +225,13 @@ pub(crate) fn rocket(
         .manage(rate_limiter)
         .manage(raindex_config)
         .manage(app_state)
+        .manage(analytics)
+        .manage(market_price_state)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v2/tokens", routes::tokens::routes_v2())
+        .mount("/v1/prices", routes::prices::routes())
+        .mount("/v2/prices", routes::prices::routes_v2())
         .mount("/v1/swap", routes::swap::routes())
         .mount("/v2/swap", routes::swap::routes_v2())
         .mount("/v1/order", routes::order::routes())
@@ -187,6 +244,7 @@ pub(crate) fn rocket(
         .mount("/v2/trades", routes::trades::routes_v2())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
+        .mount("/admin/attribution", routes::attribution_admin::routes())
         .mount("/docs", FileServer::new(docs_dir, options))
         .mount(
             "/",
@@ -195,6 +253,7 @@ pub(crate) fn rocket(
         .register("/", catchers::catchers())
         .attach(fairings::RequestLogger)
         .attach(fairings::UsageLogger::new(usage_log_max_concurrency))
+        .attach(fairings::AnalyticsFairing)
         .attach(fairings::RateLimitHeadersFairing)
         .attach(cors))
 }
@@ -327,13 +386,20 @@ async fn main() {
         }
     };
 
-    let log_guard = match telemetry::init(&cfg.log_dir) {
+    let log_guard = match telemetry::init(&cfg.log_dir, cfg.telemetry.as_ref()) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("failed to initialize telemetry: {e}");
             std::process::exit(1);
         }
     };
+
+    // Install the Prometheus recorder + standalone /metrics listener (:8001),
+    // reachable only over the tailnet. Non-fatal: a bind failure logs and the
+    // API keeps serving.
+    if let Err(e) = metrics::install() {
+        tracing::warn!(error = %e, "metrics exporter disabled");
+    }
 
     let pool = match db::init(&cfg.database_url, cfg.database_max_connections).await {
         Ok(p) => p,
@@ -343,6 +409,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let response_cache_max_trade_rows = cfg
+        .response_cache_max_trade_rows
+        .unwrap_or(cfg.response_cache_max_entries);
 
     tracing::info!(
         global_rpm = cfg.rate_limit_global_rpm,
@@ -350,17 +419,27 @@ async fn main() {
         database_max_connections = cfg.database_max_connections,
         usage_log_max_concurrency = cfg.usage_log_max_concurrency,
         response_cache_max_entries = cfg.response_cache_max_entries,
+        response_cache_max_trade_rows,
         response_cache_ttl_seconds = cfg.response_cache_ttl_seconds,
         "rate limiter configured"
     );
 
     match command {
         cli::Command::Serve { .. } => {
+            if cfg.response_cache_max_entries > 0
+                && cfg.response_cache_ttl_seconds > 0
+                && response_cache_max_trade_rows == 0
+            {
+                tracing::warn!(
+                    "batch trades response cache disabled because response_cache_max_trade_rows is zero"
+                );
+            }
             let registry_artifact_store = registry_artifact::RegistryArtifactStore::new(
                 std::path::PathBuf::from(&cfg.private_registry_path),
             );
-            let response_caches = cache::RouteResponseCaches::new(
+            let response_caches = cache::RouteResponseCaches::new_with_trade_weight(
                 cfg.response_cache_max_entries,
+                response_cache_max_trade_rows,
                 std::time::Duration::from_secs(cfg.response_cache_ttl_seconds),
             );
 
@@ -391,9 +470,37 @@ async fn main() {
                     }
                 };
 
-            let shared_raindex = tokio::sync::RwLock::new(raindex_config);
+            let attribution_chain_ids =
+                match routes::configured_chain_ids(raindex_config.raindex_yaml()) {
+                    Ok(chain_ids) if !chain_ids.is_empty() => chain_ids,
+                    Ok(_) => {
+                        tracing::error!("registry has no configured networks");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to resolve configured networks");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
+
+            let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
+            let market_price_config = match market_price::MarketPriceConfig::try_from(&cfg) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(%error, "invalid market price configuration");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let market_price_state = market_price::MarketPriceState::new(
+                pool.clone(),
+                shared_raindex.clone(),
+                market_price_config.clone(),
+            );
 
             if !std::path::Path::new(&cfg.docs_dir).is_dir() {
                 tracing::error!(docs_dir = %cfg.docs_dir, "docs_dir is not a valid directory");
@@ -402,14 +509,60 @@ async fn main() {
             }
             tracing::info!(docs_dir = %cfg.docs_dir, "serving documentation at /docs");
 
-            let app_state =
-                app_state::ApplicationState::new(registry_artifact_store, response_caches);
+            let attribution_key = match load_attribution_signer_key() {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::error!(%error, "failed to load attribution signer key");
+                    drop(log_guard);
+                    std::process::exit(1);
+                }
+            };
+            let attribution_signer =
+                match attribution::AttributionSigner::from_hex_key(&attribution_key) {
+                    Ok(signer) => signer,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to initialize attribution signer");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
+            tracing::info!(
+                signer = %attribution_signer.address(),
+                "attribution signer loaded"
+            );
+            let attribution_signer_address = attribution_signer.address();
+            let attribution_state = attribution::AttributionState::new(attribution_signer);
+            let app_state = app_state::ApplicationState::new(
+                registry_artifact_store,
+                response_caches,
+                attribution_state,
+            );
 
-            let rocket = match rocket(
-                pool,
-                rate_limiter,
-                shared_raindex,
-                app_state,
+            let analytics = analytics::Analytics::from_env();
+
+            if market_price_config.enabled {
+                tokio::spawn(market_price::supervise_market_price_sampler(
+                    market_price_state.clone(),
+                ));
+                tracing::info!(
+                    interval_seconds = market_price_config.sample_interval.as_secs(),
+                    retention_seconds = market_price_config.retention.as_secs(),
+                    "registry-driven market price sampler started"
+                );
+            } else {
+                tracing::warn!("market price sampler is disabled");
+            }
+
+            let attribution_pool = pool.clone();
+            let mut rocket = match rocket(
+                RocketDependencies {
+                    pool,
+                    rate_limiter,
+                    raindex_config: shared_raindex,
+                    app_state,
+                    analytics,
+                    market_price_state,
+                },
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
             ) {
@@ -420,6 +573,26 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+
+            if let Some(start_block) = cfg.attribution_start_block {
+                tracing::info!(
+                    start_block,
+                    interval_seconds = cfg.attribution_sync_interval_seconds,
+                    batch_size = cfg.attribution_sync_batch_size,
+                    "confirmed trade attribution worker enabled"
+                );
+                rocket = rocket.attach(attribution_reporting::AttributionWorker::new(
+                    attribution_pool,
+                    std::path::PathBuf::from(&cfg.local_db_path),
+                    attribution_chain_ids,
+                    attribution_signer_address,
+                    start_block,
+                    std::time::Duration::from_secs(cfg.attribution_sync_interval_seconds.max(1)),
+                    cfg.attribution_sync_batch_size,
+                ));
+            } else {
+                tracing::info!("confirmed trade attribution worker disabled");
+            }
 
             if let Err(e) = rocket.launch().await {
                 tracing::error!(error = %e, "Rocket launch failed");
@@ -458,11 +631,11 @@ mod tests {
     #[test]
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
-        let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
-        let swap_quote_v1_path = &openapi["paths"]["/v1/swap/quote"]["post"];
+        let proofs_path = &openapi["paths"]["/v2/tokens/{address}/proofs"]["get"];
         let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
-        let swap_calldata_v1_path = &openapi["paths"]["/v1/swap/calldata"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
+        let orders_query_path = &openapi["paths"]["/v2/orders/query"]["post"];
+        let trades_query_path = &openapi["paths"]["/v2/trades/query"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
         assert_eq!(
@@ -484,36 +657,104 @@ mod tests {
         assert!(schemas["TokenProofReceipt"]["properties"]["receiptId"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["txHash"].is_object());
         assert!(schemas["TokenProofReceipt"]["properties"]["type"].is_object());
-        assert_eq!(swap_quote_v1_path["tags"][0], "Swap");
-        assert_eq!(
-            swap_quote_v1_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SwapQuoteRequest"
-        );
         assert_eq!(swap_quote_v2_path["tags"][0], "Swap");
         assert_eq!(
             swap_quote_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SwapQuoteRequest"
+            "#/components/schemas/SwapQuoteV2RequestBody"
         );
-        assert_eq!(swap_calldata_v1_path["tags"][0], "Swap");
         assert_eq!(
-            swap_calldata_v1_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SwapCalldataRequest"
+            schemas["SwapQuoteV2RequestBody"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/SwapQuoteV2PriceCapRequest" },
+                { "$ref": "#/components/schemas/SwapQuoteV2SlippageRequest" }
+            ])
+        );
+        assert!(
+            schemas["SwapQuoteV2SlippageRequest"]["allOf"][1]["properties"]["slippageBps"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert!(
+            schemas["SwapQuoteV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("input-token-per-output-token"))
         );
         assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
         assert_eq!(
             swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SwapCalldataV2Request"
+            "#/components/schemas/SwapCalldataV2RequestBody"
         );
         assert_eq!(
             schemas["SwapCalldataMode"]["enum"],
             serde_json::json!(["buyUpTo", "spendExact", "spendUpTo"])
+        );
+        assert_eq!(
+            swap_calldata_v2_path["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/SwapCalldataV2Response"
+        );
+        assert_eq!(
+            schemas["SwapCalldataV2RequestBody"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/SwapCalldataV2PriceCapRequest" },
+                { "$ref": "#/components/schemas/SwapCalldataV2SlippageRequest" }
+            ])
+        );
+        assert!(
+            schemas["SwapCalldataV2PriceCapRequest"]["allOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("priceCap")))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&serde_json::json!("slippageBps")))
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                .is_object()
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["slippageBps"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("1 BPS = 0.01%"))
+        );
+        assert_eq!(orders_query_path["tags"][0], "Orders");
+        assert_eq!(
+            orders_query_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/OrdersQueryRequest"
+        );
+        assert_eq!(trades_query_path["tags"][0], "Trades");
+        assert_eq!(
+            trades_query_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TradesQueryRequest"
+        );
+        assert_eq!(
+            schemas["TradesQueryResponse"]["oneOf"],
+            serde_json::json!([
+                { "$ref": "#/components/schemas/TradesByOrderHashesResponse" },
+                { "$ref": "#/components/schemas/TradesByAddressResponse" }
+            ])
+        );
+        assert!(
+            schemas["SwapCalldataV2SlippageRequest"]["allOf"][1]["properties"]["referenceIoRatio"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("input-token-per-output-token"))
+        );
+        assert!(
+            schemas["SwapCalldataV2Response"]["allOf"][1]["properties"]["resolvedPriceCap"]
+                .is_object()
         );
     }
 
     #[test]
     fn test_openapi_documents_token_details_activity_limit() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
-        let details_path = &openapi["paths"]["/v1/tokens/{address}/details"]["get"];
+        let details_path = &openapi["paths"]["/v2/tokens/{address}/details"]["get"];
         let parameters = details_path["parameters"]
             .as_array()
             .expect("parameters is an array");
@@ -521,9 +762,54 @@ mod tests {
         assert!(parameters
             .iter()
             .any(|parameter| parameter["name"] == "activityLimit"));
+        assert!(parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "chainId"));
         assert!(!parameters
             .iter()
             .any(|parameter| parameter["name"] == "activity_limit"));
+    }
+
+    #[test]
+    fn test_openapi_documents_attribution_query_names() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+        let execution_parameters = openapi["paths"]["/admin/attribution/executions"]["get"]
+            ["parameters"]
+            .as_array()
+            .expect("parameters is an array");
+        let execution_names: Vec<&str> = execution_parameters
+            .iter()
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert!(execution_names.contains(&"apiKeyHash"));
+        assert!(execution_names.contains(&"transactionHash"));
+        assert!(execution_names.contains(&"beforeBlock"));
+        assert!(execution_names.contains(&"beforeLogIndex"));
+        assert!(execution_names.contains(&"beforeTradeId"));
+        assert!(!execution_names.contains(&"api_key_hash"));
+
+        let volume_parameters = openapi["paths"]["/admin/attribution/volume"]["get"]["parameters"]
+            .as_array()
+            .expect("parameters is an array");
+        let volume_names: Vec<&str> = volume_parameters
+            .iter()
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert!(volume_names.contains(&"limit"));
+        assert!(volume_names.contains(&"afterApiKeyHash"));
+        assert!(volume_names.contains(&"afterChainId"));
+        assert!(volume_names.contains(&"afterInputToken"));
+        assert!(volume_names.contains(&"afterOutputToken"));
+
+        let schemas = &openapi["components"]["schemas"];
+        assert_eq!(
+            schemas["AttributedExecution"]["properties"]["apiKeyLabel"]["description"],
+            "API key identity captured when this execution was attributed."
+        );
+        assert_eq!(
+            schemas["AttributionVolume"]["properties"]["apiKeyLabel"]["description"],
+            "Latest known identity for this API key hash, rather than an execution-time snapshot."
+        );
     }
 
     fn test_config(
@@ -538,6 +824,7 @@ mod tests {
             database_max_connections: 5,
             usage_log_max_concurrency: 2,
             response_cache_max_entries: 0,
+            response_cache_max_trade_rows: None,
             response_cache_ttl_seconds: 0,
             registry_url,
             private_registry_path: private_registry_path.to_string_lossy().into_owned(),
@@ -546,6 +833,13 @@ mod tests {
             rate_limit_per_key_rpm: 60,
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
+            price_sampler_enabled: false,
+            price_sample_interval_seconds: 60,
+            price_history_retention_seconds: 604800,
+            telemetry: None,
+            attribution_start_block: None,
+            attribution_sync_interval_seconds: 60,
+            attribution_sync_batch_size: 250,
         }
     }
 

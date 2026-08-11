@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/{address}",
+    path = "/v2/trades/{address}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
@@ -49,13 +49,22 @@ pub async fn get_trades_by_address(
             client: raindex.client(),
             pool: pool.inner(),
         };
-        process_get_trades_by_address(&ds, chain_ids, address.0, params).await
+        process_get_trades_by_address_for_chains(&ds, chain_ids, address.0, params).await
     }
     .instrument(span.0)
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn process_get_trades_by_address(
+    ds: &dyn TradesDataSource,
+    owner: Address,
+    params: TradesPaginationParams,
+) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    process_get_trades_by_address_for_chains(ds, None, owner, params).await
+}
+
+async fn process_get_trades_by_address_for_chains(
     ds: &dyn TradesDataSource,
     chain_ids: Option<Vec<u32>>,
     owner: Address,
@@ -65,7 +74,7 @@ pub(super) async fn process_get_trades_by_address(
     let (page, page_size, sdk_page, sdk_page_size, time_filter) = trades_pagination_params(params)?;
 
     let result = ds
-        .get_trades_for_owner(
+        .get_trades_for_owner_on_chains(
             chain_ids,
             owner,
             PaginationParams {
@@ -99,7 +108,6 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
@@ -107,7 +115,6 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -120,7 +127,6 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -131,24 +137,11 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _taker: Address,
             _page: u16,
             _page_size: u16,
             _time_filter: TimeFilter,
         ) -> Result<RaindexTradesListResult, ApiError> {
-            unimplemented!()
-        }
-
-        async fn get_trades_by_order_hashes(
-            &self,
-            _chain_ids: Option<Vec<u32>>,
-            _order_hashes: Vec<B256>,
-            _time_filter: TimeFilter,
-        ) -> Result<
-            rain_orderbook_common::raindex_client::trades::RaindexTradesByOrderHashResult,
-            ApiError,
-        > {
             unimplemented!()
         }
     }
@@ -168,7 +161,6 @@ mod tests {
         };
         let result = process_get_trades_by_address(
             &ds,
-            None,
             address!("0000000000000000000000000000000000000001"),
             params,
         )
@@ -205,7 +197,6 @@ mod tests {
         };
         let result = process_get_trades_by_address(
             &ds,
-            None,
             address!("0000000000000000000000000000000000000001"),
             params,
         )
@@ -234,7 +225,6 @@ mod tests {
         };
         let result = process_get_trades_by_address(
             &ds,
-            None,
             address!("0000000000000000000000000000000000000001"),
             params,
         )

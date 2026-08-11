@@ -38,6 +38,12 @@
         configFile = ./config/prod.toml;
         dataDir = "/mnt/data/st0x-rest-api";
         dataVolumeName = "st0x-rest-api-data";
+        # Tailnet MagicDNS name; must match the rain.devops scrape target
+        # (reconcile-scrape-targets.sh in terraform/modules/observability) + the
+        # tag:st0x-rest-api policy in terraform/tailscale/policy.hujson.
+        tailnetHostname = "st0x-rest-api-nixos";
+        posthogHost = "https://eu.i.posthog.com";
+        posthogProjectToken = "phc_G9J1fkYy3hYegFjBpIbFKo9Y5vznggbYe7SLSD1jf0j";
       };
 
       nixosConfigurations.st0x-rest-api-preview = mkNixosConfiguration {
@@ -46,6 +52,7 @@
         configFile = ./config/preview.toml;
         dataDir = "/mnt/data/st0x-rest-api-preview";
         dataVolumeName = "st0x-rest-api-preview-data";
+        tailnetHostname = "st0x-rest-api-staging";
       };
 
       nixosConfigurations.st0x-rest-api =
@@ -94,7 +101,7 @@
             name = "rs-test";
             body = ''
               set -euxo pipefail
-              cargo test --workspace
+              cargo test --workspace --features oracle-integration-tests
             '';
           };
           inherit (infraPkgs)

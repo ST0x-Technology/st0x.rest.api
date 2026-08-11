@@ -28,6 +28,15 @@ pub struct VaultsQueryParams {
     pub page_size: Option<u16>,
 }
 
+#[derive(Debug, Clone, Default, FromForm, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultTotalsQueryParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultTokenResponse {

@@ -19,7 +19,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/tx/{tx_hash}",
+    path = "/v2/trades/tx/{tx_hash}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
@@ -48,15 +48,15 @@ pub async fn get_trades_by_tx(
     async move {
         tracing::info!(tx_hash = ?tx_hash, params = ?params, "request received");
         let raindex = shared_raindex.read().await;
-        let chain_ids =
-            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), params.chain_id)?;
         let trades_ds = RaindexTradesDataSource {
             client: raindex.client(),
             pool: pool.inner(),
         };
-        process_get_trades_by_tx(
+        process_get_trades_by_tx_for_chains(
             &trades_ds,
-            chain_ids,
+            Some(vec![chain_id]),
             tx_hash.0,
             params.denomination.unwrap_or_default(),
         )
@@ -66,13 +66,24 @@ pub async fn get_trades_by_tx(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn process_get_trades_by_tx(
+    trades_ds: &dyn TradesDataSource,
+    tx_hash: B256,
+    denomination: Denomination,
+) -> Result<Json<TradesByTxResponse>, ApiError> {
+    process_get_trades_by_tx_for_chains(trades_ds, None, tx_hash, denomination).await
+}
+
+async fn process_get_trades_by_tx_for_chains(
     trades_ds: &dyn TradesDataSource,
     chain_ids: Option<Vec<u32>>,
     tx_hash: B256,
     denomination: Denomination,
 ) -> Result<Json<TradesByTxResponse>, ApiError> {
-    let result = trades_ds.get_trades_by_tx(chain_ids, tx_hash).await?;
+    let result = trades_ds
+        .get_trades_by_tx_for_chains(chain_ids, tx_hash)
+        .await?;
     let trades = result.trades();
 
     if trades.is_empty() {
@@ -82,6 +93,13 @@ pub(super) async fn process_get_trades_by_tx(
     }
 
     let first_tx = trades[0].transaction();
+    let chain_id = trades[0].chain_id();
+    if trades.iter().any(|trade| trade.chain_id() != chain_id) {
+        tracing::error!(%tx_hash, "transaction query returned trades from multiple chains");
+        return Err(ApiError::Internal(
+            "transaction query returned ambiguous chain data".into(),
+        ));
+    }
     let block_number: u64 = first_tx.block_number().try_into().map_err(|_| {
         tracing::error!("block number does not fit in u64");
         ApiError::Internal("block number overflow".into())
@@ -103,6 +121,7 @@ pub(super) async fn process_get_trades_by_tx(
             let block_number = trade_block_number(trade)?;
             let wrap_ratios = if denomination == Denomination::Unwrapped {
                 wrap_ratio_map_for_trade(
+                    trade.chain_id(),
                     input_token,
                     output_token,
                     block_number,
@@ -141,6 +160,7 @@ pub(super) async fn process_get_trades_by_tx(
             };
 
             Ok(TradeByTxEntry {
+                chain_id: trade.chain_id(),
                 order_hash: trade.order_hash(),
                 order_owner: trade.owner(),
                 request: TradeRequest {
@@ -174,6 +194,7 @@ pub(super) async fn process_get_trades_by_tx(
     };
 
     Ok(Json(TradesByTxResponse {
+        chain_id,
         tx_hash,
         block_number,
         timestamp,
@@ -272,7 +293,6 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             match &self.result {
@@ -283,7 +303,6 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -293,7 +312,6 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -304,24 +322,11 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _taker: Address,
             _page: u16,
             _page_size: u16,
             _time_filter: TimeFilter,
         ) -> Result<RaindexTradesListResult, ApiError> {
-            unimplemented!()
-        }
-
-        async fn get_trades_by_order_hashes(
-            &self,
-            _chain_ids: Option<Vec<u32>>,
-            _order_hashes: Vec<B256>,
-            _time_filter: TimeFilter,
-        ) -> Result<
-            rain_orderbook_common::raindex_client::trades::RaindexTradesByOrderHashResult,
-            ApiError,
-        > {
             unimplemented!()
         }
 
@@ -341,7 +346,6 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
-            None,
             "0x0000000000000000000000000000000000000000000000000000000000000088"
                 .parse()
                 .unwrap(),
@@ -380,7 +384,6 @@ mod tests {
 
         let result = process_get_trades_by_tx(
             &trades_ds,
-            None,
             "0x0000000000000000000000000000000000000000000000000000000000000088"
                 .parse()
                 .unwrap(),
@@ -408,7 +411,6 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
-            None,
             "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .parse()
                 .unwrap(),
@@ -426,7 +428,6 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
-            None,
             "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .parse()
                 .unwrap(),
@@ -444,7 +445,6 @@ mod tests {
         };
         let result = process_get_trades_by_tx(
             &trades_ds,
-            None,
             "0x0000000000000000000000000000000000000000000000000000000000000001"
                 .parse()
                 .unwrap(),

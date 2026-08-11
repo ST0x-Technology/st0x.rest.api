@@ -9,7 +9,7 @@ token `decimals` value to format them for display.
 ## List Vault Positions
 
 ```
-GET /v1/vaults
+GET /v2/vaults
 ```
 
 Returns deposit vault positions for a wallet address.
@@ -17,12 +17,13 @@ Returns deposit vault positions for a wallet address.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/vaults?owner=0xYourAddress&page=1&pageSize=100" \
+curl "https://api.st0x.io/v2/vaults?chainId=8453&owner=0xYourAddress&page=1&pageSize=100" \
   -H "Authorization: Basic <credentials>"
 ```
 
 | Parameter         | Type    | Default | Description                               |
 | ----------------- | ------- | ------- | ----------------------------------------- |
+| `chainId`         | number  | all     | Optional network chain ID filter          |
 | `owner`           | string  | -       | Wallet address that owns the vaults       |
 | `token`           | string  | -       | Optional token address filter             |
 | `hideZeroBalance` | boolean | `false` | Hide vaults whose current balance is zero |
@@ -35,6 +36,7 @@ curl "https://api.st0x.io/v1/vaults?owner=0xYourAddress&page=1&pageSize=100" \
 {
   "vaults": [
     {
+      "chainId": 8453,
       "id": "0x...",
       "vaultId": "123",
       "owner": "0xYourAddress",
@@ -66,7 +68,7 @@ use for transaction calldata.
 ## Vault Totals
 
 ```
-GET /v1/vaults/totals
+GET /v2/vaults/totals
 ```
 
 Returns non-zero deposit vault balances aggregated by token address.
@@ -74,7 +76,7 @@ Returns non-zero deposit vault balances aggregated by token address.
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/vaults/totals \
+curl "https://api.st0x.io/v2/vaults/totals?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -84,6 +86,7 @@ curl https://api.st0x.io/v1/vaults/totals \
 {
   "totals": [
     {
+      "chainId": 8453,
       "token": {
         "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
         "symbol": "USDC",

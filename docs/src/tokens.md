@@ -5,15 +5,16 @@ Discover available tokens before making swaps or deploying orders.
 ## List Tokens
 
 ```
-GET /v1/tokens
+GET /v2/tokens
 ```
 
-Returns all tokens supported on the Base network.
+Returns tokens from the networks configured in the active registry. Pass
+`chainId` to select one network; omit it to list every configured network.
 
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/tokens \
+curl "https://api.st0x.io/v2/tokens?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -69,7 +70,7 @@ curl https://api.st0x.io/v1/tokens \
 | Field        | Type           | Description                                  |
 | ------------ | -------------- | -------------------------------------------- |
 | `key`        | string         | Token key from the registry settings         |
-| `address`    | string         | Token contract address on Base               |
+| `address`    | string         | Token contract address on its network        |
 | `symbol`     | string         | Token ticker symbol                          |
 | `name`       | string         | Full token name                              |
 | `isin`       | string or null | ISIN identifier, when available              |
@@ -82,14 +83,16 @@ Use the `address` field when specifying tokens in swap and order requests.
 ## Wrapped Token Ratios
 
 ```
-GET /v1/tokens/wrap-ratio
-GET /v1/tokens/wrap-ratio/{address}
-GET /v1/tokens/wrap-ratio/{address}/history
+GET /v2/tokens/wrap-ratio
+GET /v2/tokens/wrap-ratio/{address}
+GET /v2/tokens/wrap-ratio/{address}/history
 ```
 
 Returns ERC4626 wrapped-token ratios for registry tokens where
 `extensions.category` is `ST0x`. For the single-token endpoint, `{address}` must
 be the wrapped token / ERC4626 vault address. Symbol lookup is not supported.
+The batch endpoint accepts optional `chainId`; address and history endpoints
+require `chainId` when more than one network is configured.
 
 ### Batch Response
 
@@ -100,6 +103,7 @@ The batch endpoint returns successful ratios in `data` and per-token failures in
 {
   "data": [
     {
+      "chainId": 8453,
       "shareAddress": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
       "assetAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
       "assetsPerShare": "1.0",
@@ -110,6 +114,7 @@ The batch endpoint returns successful ratios in `data` and per-token failures in
   ],
   "errors": [
     {
+      "chainId": 8453,
       "shareAddress": "0x1111111111111111111111111111111111111111",
       "message": "failed to read ERC4626 ratio"
     }
@@ -121,6 +126,7 @@ The batch endpoint returns successful ratios in `data` and per-token failures in
 
 | Field            | Type           | Description                                                                                           |
 | ---------------- | -------------- | ----------------------------------------------------------------------------------------------------- |
+| `chainId`        | number         | Network used for the ratio read                                                                       |
 | `shareAddress`   | string         | Wrapped wtStock / ERC4626 vault token address                                                         |
 | `assetAddress`   | string         | Unwrapped tStock asset address from `extensions.unwrappedAddress`, verified against ERC4626 `asset()` |
 | `assetsPerShare` | string         | Assets returned by `convertToAssets(1 * 10^shareDecimals)`                                            |
@@ -135,13 +141,15 @@ API database. It does not return donation or rebase events.
 
 Query parameters:
 
-| Field      | Type   | Default | Description                    |
-| ---------- | ------ | ------- | ------------------------------ |
-| `page`     | number | `1`     | 1-based page number            |
-| `pageSize` | number | `20`    | Rows per page, capped at `100` |
+| Field      | Type   | Default            | Description                                    |
+| ---------- | ------ | ------------------ | ---------------------------------------------- |
+| `page`     | number | `1`                | 1-based page number                            |
+| `pageSize` | number | `20`               | Rows per page, capped at `100`                 |
+| `chainId`  | number | configured network | Required when multiple networks are configured |
 
 ```json
 {
+  "chainId": 8453,
   "shareAddress": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
   "assetAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
   "events": [
@@ -166,15 +174,16 @@ Query parameters:
 ## Token Details
 
 ```
-GET /v1/tokens/details
-GET /v1/tokens/{address}/details
+GET /v2/tokens/details
+GET /v2/tokens/{address}/details
 ```
 
 Returns ST0x token supply, holder, transfer, and bridging activity data from the
 configured SFT subgraph. `{address}` can be the current wrapped token address,
 the token's `extensions.unwrappedAddress`, or its `extensions.legacyAddress`
 when one is present. The response always normalizes `address` to the current
-wrapped token address from the registry.
+wrapped token address from the registry. The list accepts optional `chainId`;
+the address endpoint requires it when the registry contains multiple networks.
 
 The batch endpoint returns successful rows in `data` and per-token failures in
 `errors`. One failed token does not fail the whole response.
@@ -185,6 +194,7 @@ The batch endpoint returns successful rows in `data` and per-token failures in
 {
   "data": [
     {
+      "chainId": 8453,
       "address": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
       "receiptContractAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
       "name": "Wrapped MicroStrategy Incorporated ST0x",
@@ -201,6 +211,7 @@ The batch endpoint returns successful rows in `data` and per-token failures in
   ],
   "errors": [
     {
+      "chainId": 8453,
       "address": "0x1111111111111111111111111111111111111111",
       "message": "SFT vault not found for token"
     }
@@ -212,6 +223,7 @@ The batch endpoint returns successful rows in `data` and per-token failures in
 
 ```json
 {
+  "chainId": 8453,
   "address": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
   "receiptContractAddress": "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe",
   "name": "Wrapped MicroStrategy Incorporated ST0x",
@@ -246,9 +258,10 @@ The batch endpoint returns successful rows in `data` and per-token failures in
 
 ### Query Parameters
 
-| Field           | Type   | Default | Description                                              |
-| --------------- | ------ | ------- | -------------------------------------------------------- |
-| `activityLimit` | number | `5`     | Recent deposit/withdraw rows per activity type, max `50` |
+| Field           | Type   | Default            | Description                                              |
+| --------------- | ------ | ------------------ | -------------------------------------------------------- |
+| `activityLimit` | number | `5`                | Recent deposit/withdraw rows per activity type, max `50` |
+| `chainId`       | number | configured network | Required when multiple networks are configured           |
 
 ### Fields
 
@@ -264,19 +277,21 @@ The batch endpoint returns successful rows in `data` and per-token failures in
 | `activity`       | object | Recent deposit and withdraw rows only; transfer rows are not returned |
 
 Aggregate counts and volumes come from the configured SFT subgraph and are
-cached for 5 minutes. The batch `/v1/tokens/details` response is also cached for
+cached for 5 minutes. The batch `/v2/tokens/details` response is also cached for
 5 minutes for landing/sidebar usage. Full holder lists are not returned.
 
 ## Token Proofs
 
 ```
-GET /v1/tokens/{address}/proofs
+GET /v2/tokens/{address}/proofs
 ```
 
 Returns the raw proof data for a supported ST0x token. `{address}` can be the
 current wrapped token address, the token's `extensions.unwrappedAddress`, or its
 `extensions.legacyAddress` when one is present. The response always normalizes
-`address` to the current wrapped token address from the registry.
+`address` to the current wrapped token address from the registry. Pass `chainId`
+to select the token network; it is required when multiple networks are
+configured.
 
 The API returns raw hex strings from the configured subgraphs. It does not strip
 Rain metadata prefixes, decode CBOR, or parse schema hashes.
@@ -284,7 +299,7 @@ Rain metadata prefixes, decode CBOR, or parse schema hashes.
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/tokens/0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2/proofs \
+curl "https://api.st0x.io/v2/tokens/0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2/proofs?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -292,6 +307,7 @@ curl https://api.st0x.io/v1/tokens/0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2/pr
 
 ```json
 {
+  "chainId": 8453,
   "address": "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2",
   "metadata": [
     {

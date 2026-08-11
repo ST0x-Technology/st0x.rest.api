@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/taker/{address}",
+    path = "/v2/trades/taker/{address}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
@@ -46,19 +46,18 @@ pub async fn get_trades_by_taker(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
-        let client = {
+        let (client, chain_ids) = {
             let raindex = shared_raindex.read().await;
             let chain_ids =
                 crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
             (raindex.client().clone(), chain_ids)
         };
-        let (client, chain_ids) = client;
         if !app_state.response_caches.is_enabled() {
             let ds = RaindexTradesDataSource {
                 client: &client,
                 pool: pool.inner(),
             };
-            return process_get_trades_by_taker(&ds, chain_ids, addr, params).await;
+            return process_get_trades_by_taker_for_chains(&ds, chain_ids, addr, params).await;
         }
 
         let cache_key = super::get_by_token::trades_cache_key("trades/taker", addr, &params);
@@ -70,7 +69,7 @@ pub async fn get_trades_by_taker(
                     client: &client,
                     pool: pool.inner(),
                 };
-                process_get_trades_by_taker(&ds, chain_ids, addr, params)
+                process_get_trades_by_taker_for_chains(&ds, chain_ids, addr, params)
                     .await
                     .map(Json::into_inner)
             })
@@ -82,7 +81,16 @@ pub async fn get_trades_by_taker(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn process_get_trades_by_taker(
+    ds: &dyn TradesDataSource,
+    taker: Address,
+    params: TradesPaginationParams,
+) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    process_get_trades_by_taker_for_chains(ds, None, taker, params).await
+}
+
+async fn process_get_trades_by_taker_for_chains(
     ds: &dyn TradesDataSource,
     chain_ids: Option<Vec<u32>>,
     taker: Address,
@@ -93,7 +101,7 @@ pub(super) async fn process_get_trades_by_taker(
 
     tracing::info!(taker = ?taker, page, page_size, "querying trades by taker");
     let result = ds
-        .get_trades_for_taker(chain_ids, taker, sdk_page, sdk_page_size, time_filter)
+        .get_trades_for_taker_on_chains(chain_ids, taker, sdk_page, sdk_page_size, time_filter)
         .await?;
 
     build_trades_list_response(ds, result, page, page_size, denomination).await
@@ -116,7 +124,6 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct CapturedTakerQuery {
-        chain_ids: Option<Vec<u32>>,
         taker: Address,
         page: u16,
         page_size: u16,
@@ -132,7 +139,6 @@ mod tests {
     impl TradesDataSource for MockTradesDataSource {
         async fn get_trades_by_tx(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _tx_hash: B256,
         ) -> Result<RaindexTradesListResult, ApiError> {
             unimplemented!()
@@ -140,7 +146,6 @@ mod tests {
 
         async fn get_trades_for_owner(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _owner: Address,
             _pagination: PaginationParams,
             _time_filter: TimeFilter,
@@ -150,7 +155,6 @@ mod tests {
 
         async fn get_trades_for_token(
             &self,
-            _chain_ids: Option<Vec<u32>>,
             _token: Address,
             _page: u16,
             _page_size: u16,
@@ -161,14 +165,12 @@ mod tests {
 
         async fn get_trades_for_taker(
             &self,
-            chain_ids: Option<Vec<u32>>,
             taker: Address,
             page: u16,
             page_size: u16,
             time_filter: TimeFilter,
         ) -> Result<RaindexTradesListResult, ApiError> {
             *self.captured.lock().unwrap() = Some(CapturedTakerQuery {
-                chain_ids,
                 taker,
                 page,
                 page_size,
@@ -178,18 +180,6 @@ mod tests {
                 Ok(r) => Ok(r.clone()),
                 Err(e) => Err(e.clone()),
             }
-        }
-
-        async fn get_trades_by_order_hashes(
-            &self,
-            _chain_ids: Option<Vec<u32>>,
-            _order_hashes: Vec<B256>,
-            _time_filter: TimeFilter,
-        ) -> Result<
-            rain_orderbook_common::raindex_client::trades::RaindexTradesByOrderHashResult,
-            ApiError,
-        > {
-            unimplemented!()
         }
     }
 
@@ -209,7 +199,7 @@ mod tests {
             end_time: Some(1700002000),
             denomination: None,
         };
-        let result = process_get_trades_by_taker(&ds, Some(vec![8453]), taker, params)
+        let result = process_get_trades_by_taker(&ds, taker, params)
             .await
             .unwrap();
 
@@ -230,7 +220,6 @@ mod tests {
         assert_eq!(t.output_token.symbol, "WETH");
 
         let captured = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(captured.chain_ids, Some(vec![8453]));
         assert_eq!(captured.taker, taker);
         assert_eq!(captured.page, 2);
         assert_eq!(captured.page_size, 10);
@@ -254,7 +243,6 @@ mod tests {
         };
         let result = process_get_trades_by_taker(
             &ds,
-            None,
             address!("cccccccccccccccccccccccccccccccccccccccc"),
             params,
         )
@@ -284,7 +272,6 @@ mod tests {
         };
         let result = process_get_trades_by_taker(
             &ds,
-            None,
             address!("cccccccccccccccccccccccccccccccccccccccc"),
             params,
         )

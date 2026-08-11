@@ -3,8 +3,8 @@ use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::vaults::{
     VaultOrderRef, VaultPositionResponse, VaultTokenResponse, VaultTotalResponse,
-    VaultTotalTokenResponse, VaultTotalsResponse, VaultsPagination, VaultsQueryParams,
-    VaultsResponse,
+    VaultTotalTokenResponse, VaultTotalsQueryParams, VaultTotalsResponse, VaultsPagination,
+    VaultsQueryParams, VaultsResponse,
 };
 use alloy::primitives::{Address, FixedBytes, U256};
 use async_trait::async_trait;
@@ -305,7 +305,7 @@ pub(crate) async fn process_get_vault_totals(
 
 #[utoipa::path(
     get,
-    path = "/v1/vaults",
+    path = "/v2/vaults",
     tag = "Vaults",
     security(("basicAuth" = [])),
     params(VaultsQueryParams),
@@ -352,9 +352,10 @@ pub async fn get_vaults(
 
 #[utoipa::path(
     get,
-    path = "/v1/vaults/totals",
+    path = "/v2/vaults/totals",
     tag = "Vaults",
     security(("basicAuth" = [])),
+    params(VaultTotalsQueryParams),
     responses(
         (status = 200, description = "Aggregated non-zero vault balances by token", body = VaultTotalsResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
@@ -362,17 +363,19 @@ pub async fn get_vaults(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/totals")]
+#[get("/totals?<params..>")]
 pub async fn get_vault_totals(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
+    params: VaultTotalsQueryParams,
 ) -> Result<Json<VaultTotalsResponse>, ApiError> {
     async move {
         tracing::info!("request received");
         let raindex = shared_raindex.read().await;
-        let chain_ids = None;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
         let ds = RaindexVaultsDataSource {
             client: raindex.client(),
         };

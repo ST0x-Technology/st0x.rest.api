@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::ops::{Div, Mul};
 
 pub(crate) struct CalldataRequestNormalization {
+    pub chain_id: u32,
     pub denomination: SwapDenomination,
     pub input_token: Address,
     pub output_token: Address,
@@ -19,8 +20,19 @@ pub(crate) struct CalldataRequestNormalization {
     pub price_cap_field: &'static str,
 }
 
+pub(crate) struct CalldataAmountNormalization {
+    pub chain_id: u32,
+    pub denomination: SwapDenomination,
+    pub input_token: Address,
+    pub output_token: Address,
+    pub mode: TakeOrdersMode,
+    pub amount: String,
+    pub amount_field: &'static str,
+}
+
 pub(crate) async fn normalize_quote_amounts(
     ds: &dyn SwapDataSource,
+    chain_id: u32,
     denomination: SwapDenomination,
     input_token: Address,
     output_token: Address,
@@ -32,7 +44,7 @@ pub(crate) async fn normalize_quote_amounts(
         SwapDenomination::Unwrapped => {
             tracing::info!("normalizing swap quote response to unwrapped denomination");
             let ratios = ds
-                .get_wrap_ratios_for_tokens(&[input_token, output_token])
+                .get_wrap_ratios_for_tokens_on_chain(chain_id, &[input_token, output_token])
                 .await?;
 
             let converted_input =
@@ -49,56 +61,113 @@ pub(crate) async fn normalize_calldata_request_values(
     ds: &dyn SwapDataSource,
     req: CalldataRequestNormalization,
 ) -> Result<(String, String, HashMap<Address, WrapRatioValue>), ApiError> {
-    match req.denomination {
-        SwapDenomination::Wrapped => Ok((req.amount, req.price_cap, HashMap::new())),
-        SwapDenomination::Unwrapped => {
-            tracing::info!("normalizing swap calldata request to wrapped denomination");
-            let ratios = ds
-                .get_wrap_ratios_for_tokens(&[req.input_token, req.output_token])
-                .await?;
-            let input_is_wrapped = ratios.contains_key(&req.input_token);
-            let output_is_wrapped = ratios.contains_key(&req.output_token);
+    let denomination = req.denomination;
+    let input_token = req.input_token;
+    let output_token = req.output_token;
+    let price_cap = req.price_cap;
+    let price_cap_field = req.price_cap_field;
+    let (amount, ratios) = normalize_calldata_request_amount(
+        ds,
+        CalldataAmountNormalization {
+            chain_id: req.chain_id,
+            denomination,
+            input_token,
+            output_token,
+            mode: req.mode,
+            amount: req.amount,
+            amount_field: req.amount_field,
+        },
+    )
+    .await?;
+    let price_cap = normalize_calldata_price_cap(
+        price_cap,
+        price_cap_field,
+        denomination,
+        input_token,
+        output_token,
+        &ratios,
+    )?;
+    Ok((amount, price_cap, ratios))
+}
 
-            if !input_is_wrapped && !output_is_wrapped {
-                return Ok((req.amount, req.price_cap, ratios));
-            }
-
-            let input_assets_per_share = ratio_for_token(req.input_token, &ratios)?;
-            let output_assets_per_share = ratio_for_token(req.output_token, &ratios)?;
-
-            let price_cap = parse_user_float(req.price_cap, req.price_cap_field)?;
-
-            let normalized_amount = if amount_needs_wrapped_normalization(
-                req.mode,
-                input_is_wrapped,
-                output_is_wrapped,
-            ) {
-                let amount = parse_user_float(req.amount, req.amount_field)?;
-                let ratio = amount_ratio(req.mode, input_assets_per_share, output_assets_per_share);
-                let wrapped_amount = amount.div(ratio).map_err(|e| {
-                    tracing::error!(error = %e, "failed to normalize calldata amount");
-                    ApiError::Internal("failed to normalize amount".into())
-                })?;
-                format_float(wrapped_amount, "amount")?
-            } else {
-                req.amount
-            };
-
-            let normalized_io_ratio = price_cap
-                .mul(output_assets_per_share)
-                .and_then(|ratio| ratio.div(input_assets_per_share))
-                .map_err(|e| {
-                    tracing::error!(error = %e, "failed to normalize calldata IO ratio");
-                    ApiError::Internal("failed to normalize IO ratio".into())
-                })?;
-
-            Ok((
-                normalized_amount,
-                format_float(normalized_io_ratio, "IO ratio")?,
-                ratios,
-            ))
-        }
+pub(crate) async fn normalize_calldata_request_amount(
+    ds: &dyn SwapDataSource,
+    req: CalldataAmountNormalization,
+) -> Result<(String, HashMap<Address, WrapRatioValue>), ApiError> {
+    if req.denomination == SwapDenomination::Wrapped {
+        return Ok((req.amount, HashMap::new()));
     }
+
+    tracing::info!("normalizing swap calldata request to wrapped denomination");
+    let ratios = ds
+        .get_wrap_ratios_for_tokens_on_chain(req.chain_id, &[req.input_token, req.output_token])
+        .await?;
+    let input_is_wrapped = ratios.contains_key(&req.input_token);
+    let output_is_wrapped = ratios.contains_key(&req.output_token);
+
+    if !amount_needs_wrapped_normalization(req.mode, input_is_wrapped, output_is_wrapped) {
+        return Ok((req.amount, ratios));
+    }
+
+    let input_assets_per_share = ratio_for_token(req.input_token, &ratios)?;
+    let output_assets_per_share = ratio_for_token(req.output_token, &ratios)?;
+    let amount = parse_user_float(req.amount, req.amount_field)?;
+    let ratio = amount_ratio(req.mode, input_assets_per_share, output_assets_per_share);
+    let wrapped_amount = amount.div(ratio).map_err(|e| {
+        tracing::error!(error = %e, "failed to normalize calldata amount");
+        ApiError::Internal("failed to normalize amount".into())
+    })?;
+    Ok((format_float(wrapped_amount, "amount")?, ratios))
+}
+
+pub(crate) fn normalize_calldata_price_cap(
+    price_cap: String,
+    price_cap_field: &'static str,
+    denomination: SwapDenomination,
+    input_token: Address,
+    output_token: Address,
+    ratios: &HashMap<Address, WrapRatioValue>,
+) -> Result<String, ApiError> {
+    if denomination == SwapDenomination::Wrapped
+        || (!ratios.contains_key(&input_token) && !ratios.contains_key(&output_token))
+    {
+        return Ok(price_cap);
+    }
+
+    let input_assets_per_share = ratio_for_token(input_token, ratios)?;
+    let output_assets_per_share = ratio_for_token(output_token, ratios)?;
+    let price_cap = parse_user_float(price_cap, price_cap_field)?;
+    let normalized_io_ratio = price_cap
+        .mul(output_assets_per_share)
+        .and_then(|ratio| ratio.div(input_assets_per_share))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to normalize calldata IO ratio");
+            ApiError::Internal("failed to normalize IO ratio".into())
+        })?;
+    format_float(normalized_io_ratio, "IO ratio")
+}
+
+pub(crate) fn denormalize_calldata_price_cap(
+    price_cap: Float,
+    denomination: SwapDenomination,
+    input_token: Address,
+    output_token: Address,
+    ratios: &HashMap<Address, WrapRatioValue>,
+) -> Result<String, ApiError> {
+    if denomination == SwapDenomination::Wrapped {
+        return format_float(price_cap, "IO ratio");
+    }
+
+    let input_assets_per_share = ratio_for_token(input_token, ratios)?;
+    let output_assets_per_share = ratio_for_token(output_token, ratios)?;
+    let unwrapped_io_ratio = price_cap
+        .mul(input_assets_per_share)
+        .and_then(|ratio| ratio.div(output_assets_per_share))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to denormalize calldata IO ratio");
+            ApiError::Internal("failed to denormalize IO ratio".into())
+        })?;
+    format_float(unwrapped_io_ratio, "IO ratio")
 }
 
 fn amount_needs_wrapped_normalization(

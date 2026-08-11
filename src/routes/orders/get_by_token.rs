@@ -6,7 +6,7 @@ use super::{
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::{Denomination, ValidatedAddress};
 use crate::types::orders::{OrderSide, OrderState, OrdersByTokenParams, OrdersListResponse};
@@ -17,8 +17,31 @@ use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn process_get_orders_by_token(
+    ds: &dyn OrdersListDataSource,
+    address: Address,
+    state: Option<OrderState>,
+    side: Option<OrderSide>,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    denomination: Denomination,
+) -> Result<OrdersListResponse, ApiError> {
+    process_get_orders_by_token_for_chains(
+        ds,
+        None,
+        address,
+        state,
+        side,
+        page,
+        page_size,
+        denomination,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_get_orders_by_token_for_chains(
     ds: &dyn OrdersListDataSource,
     chain_ids: Option<Vec<u32>>,
     address: Address,
@@ -62,7 +85,14 @@ pub(crate) async fn process_get_orders_by_token(
             Some(page_num),
             Some(effective_page_size),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, code = %ApiErrorCode::OrdersQueryFailed, "orders-by-token query failed");
+            ApiError::coded(
+                ApiErrorCode::OrdersQueryFailed,
+                "the order source could not serve this request",
+            )
+        })?;
 
     tracing::info!(
         quoted_orders = orders.len(),
@@ -84,7 +114,7 @@ pub(crate) async fn process_get_orders_by_token(
 
 #[utoipa::path(
     get,
-    path = "/v1/orders/token/{address}",
+    path = "/v2/orders/token/{address}",
     tag = "Orders",
     security(("basicAuth" = [])),
     params(
@@ -98,6 +128,7 @@ pub(crate) async fn process_get_orders_by_token(
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -132,7 +163,7 @@ pub async fn get_orders_by_token(
                 caches: &app_state.response_caches,
                 pool: pool.inner(),
             };
-            let response = process_get_orders_by_token(
+            let response = process_get_orders_by_token_for_chains(
                 &ds,
                 chain_ids,
                 addr,
@@ -164,7 +195,7 @@ pub async fn get_orders_by_token(
                     caches: &app_state.response_caches,
                     pool: pool.inner(),
                 };
-                process_get_orders_by_token(
+                process_get_orders_by_token_for_chains(
                     &ds,
                     chain_ids,
                     addr,
@@ -207,14 +238,16 @@ fn orders_by_token_cache_key(
     let page_size = page_size
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
-    let chain_key = match chain_ids {
-        Some(chain_ids) if !chain_ids.is_empty() => chain_ids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-        _ => "all".to_string(),
-    };
+    let chain_key = chain_ids.map_or_else(
+        || "all".to_string(),
+        |chain_ids| {
+            chain_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
     format!(
         "orders/token/{chain_key}/{}/{state}/{side}/{page}/{page_size}/{denomination:?}",
         address.to_string().to_ascii_lowercase()
@@ -244,18 +277,10 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(
-            &ds,
-            None,
-            addr,
-            None,
-            None,
-            None,
-            None,
-            Denomination::Wrapped,
-        )
-        .await
-        .unwrap();
+        let result =
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "USDC");
@@ -284,7 +309,6 @@ mod tests {
             .unwrap();
         let result = process_get_orders_by_token(
             &ds,
-            None,
             addr,
             None,
             Some(OrderSide::Input),
@@ -310,18 +334,10 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(
-            &ds,
-            None,
-            addr,
-            None,
-            None,
-            None,
-            None,
-            Denomination::Wrapped,
-        )
-        .await
-        .unwrap();
+        let result =
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert_eq!(result.orders[0].io_ratio, "-");
         assert_eq!(result.orders[0].max_output, None);
@@ -337,18 +353,16 @@ mod tests {
         let addr: Address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(
-            &ds,
-            None,
-            addr,
-            None,
-            None,
-            None,
-            None,
-            Denomination::Wrapped,
-        )
-        .await;
-        assert!(matches!(result, Err(ApiError::Internal(_))));
+        let result =
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
+                .await;
+        assert!(matches!(
+            result,
+            Err(ApiError::Coded {
+                code: ApiErrorCode::OrdersQueryFailed,
+                ..
+            })
+        ));
     }
 
     #[rocket::async_test]
@@ -361,18 +375,10 @@ mod tests {
         let addr: Address = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
             .parse()
             .unwrap();
-        let result = process_get_orders_by_token(
-            &ds,
-            None,
-            addr,
-            None,
-            None,
-            None,
-            None,
-            Denomination::Wrapped,
-        )
-        .await
-        .unwrap();
+        let result =
+            process_get_orders_by_token(&ds, addr, None, None, None, None, Denomination::Wrapped)
+                .await
+                .unwrap();
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].input_token.symbol, "wtMSTR");
@@ -389,7 +395,6 @@ mod tests {
 
         let result = process_get_orders_by_token(
             &ds,
-            None,
             addr,
             Some(OrderState::Inactive),
             None,
@@ -415,7 +420,6 @@ mod tests {
 
         let result = process_get_orders_by_token(
             &ds,
-            None,
             addr,
             Some(OrderState::All),
             None,
@@ -493,18 +497,6 @@ mod tests {
                 None,
                 lower,
                 Some(OrderState::All),
-                None,
-                None,
-                None,
-                Denomination::Wrapped
-            )
-        );
-        assert_ne!(
-            orders_by_token_cache_key(None, lower, None, None, None, None, Denomination::Wrapped),
-            orders_by_token_cache_key(
-                Some(&[8453]),
-                lower,
-                None,
                 None,
                 None,
                 None,

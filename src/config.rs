@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::path::Path;
+use url::Url;
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -8,6 +9,8 @@ pub struct Config {
     pub database_max_connections: u32,
     pub usage_log_max_concurrency: usize,
     pub response_cache_max_entries: u64,
+    #[serde(default)]
+    pub response_cache_max_trade_rows: Option<u64>,
     pub response_cache_ttl_seconds: u64,
     pub registry_url: String,
     pub private_registry_path: String,
@@ -16,6 +19,41 @@ pub struct Config {
     pub rate_limit_per_key_rpm: u64,
     pub docs_dir: String,
     pub local_db_path: String,
+    pub price_sampler_enabled: bool,
+    pub price_sample_interval_seconds: u64,
+    pub price_history_retention_seconds: u64,
+    #[serde(default)]
+    pub attribution_start_block: Option<u64>,
+    #[serde(default = "default_attribution_sync_interval_seconds")]
+    pub attribution_sync_interval_seconds: u64,
+    #[serde(default = "default_attribution_sync_batch_size")]
+    pub attribution_sync_batch_size: u32,
+    /// OTLP export target. Absent ⇒ console + file logging only (no push to the
+    /// observability stack). Non-secret plaintext (tailnet endpoints).
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// Where to push OTLP logs/traces, and how signals are labelled. Endpoints are
+/// the VictoriaLogs (`:9428`) / VictoriaTraces (`:10428`) ingest URLs, reached
+/// over the tailnet (e.g. `http://rain-management-observability.taile5cf8a.ts.net:9428`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    pub service_name: String,
+    /// `production`, `staging`, … exported as the `deployment.environment`
+    /// resource attribute so environments are distinguishable downstream.
+    pub environment: String,
+    pub traces_endpoint: Url,
+    pub logs_endpoint: Url,
+}
+
+fn default_attribution_sync_interval_seconds() -> u64 {
+    60
+}
+
+fn default_attribution_sync_batch_size() -> u32 {
+    250
 }
 
 impl Config {

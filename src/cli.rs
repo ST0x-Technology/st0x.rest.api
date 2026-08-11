@@ -88,7 +88,11 @@ async fn create_key(
     let secret_hash =
         auth::hash_secret(&secret).map_err(|e| format!("failed to hash secret: {e}"))?;
 
-    sqlx::query(
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|e| format!("failed to begin API key transaction: {e}"))?;
+    let insert = sqlx::query(
         "INSERT INTO api_keys (key_id, secret_hash, label, owner, is_admin) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&key_id)
@@ -96,9 +100,22 @@ async fn create_key(
     .bind(label)
     .bind(owner)
     .bind(admin)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|e| format!("failed to insert API key: {e}"))?;
+    crate::db::attribution::snapshot_api_key(
+        &mut transaction,
+        insert.last_insert_rowid(),
+        &key_id,
+        label,
+        owner,
+    )
+    .await
+    .map_err(|e| format!("failed to snapshot API key attribution identity: {e}"))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|e| format!("failed to commit API key transaction: {e}"))?;
 
     tracing::info!(key_id = %key_id, label = %label, owner = %owner, admin = %admin, "API key created");
 
@@ -172,15 +189,34 @@ async fn revoke_key(pool: &DbPool, key_id: &str) -> Result<(), Box<dyn std::erro
 }
 
 async fn delete_key(pool: &DbPool, key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|e| format!("failed to begin API key deletion: {e}"))?;
+    let identity: Option<(i64, String, String)> =
+        sqlx::query_as("SELECT id, label, owner FROM api_keys WHERE key_id = ?")
+            .bind(key_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|e| format!("failed to query API key before deletion: {e}"))?;
+    if let Some((id, label, owner)) = identity {
+        crate::db::attribution::snapshot_api_key(&mut transaction, id, key_id, &label, &owner)
+            .await
+            .map_err(|e| format!("failed to preserve API key attribution identity: {e}"))?;
+    }
     let result = sqlx::query("DELETE FROM api_keys WHERE key_id = ?")
         .bind(key_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|e| format!("failed to delete API key: {e}"))?;
 
     if result.rows_affected() == 0 {
         return Err(format!("API key {key_id} not found").into());
     }
+    transaction
+        .commit()
+        .await
+        .map_err(|e| format!("failed to commit API key deletion: {e}"))?;
 
     tracing::info!(key_id = %key_id, "API key deleted");
     println!("API key {key_id} deleted successfully");
@@ -265,6 +301,12 @@ mod tests {
         assert!(row.active);
         assert!(!row.is_admin);
         assert!(PasswordHash::new(&row.secret_hash).is_ok());
+        let snapshotted_key_id: String =
+            sqlx::query_scalar("SELECT api_key_id FROM attribution_api_keys")
+                .fetch_one(&pool)
+                .await
+                .expect("attribution identity");
+        assert_eq!(snapshotted_key_id, row.key_id);
     }
 
     #[tokio::test]
@@ -339,6 +381,13 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0);
+        let preserved: String =
+            sqlx::query_scalar("SELECT api_key_id FROM attribution_api_keys WHERE api_key_id = ?")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("preserved attribution identity");
+        assert_eq!(preserved, key_id);
     }
 
     #[tokio::test]
