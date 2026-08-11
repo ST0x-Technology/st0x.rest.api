@@ -2,6 +2,10 @@
 
 REST API for st0x orderbook operations. Built with Rocket, backed by SQLite, and authenticated via API keys using HTTP Basic auth.
 
+## Prerequisites
+
+- [Nix](https://nixos.org/download/) with flakes enabled
+
 ## Setup
 
 ### 1. Clone and initialize submodules
@@ -18,92 +22,89 @@ git submodule update --init --recursive
 nix develop -c bash prep.sh
 ```
 
-This writes `COMMIT_SHA` to `.env` and bootstraps the orderbook submodule.
+This initializes submodules, runs the orderbook prep script, and builds the local mdBook into `docs/book` for the `/docs` route. Run it before the first `serve`.
 
-## Usage
+### 3. Configure
 
-The binary has two subcommands:
+The config file is at `config/dev.toml`. The only value that may need updating is `registry_url` — it points to a pinned GitHub raw URL so it should work out of the box.
 
-```
-st0x_rest_api serve     Start the API server
-st0x_rest_api keys      Manage API keys
-```
-
-### Starting the server
+If it's stale, grab the latest from production:
 
 ```sh
-nix develop -c cargo run serve
+curl -u "KEY_ID:SECRET" https://<SERVER_IP>/registry -k
 ```
 
-The server starts on `http://localhost:8000` by default. Swagger UI is available at `/swagger`.
+and update `registry_url` in `config/dev.toml`.
 
-### API key management
-
-All API routes (except `/health`) require HTTP Basic authentication. Use the `keys` subcommand to manage credentials.
-
-#### Create a key
+### 4. Create an API key
 
 ```sh
-nix develop -c cargo run keys create --label "partner-x" --owner "contact@example.com"
+nix develop -c cargo run -- keys --config config/dev.toml create \
+  --label "dev-key" \
+  --owner "you@example.com"
 ```
 
-Output:
+This prints a **Key ID** (UUID) and **Secret** (base64 string). Save both — the secret is hashed with Argon2 and cannot be recovered.
 
-```
-API key created successfully
-
-Key ID:  <uuid>
-Secret:  <base64-encoded-secret>
-Label:   partner-x
-Owner:   contact@example.com
-
-IMPORTANT: Store the secret securely. It will not be shown again.
-```
-
-The secret is hashed with Argon2 before storage. There is no way to recover it.
-
-#### List keys
+### 5. Set log level (optional)
 
 ```sh
-nix develop -c cargo run keys list
+export RUST_LOG=st0x_rest_api=info,rocket=warn,warn
 ```
 
-Shows all keys with their ID, label, owner, active status, and timestamps.
-
-#### Revoke a key
+### 6. Start the server
 
 ```sh
-nix develop -c cargo run keys revoke <KEY_ID>
+COMMIT_SHA=$(git rev-parse HEAD) nix develop -c cargo run -- serve --config config/dev.toml
 ```
 
-Sets the key to inactive. Revoked keys are rejected at authentication.
+Server runs on `http://127.0.0.1:8000`. Swagger UI is available at `/swagger`, and the mdBook docs are served at `/docs`.
 
-#### Delete a key
+The database (`data/st0x.db`) is created and migrated automatically on first run — no manual DB setup needed.
+
+### 7. Test it
 
 ```sh
-nix develop -c cargo run keys delete <KEY_ID>
+curl -u "KEY_ID:SECRET" http://localhost:8000/v1/tokens
 ```
 
-Permanently removes the key from the database.
+API routes require HTTP Basic Auth with the key ID and secret. `/health`, `/docs`, `/swagger`, and `/api-doc/openapi.json` are public.
 
-### Authenticating API requests
+## API Key Management
+
+Use the `keys` subcommand to manage credentials. All commands require `--config` to point at the config file.
+
+```sh
+# List keys
+nix develop -c cargo run -- keys --config config/dev.toml list
+
+# Revoke a key (sets it to inactive, rejected at auth)
+nix develop -c cargo run -- keys --config config/dev.toml revoke <KEY_ID>
+
+# Delete a key (permanent removal)
+nix develop -c cargo run -- keys --config config/dev.toml delete <KEY_ID>
+```
+
+## Authenticating API Requests
 
 Use HTTP Basic auth with the key ID as the username and the secret as the password:
 
 ```sh
-curl -u "<KEY_ID>:<SECRET>" http://localhost:8000/v1/tokens
+curl -u "KEY_ID:SECRET" http://localhost:8000/v1/tokens
 ```
 
 Or with an explicit header:
 
 ```sh
-curl -H "Authorization: Basic $(echo -n '<KEY_ID>:<SECRET>' | base64)" http://localhost:8000/v1/tokens
+curl -H "Authorization: Basic $(echo -n 'KEY_ID:SECRET' | base64)" http://localhost:8000/v1/tokens
 ```
 
 ## Development
 
 ```sh
-nix develop -c cargo fmt
-nix develop -c rainix-rs-static
-nix develop -c cargo test
+nix develop -c cargo fmt          # format
+nix develop -c rainix-rs-static   # lint
+nix develop -c cargo test         # test
 ```
+
+Always run the formatter and linter before committing.
