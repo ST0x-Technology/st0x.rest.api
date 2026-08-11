@@ -1252,20 +1252,42 @@ mod tests {
 
     #[rocket::async_test]
     async fn test_process_swap_calldata_v2_spend_up_to_preserves_request() {
-        let (ds, captured_request) = capture_ds(ready_response(), HashMap::new());
-        let result = process_swap_calldata_v2(
-            &ds,
-            calldata_v2_request(SwapCalldataMode::SpendUpTo, "75", "3"),
-        )
-        .await
-        .unwrap();
+        // Exact request and surviving-leg input from production block 49,797,519.
+        let executable_input =
+            "0.04310434222334697689407343024988324343123847171843280166595003948319";
+        let response = SwapCalldataResponse {
+            estimated_input: executable_input.to_string(),
+            ..ready_response()
+        };
+        let (ds, captured_request) = capture_ds(response, HashMap::new());
+        let mut incident_request = calldata_v2_request(
+            SwapCalldataMode::SpendUpTo,
+            "0.05",
+            "0.010507140312878644839541586318708372026337414326508889434455784294694",
+        );
+        incident_request.taker = address!("D2843D9E7738d46D90CB6Dff8D6C83db58B9c165");
+        incident_request.input_token = WT_MSTR;
+        incident_request.output_token = USDC;
+        let result = process_swap_calldata_v2(&ds, incident_request)
+            .await
+            .unwrap();
         let request = captured_take_orders_request(&captured_request);
 
+        assert_eq!(request.taker, "0xD2843D9E7738d46D90CB6Dff8D6C83db58B9c165");
+        assert_eq!(request.sell_token, WT_MSTR.to_string());
+        assert_eq!(request.buy_token, USDC.to_string());
         assert_eq!(request.mode, TakeOrdersMode::SpendUpTo);
-        assert_eq!(request.amount, "75");
-        assert_eq!(request.price_cap, "3");
+        assert_eq!(request.amount, "0.05");
+        assert_eq!(
+            request.price_cap,
+            "0.010507140312878644839541586318708372026337414326508889434455784294694"
+        );
+        assert_eq!(result.calldata.estimated_input, executable_input);
         assert_eq!(result.calldata.denomination, SwapDenomination::Wrapped);
-        assert_eq!(result.resolved_price_cap, "3");
+        assert_eq!(
+            result.resolved_price_cap,
+            "0.010507140312878644839541586318708372026337414326508889434455784294694"
+        );
     }
 
     #[rocket::async_test]

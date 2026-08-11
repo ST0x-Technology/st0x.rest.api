@@ -112,7 +112,7 @@ pub(crate) fn select_best_raindex_simulation(
         let replace = match &best {
             None => true,
             Some((best_raindex, best_simulation)) => {
-                is_better_simulation(raindex, &simulation, *best_raindex, best_simulation)?
+                is_better_simulation(mode, raindex, &simulation, *best_raindex, best_simulation)?
             }
         };
         if replace {
@@ -127,11 +127,27 @@ pub(crate) fn select_best_raindex_simulation(
 }
 
 fn is_better_simulation(
+    mode: ParsedTakeOrdersMode,
     raindex: Address,
     simulation: &SimulationResult,
     best_raindex: Address,
     best_simulation: &SimulationResult,
 ) -> Result<bool, ApiError> {
+    let primary = selection_primary(simulation, mode);
+    let best_primary = selection_primary(best_simulation, mode);
+    if primary
+        .gt(best_primary)
+        .map_err(map_float_comparison_error)?
+    {
+        return Ok(true);
+    }
+    if !primary
+        .eq(best_primary)
+        .map_err(map_float_comparison_error)?
+    {
+        return Ok(false);
+    }
+
     if simulation
         .total_output
         .gt(best_simulation.total_output)
@@ -158,6 +174,14 @@ fn is_better_simulation(
             }
         }
         _ => Ok(raindex < best_raindex),
+    }
+}
+
+fn selection_primary(simulation: &SimulationResult, mode: ParsedTakeOrdersMode) -> Float {
+    if mode.is_exact_mode() && !mode.is_buy_mode() {
+        simulation.total_input
+    } else {
+        simulation.total_output
     }
 }
 
@@ -244,6 +268,38 @@ mod tests {
             vec![candidate(1, "5", "1"), candidate(1, "5", "2")],
             TakeOrdersMode::SpendExact,
             "8",
+            100,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cap.format().unwrap(), "2.02");
+    }
+
+    #[test]
+    fn spend_exact_prefers_the_raindex_that_fills_the_input_target() {
+        let cap = resolve_slippage_price_cap(
+            vec![candidate(1, "5", "0.5"), candidate(2, "10", "2")],
+            TakeOrdersMode::SpendExact,
+            "10",
+            100,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cap.format().unwrap(), "2.02");
+    }
+
+    #[test]
+    fn spend_exact_breaks_equal_input_ties_with_higher_output() {
+        let cap = resolve_slippage_price_cap(
+            vec![
+                candidate(1, "10", "1"),
+                candidate(2, "10", "0.5"),
+                candidate(2, "2.5", "2"),
+            ],
+            TakeOrdersMode::SpendExact,
+            "10",
             100,
             None,
         )

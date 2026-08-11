@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use rain_orderbook_common::raindex_client::orders::{
     GetOrdersFilters, GetOrdersTokenFilter, RaindexOrder,
 };
-use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
+use rain_orderbook_common::raindex_client::take_orders::{TakeOrdersInfo, TakeOrdersRequest};
 use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rain_orderbook_common::raindex_client::RaindexError;
@@ -277,21 +277,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 }],
             })
         } else if let Some(take_orders_info) = result.take_orders_info() {
-            let expected_sell = take_orders_info.expected_sell().format().map_err(|e| {
-                tracing::error!(error = %e, "failed to format expected sell");
-                ApiError::coded(
-                    ApiErrorCode::SwapCalldataFailed,
-                    "swap calldata could not be generated",
-                )
-            })?;
-            Ok(SwapCalldataResponse {
-                to: take_orders_info.raindex(),
-                data: take_orders_info.calldata().clone(),
-                value: alloy::primitives::U256::ZERO,
-                estimated_input: expected_sell,
-                denomination: SwapDenomination::Wrapped,
-                approvals: vec![],
-            })
+            swap_calldata_response_from_take_orders_info(&take_orders_info)
         } else {
             tracing::error!("calldata provider returned an unexpected result state");
             Err(ApiError::coded(
@@ -319,6 +305,27 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
         Ok(wrap_ratio_values_from_responses(responses))
     }
+}
+
+fn swap_calldata_response_from_take_orders_info(
+    take_orders_info: &TakeOrdersInfo,
+) -> Result<SwapCalldataResponse, ApiError> {
+    let expected_sell = take_orders_info.expected_sell().format().map_err(|e| {
+        tracing::error!(error = %e, "failed to format expected sell");
+        ApiError::coded(
+            ApiErrorCode::SwapCalldataFailed,
+            "swap calldata could not be generated",
+        )
+    })?;
+
+    Ok(SwapCalldataResponse {
+        to: take_orders_info.raindex(),
+        data: take_orders_info.calldata().clone(),
+        value: alloy::primitives::U256::ZERO,
+        estimated_input: expected_sell,
+        denomination: SwapDenomination::Wrapped,
+        approvals: vec![],
+    })
 }
 
 /// Reject a swap whose input and output token are the same, before any order lookup.
@@ -434,12 +441,13 @@ pub fn routes_v2() -> Vec<Route> {
 mod tests {
     use super::{
         ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
-        swap_candidates_cache_key, swap_chain_ids,
+        swap_calldata_response_from_take_orders_info, swap_candidates_cache_key, swap_chain_ids,
     };
     use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
     use alloy::primitives::address;
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
+    use rain_orderbook_common::raindex_client::take_orders::TakeOrdersInfo;
     use rain_orderbook_common::raindex_client::RaindexError;
     use rain_orderbook_common::rpc_client::RpcClientError;
     use serde_json::json;
@@ -512,6 +520,41 @@ mod tests {
     #[test]
     fn test_swap_orders_are_scoped_to_calldata_chain() {
         assert_eq!(swap_chain_ids().0, vec![crate::CHAIN_ID]);
+    }
+
+    #[test]
+    fn test_take_orders_info_maps_executable_incident_input() {
+        // After preflight removed the reverting leg, this was the only executable input.
+        let expected_sell =
+            "0.04310434222334697689407343024988324343123847171843280166595003948319";
+        let expected_sell_float = rain_math_float::Float::parse(expected_sell.to_string())
+            .expect("parse incident executable input");
+        let effective_price = rain_math_float::Float::parse(
+            "0.010405262850569590820343337005442828611770549820812206944645896242997".to_string(),
+        )
+        .expect("parse incident effective price");
+        let max_sell_cap =
+            rain_math_float::Float::parse("0.05".to_string()).expect("parse incident maximum sell");
+        let take_orders_info: TakeOrdersInfo = serde_json::from_value(json!({
+            "raindex": "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D",
+            "calldata": "0xabcdef",
+            "effectivePrice": effective_price,
+            "prices": [effective_price],
+            "expectedSell": expected_sell_float,
+            "maxSellCap": max_sell_cap
+        }))
+        .expect("deserialize SDK take-orders result");
+
+        let response = swap_calldata_response_from_take_orders_info(&take_orders_info)
+            .expect("map ready SDK result");
+
+        assert_eq!(response.estimated_input, expected_sell);
+        assert_eq!(
+            response.to,
+            address!("e522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D")
+        );
+        assert_eq!(response.data.as_ref(), [0xab, 0xcd, 0xef]);
+        assert!(response.approvals.is_empty());
     }
 
     #[test]

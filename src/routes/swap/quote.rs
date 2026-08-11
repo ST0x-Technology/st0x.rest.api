@@ -18,15 +18,21 @@ use crate::types::swap::{
     SwapQuoteRequest, SwapQuoteResponse, SwapQuoteV2Request, SwapQuoteV2RequestBody,
     SwapQuoteV2Response,
 };
-use alloy::primitives::Address;
+use alloy::primitives::{fixed_bytes, Address};
 use rain_math_float::Float;
 use rain_orderbook_common::take_orders::{
     simulate_buy_over_candidates, ParsedTakeOrdersMode, TakeOrdersMode,
 };
 use rocket::serde::json::Json;
 use rocket::State;
-use std::ops::Div;
+use std::ops::{Div, Sub};
 use tracing::Instrument;
+
+// Up-to modes can be microscopically under target because DecimalFloat arithmetic
+// rounds. One part per billion is presentation dust; exact modes remain strict.
+const FULL_FILL_RELATIVE_TOLERANCE: Float = Float::from_raw(fixed_bytes!(
+    "fffffff700000000000000000000000000000000000000000000000000000001"
+));
 
 #[utoipa::path(
     post,
@@ -384,10 +390,7 @@ async fn process_swap_quote_v2(
     } else {
         simulation.total_input
     };
-    let fully_filled = achieved_amount.eq(target_amount).map_err(|error| {
-        tracing::error!(%error, "failed to compare swap quote fill amount");
-        quote_failed_error()
-    })?;
+    let fully_filled = is_quote_fully_filled(achieved_amount, target_amount, is_exact_mode)?;
     if is_exact_mode && !fully_filled {
         let requested = target_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format requested quote amount");
@@ -443,6 +446,33 @@ async fn process_swap_quote_v2(
         fully_filled,
         resolved_price_cap,
     })
+}
+
+fn is_quote_fully_filled(
+    achieved: Float,
+    target: Float,
+    is_exact_mode: bool,
+) -> Result<bool, ApiError> {
+    if is_exact_mode {
+        return achieved.eq(target).map_err(|error| {
+            tracing::error!(%error, "failed to compare exact swap quote fill amount");
+            quote_failed_error()
+        });
+    }
+
+    let relative_shortfall = target
+        .sub(achieved)
+        .and_then(|shortfall| shortfall.div(target))
+        .map_err(|error| {
+            tracing::error!(%error, "failed to compute relative swap quote fill shortfall");
+            quote_failed_error()
+        })?;
+    relative_shortfall
+        .lte(FULL_FILL_RELATIVE_TOLERANCE)
+        .map_err(|error| {
+            tracing::error!(%error, "failed to compare relative swap quote fill shortfall");
+            quote_failed_error()
+        })
 }
 
 enum QuoteV2PriceLimit<'a> {
@@ -569,6 +599,41 @@ mod tests {
             reference_io_ratio: None,
             denomination: SwapDenomination::Wrapped,
         }
+    }
+
+    #[test]
+    fn test_full_fill_tolerance_accepts_incident_rounding_dust() {
+        let achieved = Float::parse(
+            "0.04999999999999999999999999999999999999999999999999999999999999999999".to_string(),
+        )
+        .unwrap();
+        let target = Float::parse("0.05".to_string()).unwrap();
+
+        assert!(is_quote_fully_filled(achieved, target, false).unwrap());
+        assert!(!is_quote_fully_filled(achieved, target, true).unwrap());
+    }
+
+    #[test]
+    fn test_full_fill_tolerance_rejects_incident_executable_shortfall() {
+        let achieved = Float::parse(
+            "0.04310434222334697689407343024988324343123847171843280166595003948319".to_string(),
+        )
+        .unwrap();
+        let target = Float::parse("0.05".to_string()).unwrap();
+
+        assert!(!is_quote_fully_filled(achieved, target, false).unwrap());
+    }
+
+    #[test]
+    fn test_full_fill_tolerance_accepts_boundary_and_overfill() {
+        let target = Float::parse("1".to_string()).unwrap();
+        let boundary = Float::parse("0.999999999".to_string()).unwrap();
+        let beyond = Float::parse("0.9999999989".to_string()).unwrap();
+        let overfill = Float::parse("1.01".to_string()).unwrap();
+
+        assert!(is_quote_fully_filled(boundary, target, false).unwrap());
+        assert!(!is_quote_fully_filled(beyond, target, false).unwrap());
+        assert!(is_quote_fully_filled(overfill, target, false).unwrap());
     }
 
     fn assert_error_code<T>(result: Result<T, ApiError>, expected: ApiErrorCode) {
