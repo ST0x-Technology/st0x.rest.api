@@ -46,9 +46,20 @@ pub struct TokenResponse {
     isin: Option<String>,
 }
 
+#[derive(Debug, Clone, FromForm, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenListParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    chain_id: Option<u32>,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioErrorResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     share_address: Address,
     #[schema(example = "failed to read ERC4626 ratio")]
@@ -66,6 +77,9 @@ pub struct WrapRatioBatchResponse {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioHistoryParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    chain_id: Option<u32>,
     #[field(name = "page")]
     #[param(example = 1)]
     page: Option<u32>,
@@ -77,6 +91,8 @@ pub struct WrapRatioHistoryParams {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioHistoryResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     share_address: Address,
     #[schema(value_type = String, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
@@ -119,6 +135,8 @@ pub struct WrapRatioHistoryPagination {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenProofsResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     address: Address,
     metadata: Vec<TokenProofMetadata>,
@@ -569,6 +587,7 @@ async fn read_limited_response_body(response: reqwest::Response, limit: u64) -> 
 }
 
 fn build_token_proofs_response(
+    chain_id: u32,
     address: Address,
     sft: SftProofsData,
     metadata: MetadataProofsData,
@@ -597,6 +616,7 @@ fn build_token_proofs_response(
     )?);
 
     Ok(TokenProofsResponse {
+        chain_id,
         address,
         metadata: metadata.meta_v1_s,
         schemas,
@@ -652,6 +672,7 @@ pub(super) fn api_error_message(error: &ApiError) -> String {
 }
 
 async fn read_token_proofs(
+    chain_id: u32,
     address: Address,
     sft_subgraph_url: &str,
     metadata_subgraph_url: &str,
@@ -724,14 +745,15 @@ query TokenMetadata($subject: String!) {
         ),
     )?;
 
-    build_token_proofs_response(address, sft, metadata)
+    build_token_proofs_response(chain_id, address, sft, metadata)
 }
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens",
+    path = "/v2/tokens",
     tag = "Tokens",
     security(("basicAuth" = [])),
+    params(TokenListParams),
     responses(
         (
             status = 200,
@@ -761,22 +783,26 @@ query TokenMetadata($subject: String!) {
                 }
             ])
         ),
+        (status = 400, description = "Bad request", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/")]
+#[get("/?<params..>")]
 pub async fn get_tokens(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
+    params: TokenListParams,
 ) -> Result<Json<Vec<TokenResponse>>, ApiError> {
     async move {
-        tracing::info!("request received");
+        tracing::info!(params = ?params, "request received");
 
         let raindex = shared_raindex.read().await;
+        let chain_ids =
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
         let tokens = raindex
             .client()
             .get_all_tokens()
@@ -785,7 +811,15 @@ pub async fn get_tokens(
                 ApiError::Internal("failed to retrieve token list".into())
             })?;
 
-        let result: Vec<TokenResponse> = tokens.into_values().map(TokenResponse::from).collect();
+        let result: Vec<TokenResponse> = tokens
+            .into_values()
+            .filter(|token| {
+                chain_ids
+                    .as_ref()
+                    .is_none_or(|chain_ids| chain_ids.contains(&token.network.chain_id))
+            })
+            .map(TokenResponse::from)
+            .collect();
         tracing::info!(count = result.len(), "returning tokens");
         Ok(Json(result))
     }
@@ -795,9 +829,10 @@ pub async fn get_tokens(
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/wrap-ratio",
+    path = "/v2/tokens/wrap-ratio",
     tag = "Tokens",
     security(("basicAuth" = [])),
+    params(TokenListParams),
     responses(
         (status = 200, description = "Wrapped ST0x token ratios", body = WrapRatioBatchResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
@@ -805,20 +840,32 @@ pub async fn get_tokens(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/wrap-ratio")]
+#[get("/wrap-ratio?<params..>")]
 pub async fn get_wrap_ratios(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
     pool: &State<DbPool>,
+    params: TokenListParams,
 ) -> Result<Json<WrapRatioBatchResponse>, ApiError> {
     async move {
-        tracing::info!("request received");
+        tracing::info!(params = ?params, "request received");
 
         let tokens = registry_tokens(shared_raindex).await?;
-        let st0x_tokens: Vec<&TokenCfg> =
-            tokens.iter().filter(|token| is_st0x_token(token)).collect();
+        let chain_ids = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?
+        };
+        let st0x_tokens: Vec<&TokenCfg> = tokens
+            .iter()
+            .filter(|token| {
+                is_st0x_token(token)
+                    && chain_ids
+                        .as_ref()
+                        .is_none_or(|chain_ids| chain_ids.contains(&token.network.chain_id))
+            })
+            .collect();
         tracing::info!(count = st0x_tokens.len(), "reading wrapped token ratios");
 
         let mut data = Vec::new();
@@ -839,6 +886,7 @@ pub async fn get_wrap_ratios(
                         "failed to read wrapped token ratio"
                     );
                     errors.push(WrapRatioErrorResponse {
+                        chain_id: token.network.chain_id,
                         share_address: token.address,
                         message: error.batch_message(),
                     });
@@ -864,7 +912,12 @@ pub async fn get_wrap_ratios(
 
                 let row = find_wrap_ratio_item(&group.response.items, input.share_address)
                     .and_then(|item| {
-                        build_wrap_ratio_response(item, input.expected_asset_address, &metadata)
+                        build_wrap_ratio_response(
+                            input.token.network.chain_id,
+                            item,
+                            input.expected_asset_address,
+                            &metadata,
+                        )
                     });
 
                 match row {
@@ -876,6 +929,7 @@ pub async fn get_wrap_ratios(
                             "failed to read wrapped token ratio"
                         );
                         errors.push(WrapRatioErrorResponse {
+                            chain_id: input.token.network.chain_id,
                             share_address: input.share_address,
                             message: error.batch_message(),
                         });
@@ -899,11 +953,12 @@ pub async fn get_wrap_ratios(
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/wrap-ratio/{address}",
+    path = "/v2/tokens/wrap-ratio/{address}",
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
-        ("address" = String, Path, description = "Wrapped token / ERC4626 vault address")
+        ("address" = String, Path, description = "Wrapped token / ERC4626 vault address"),
+        TokenListParams
     ),
     responses(
         (status = 200, description = "Wrapped token ratio", body = WrapRatioResponse),
@@ -914,7 +969,7 @@ pub async fn get_wrap_ratios(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/wrap-ratio/<address>")]
+#[get("/wrap-ratio/<address>?<params..>")]
 pub async fn get_wrap_ratio_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
@@ -922,15 +977,19 @@ pub async fn get_wrap_ratio_by_address(
     shared_raindex: &State<SharedRaindexProvider>,
     pool: &State<DbPool>,
     address: ValidatedAddress,
+    params: TokenListParams,
 ) -> Result<Json<WrapRatioResponse>, ApiError> {
     async move {
         tracing::info!(share_address = %address.0, "request received");
 
+        let chain_id = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), params.chain_id)?
+        };
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| token.address == address.0 && is_st0x_token(token))
-        else {
+        let Some(token) = tokens.iter().find(|token| {
+            token.network.chain_id == chain_id && token.address == address.0 && is_st0x_token(token)
+        }) else {
             tracing::warn!(share_address = %address.0, "wrapped ST0x token not found");
             return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
         };
@@ -977,16 +1036,15 @@ pub async fn get_wrap_ratio_by_address(
             error.into_api_error()
         })?;
 
-        let response = build_wrap_ratio_response(item, expected_asset_address, &metadata).map_err(
-            |error| {
+        let response = build_wrap_ratio_response(chain_id, item, expected_asset_address, &metadata)
+            .map_err(|error| {
                 tracing::error!(
                     share_address = %token.address,
                     error = %error,
                     "failed to read wrapped token ratio"
                 );
                 error.into_api_error()
-            },
-        )?;
+            })?;
 
         persist_wrap_ratio_snapshots_best_effort(pool.inner(), std::slice::from_ref(&response))
             .await;
@@ -1000,7 +1058,7 @@ pub async fn get_wrap_ratio_by_address(
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/wrap-ratio/{address}/history",
+    path = "/v2/tokens/wrap-ratio/{address}/history",
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
@@ -1030,11 +1088,14 @@ pub async fn get_wrap_ratio_history_by_address(
     async move {
         tracing::info!(share_address = %address.0, "request received");
 
+        let chain_id = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), params.chain_id)?
+        };
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| token.address == address.0 && is_st0x_token(token))
-        else {
+        let Some(token) = tokens.iter().find(|token| {
+            token.network.chain_id == chain_id && token.address == address.0 && is_st0x_token(token)
+        }) else {
             tracing::warn!(share_address = %address.0, "wrapped ST0x token not found");
             return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
         };
@@ -1050,19 +1111,23 @@ pub async fn get_wrap_ratio_history_by_address(
 
         let (page, page_size, offset) = wrap_ratio_history_pagination_params(params)?;
         let share_token_address = normalize_address(token.address);
-        let total_events =
-            count_wrapped_exchange_rate_snapshots_for_share(pool.inner(), &share_token_address)
-                .await
-                .map_err(|error| {
-                    tracing::error!(
-                        share_address = %token.address,
-                        error = %error,
-                        "failed to count wrapped token ratio history"
-                    );
-                    ApiError::Internal("failed to query wrapped token ratio history".into())
-                })?;
+        let total_events = count_wrapped_exchange_rate_snapshots_for_share(
+            pool.inner(),
+            chain_id,
+            &share_token_address,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                share_address = %token.address,
+                error = %error,
+                "failed to count wrapped token ratio history"
+            );
+            ApiError::Internal("failed to query wrapped token ratio history".into())
+        })?;
         let snapshots = list_wrapped_exchange_rate_snapshots_for_share(
             pool.inner(),
+            chain_id,
             &share_token_address,
             page_size,
             offset,
@@ -1092,6 +1157,7 @@ pub async fn get_wrap_ratio_history_by_address(
             "returning wrapped token ratio history"
         );
         Ok(Json(WrapRatioHistoryResponse {
+            chain_id,
             share_address: token.address,
             asset_address,
             events,
@@ -1104,11 +1170,12 @@ pub async fn get_wrap_ratio_history_by_address(
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/{address}/proofs",
+    path = "/v2/tokens/{address}/proofs",
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
-        ("address" = String, Path, description = "Wrapped, unwrapped, or legacy ST0x token address")
+        ("address" = String, Path, description = "Wrapped, unwrapped, or legacy ST0x token address"),
+        TokenListParams
     ),
     responses(
         (status = 200, description = "Raw ST0x proof metadata, schemas, and receipts", body = TokenProofsResponse),
@@ -1119,22 +1186,28 @@ pub async fn get_wrap_ratio_history_by_address(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/<address>/proofs", rank = 10)]
+#[get("/<address>/proofs?<params..>", rank = 10)]
 pub async fn get_token_proofs(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
     address: ValidatedAddress,
+    params: TokenListParams,
 ) -> Result<Json<TokenProofsResponse>, ApiError> {
     async move {
         tracing::info!(address = %address.0, "request received");
 
+        let chain_id = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), params.chain_id)?
+        };
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| is_st0x_token(token) && matches_token_proof_address(token, address.0))
-        else {
+        let Some(token) = tokens.iter().find(|token| {
+            token.network.chain_id == chain_id
+                && is_st0x_token(token)
+                && matches_token_proof_address(token, address.0)
+        }) else {
             tracing::warn!(address = %address.0, "wrapped ST0x token not found");
             return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
         };
@@ -1151,8 +1224,13 @@ pub async fn get_token_proofs(
             "querying token proofs"
         );
 
-        let response =
-            read_token_proofs(token.address, &sft_subgraph_url, &metadata_subgraph_url).await?;
+        let response = read_token_proofs(
+            chain_id,
+            token.address,
+            &sft_subgraph_url,
+            &metadata_subgraph_url,
+        )
+        .await?;
 
         tracing::info!(
             wrapped_address = %token.address,
@@ -1177,6 +1255,10 @@ pub fn routes() -> Vec<Route> {
         get_token_details_by_address,
         get_token_proofs
     ]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }
 
 #[cfg(test)]
@@ -1258,6 +1340,7 @@ mod tests {
         captured_at: &str,
     ) -> NewWrappedExchangeRateSnapshot {
         NewWrappedExchangeRateSnapshot {
+            chain_id: 8453,
             share_token_address: format!("{share_token_address:#x}"),
             asset_token_address: format!("{asset_token_address:#x}"),
             assets_per_share: assets_per_share.to_string(),
@@ -2289,6 +2372,90 @@ tokens:
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
         let tokens = body.as_array().expect("tokens is an array");
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[rocket::async_test]
+    async fn test_get_tokens_filters_by_chain_id() {
+        let settings = r#"version: 6
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+    currency: ETH
+  polygon:
+    rpcs:
+      - https://polygon-rpc.com
+    chain-id: 137
+    currency: POL
+subgraphs:
+  base: https://example.com/base-subgraph
+  polygon: https://example.com/polygon-subgraph
+raindexes:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+  polygon:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: polygon
+    subgraph: polygon
+    deployment-block: 0
+deployers:
+  base:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: base
+  polygon:
+    address: 0xC1A14cE2fd58A3A2f99deCb8eDd866204eE07f8D
+    network: polygon
+tokens:
+  usdc-base:
+    address: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+    network: base
+    decimals: 6
+    label: USD Coin
+    symbol: USDC
+  usdc-polygon:
+    address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+    network: polygon
+    decimals: 6
+    label: USD Coin (PoS)
+    symbol: USDC
+"#;
+        let registry_url =
+            crate::test_helpers::mock_raindex_registry_url_with_settings(settings).await;
+        let config = crate::raindex::RaindexProvider::load(&registry_url, None)
+            .await
+            .expect("load raindex config");
+        let client = TestClientBuilder::new()
+            .raindex_config(config)
+            .build()
+            .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+        let response = client
+            .get("/v2/tokens?chainId=137")
+            .header(Header::new("Authorization", header.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let tokens = body.as_array().expect("tokens is an array");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0]["address"],
+            "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+        );
+        assert_eq!(tokens[0]["network"]["chainId"], 137);
+
+        let response = client
+            .get("/v2/tokens?chainId=999")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
     }
 
     #[rocket::async_test]

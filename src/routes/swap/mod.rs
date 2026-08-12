@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::future::Future;
 
 struct SwapAnalyticsContext {
+    chain_id: Option<u32>,
     input_token: Address,
     output_token: Address,
     requested_amount: String,
@@ -42,6 +43,7 @@ struct SwapAnalyticsContext {
 impl SwapAnalyticsContext {
     fn failure(&self) -> SwapFailure<'_> {
         SwapFailure {
+            chain_id: self.chain_id,
             input_token: self.input_token,
             output_token: self.output_token,
             requested_amount: &self.requested_amount,
@@ -91,11 +93,30 @@ pub(crate) trait SwapDataSource: Send + Sync {
         output_token: Address,
     ) -> Result<(), ApiError>;
 
+    async fn validate_supported_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<(), ApiError> {
+        self.validate_supported_tokens(input_token, output_token)
+            .await
+    }
+
     async fn get_orders_for_pair(
         &self,
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<RaindexOrder>, ApiError>;
+
+    async fn get_orders_for_pair_on_chain(
+        &self,
+        _chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<Vec<RaindexOrder>, ApiError> {
+        self.get_orders_for_pair(input_token, output_token).await
+    }
 
     async fn build_candidates_for_pair(
         &self,
@@ -110,11 +131,29 @@ pub(crate) trait SwapDataSource: Send + Sync {
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError>;
 
+    async fn get_calldata_on_chain(
+        &self,
+        chain_id: u32,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataResponse, ApiError> {
+        let mut response = self.get_calldata(request).await?;
+        response.chain_id = chain_id;
+        Ok(response)
+    }
+
     async fn get_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
+    }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        self.get_wrap_ratios_for_tokens(token_addresses).await
     }
 }
 
@@ -122,10 +161,6 @@ pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
     pub pool: &'a DbPool,
-}
-
-fn swap_chain_ids() -> ChainIds {
-    ChainIds(vec![crate::CHAIN_ID])
 }
 
 fn swap_candidates_cache_key(
@@ -160,9 +195,45 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             tracing::error!(error = %e, "failed to retrieve curated tokens");
             ApiError::Internal("failed to read the token registry".into())
         })?;
+        let chain_ids = tokens
+            .values()
+            .filter(|token| token.address == input_token || token.address == output_token)
+            .map(|token| token.network.chain_id)
+            .collect::<std::collections::HashSet<_>>();
+        if chain_ids.len() != 1 {
+            tracing::warn!(%input_token, %output_token, "swap token pair is missing or ambiguous across configured chains");
+            return Err(ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
+            ));
+        }
+        let chain_id = chain_ids.into_iter().next().ok_or_else(|| {
+            ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
+            )
+        })?;
+        self.validate_supported_tokens_on_chain(chain_id, input_token, output_token)
+            .await
+    }
 
-        let input_supported = tokens.values().any(|token| token.address == input_token);
-        let output_supported = tokens.values().any(|token| token.address == output_token);
+    async fn validate_supported_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<(), ApiError> {
+        let tokens = self.client.get_all_tokens().map_err(|e| {
+            tracing::error!(error = %e, "failed to retrieve curated tokens");
+            ApiError::Internal("failed to read the token registry".into())
+        })?;
+
+        let input_supported = tokens
+            .values()
+            .any(|token| token.network.chain_id == chain_id && token.address == input_token);
+        let output_supported = tokens
+            .values()
+            .any(|token| token.network.chain_id == chain_id && token.address == output_token);
 
         if input_supported && output_supported {
             tracing::info!(input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
@@ -187,6 +258,29 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<RaindexOrder>, ApiError> {
+        let chain_ids = self.client.get_unique_chain_ids().map_err(|error| {
+            tracing::error!(%error, "failed to read configured swap chains");
+            ApiError::Internal("failed to read configured networks".into())
+        })?;
+        let chain_id = match chain_ids.as_slice() {
+            [chain_id] => *chain_id,
+            [] => return Err(ApiError::Internal("no configured networks".into())),
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "chainId is required when multiple networks are configured".into(),
+                ));
+            }
+        };
+        self.get_orders_for_pair_on_chain(chain_id, input_token, output_token)
+            .await
+    }
+
+    async fn get_orders_for_pair_on_chain(
+        &self,
+        chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<Vec<RaindexOrder>, ApiError> {
         let filters = GetOrdersFilters {
             active: Some(true),
             tokens: Some(GetOrdersTokenFilter {
@@ -197,7 +291,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ..Default::default()
         };
         self.client
-            .get_orders(Some(swap_chain_ids()), Some(filters), None, None)
+            .get_orders(Some(ChainIds(vec![chain_id])), Some(filters), None, None)
             .await
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
@@ -254,6 +348,15 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         &self,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError> {
+        let chain_id = request.chain_id;
+        self.get_calldata_on_chain(chain_id, request).await
+    }
+
+    async fn get_calldata_on_chain(
+        &self,
+        chain_id: u32,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataResponse, ApiError> {
         let result = self
             .client
             .get_take_orders_calldata(request)
@@ -263,6 +366,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         if let Some(approval_info) = result.approval_info() {
             let formatted_amount = approval_info.formatted_amount().to_string();
             Ok(SwapCalldataResponse {
+                chain_id,
                 to: approval_info.spender(),
                 data: alloy::primitives::Bytes::new(),
                 value: alloy::primitives::U256::ZERO,
@@ -277,7 +381,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 }],
             })
         } else if let Some(take_orders_info) = result.take_orders_info() {
-            swap_calldata_response_from_take_orders_info(&take_orders_info)
+            swap_calldata_response_from_take_orders_info(chain_id, &take_orders_info)
         } else {
             tracing::error!("calldata provider returned an unexpected result state");
             Err(ApiError::coded(
@@ -291,6 +395,40 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         &self,
         token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let tokens = self.client.get_all_tokens().map_err(|e| {
+            tracing::error!(error = %e, "failed to retrieve curated tokens");
+            ApiError::Internal("failed to read the token registry".into())
+        })?;
+        let chain_ids = tokens
+            .values()
+            .filter(|token| token_addresses.contains(&token.address))
+            .map(|token| token.network.chain_id)
+            .collect::<std::collections::HashSet<_>>();
+        let chain_id = match chain_ids.len() {
+            0 => {
+                return Err(ApiError::BadRequest(
+                    "unable to resolve token network".into(),
+                ))
+            }
+            1 => chain_ids
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::BadRequest("unable to resolve token network".into()))?,
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "chainId is required when multiple networks are configured".into(),
+                ));
+            }
+        };
+        self.get_wrap_ratios_for_tokens_on_chain(chain_id, token_addresses)
+            .await
+    }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         let tokens: Vec<_> = self
             .client
             .get_all_tokens()
@@ -299,6 +437,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 ApiError::Internal("failed to read the token registry".into())
             })?
             .into_values()
+            .filter(|token| token.network.chain_id == chain_id)
             .collect();
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
@@ -308,6 +447,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
 }
 
 fn swap_calldata_response_from_take_orders_info(
+    chain_id: u32,
     take_orders_info: &TakeOrdersInfo,
 ) -> Result<SwapCalldataResponse, ApiError> {
     let expected_sell = take_orders_info.expected_sell().format().map_err(|e| {
@@ -319,6 +459,7 @@ fn swap_calldata_response_from_take_orders_info(
     })?;
 
     Ok(SwapCalldataResponse {
+        chain_id,
         to: take_orders_info.raindex(),
         data: take_orders_info.calldata().clone(),
         value: alloy::primitives::U256::ZERO,
@@ -349,6 +490,10 @@ pub(crate) fn ensure_distinct_tokens(
         "swap request rejected: input and output token are identical"
     );
     Err(same_token_error())
+}
+
+pub(crate) fn request_chain_id(chain_id: Option<u32>) -> Result<u32, ApiError> {
+    chain_id.ok_or_else(|| ApiError::BadRequest("chainId is required".into()))
 }
 
 fn same_token_error() -> ApiError {
@@ -441,7 +586,7 @@ pub fn routes_v2() -> Vec<Route> {
 mod tests {
     use super::{
         ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
-        swap_calldata_response_from_take_orders_info, swap_candidates_cache_key, swap_chain_ids,
+        swap_calldata_response_from_take_orders_info, swap_candidates_cache_key,
     };
     use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
@@ -518,11 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn test_swap_orders_are_scoped_to_calldata_chain() {
-        assert_eq!(swap_chain_ids().0, vec![crate::CHAIN_ID]);
-    }
-
-    #[test]
     fn test_take_orders_info_maps_executable_incident_input() {
         // After preflight removed the reverting leg, this was the only executable input.
         let expected_sell =
@@ -545,7 +685,7 @@ mod tests {
         }))
         .expect("deserialize SDK take-orders result");
 
-        let response = swap_calldata_response_from_take_orders_info(&take_orders_info)
+        let response = swap_calldata_response_from_take_orders_info(8453, &take_orders_info)
             .expect("map ready SDK result");
 
         assert_eq!(response.estimated_input, expected_sell);

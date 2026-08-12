@@ -83,7 +83,7 @@ impl ValidatedTradesQuery {
 
 #[utoipa::path(
     post,
-    path = "/v1/trades/query",
+    path = "/v2/trades/query",
     tag = "Trades",
     security(("basicAuth" = [])),
     request_body = TradesQueryRequest,

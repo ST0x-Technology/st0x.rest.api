@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/taker/{address}",
+    path = "/v2/trades/taker/{address}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
@@ -46,16 +46,18 @@ pub async fn get_trades_by_taker(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
+        let (client, chain_ids) = {
+            let raindex = shared_raindex.read().await;
+            let chain_ids =
+                crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
+            (raindex.client().clone(), chain_ids)
+        };
         if !app_state.response_caches.is_enabled() {
-            let client = {
-                let raindex = shared_raindex.read().await;
-                raindex.client().clone()
-            };
             let ds = RaindexTradesDataSource {
                 client: &client,
                 pool: pool.inner(),
             };
-            return process_get_trades_by_taker(&ds, addr, params).await;
+            return process_get_trades_by_taker_for_chains(&ds, chain_ids, addr, params).await;
         }
 
         let cache_key = super::get_by_token::trades_cache_key("trades/taker", addr, &params);
@@ -63,15 +65,11 @@ pub async fn get_trades_by_taker(
             .response_caches
             .trades_by_taker
             .get_or_try_insert(cache_key, || async move {
-                let client = {
-                    let raindex = shared_raindex.read().await;
-                    raindex.client().clone()
-                };
                 let ds = RaindexTradesDataSource {
                     client: &client,
                     pool: pool.inner(),
                 };
-                process_get_trades_by_taker(&ds, addr, params)
+                process_get_trades_by_taker_for_chains(&ds, chain_ids, addr, params)
                     .await
                     .map(Json::into_inner)
             })
@@ -83,8 +81,18 @@ pub async fn get_trades_by_taker(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn process_get_trades_by_taker(
     ds: &dyn TradesDataSource,
+    taker: Address,
+    params: TradesPaginationParams,
+) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    process_get_trades_by_taker_for_chains(ds, None, taker, params).await
+}
+
+async fn process_get_trades_by_taker_for_chains(
+    ds: &dyn TradesDataSource,
+    chain_ids: Option<Vec<u32>>,
     taker: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
@@ -93,7 +101,7 @@ pub(super) async fn process_get_trades_by_taker(
 
     tracing::info!(taker = ?taker, page, page_size, "querying trades by taker");
     let result = ds
-        .get_trades_for_taker(taker, sdk_page, sdk_page_size, time_filter)
+        .get_trades_for_taker_on_chains(chain_ids, taker, sdk_page, sdk_page_size, time_filter)
         .await?;
 
     build_trades_list_response(ds, result, page, page_size, denomination).await
@@ -184,6 +192,7 @@ mod tests {
         };
         let taker = address!("cccccccccccccccccccccccccccccccccccccccc");
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(2),
             page_size: Some(10),
             start_time: Some(1700000000),
@@ -225,6 +234,7 @@ mod tests {
             captured: Arc::new(Mutex::new(None)),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -253,6 +263,7 @@ mod tests {
             captured: Arc::new(Mutex::new(None)),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,

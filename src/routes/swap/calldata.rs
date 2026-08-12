@@ -1,6 +1,6 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, snapshot_swap_context, RaindexSwapDataSource,
-    SwapAnalyticsContext, SwapDataSource,
+    capture_swap_outcome, ensure_distinct_tokens, request_chain_id, snapshot_swap_context,
+    RaindexSwapDataSource, SwapAnalyticsContext, SwapDataSource,
 };
 use crate::analytics::{
     swap_calldata_failed_event, swap_calldata_generated_event, Analytics, ApiVersion,
@@ -61,10 +61,13 @@ pub async fn post_swap_calldata(
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
     async move {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         tracing::info!(body = ?req, "request received");
-        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
+        req.chain_id = Some(chain_id);
+        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
@@ -119,14 +122,17 @@ pub async fn post_swap_calldata_v2(
     request: Json<SwapCalldataV2Request>,
 ) -> Result<Json<SwapCalldataV2Response>, ApiError> {
     async move {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         tracing::info!(
             mode = ?req.mode,
             denomination = ?req.denomination,
             "request received"
         );
-        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
+        req.chain_id = Some(chain_id);
+        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
@@ -158,6 +164,7 @@ async fn handle_swap_calldata(
 ) -> Result<SwapCalldataResponse, ApiError> {
     let taker = req.taker;
     let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
         taker: Some(taker),
         input_token: req.input_token,
         output_token: req.output_token,
@@ -204,6 +211,7 @@ async fn handle_swap_calldata_v2(
 ) -> Result<SwapCalldataV2Response, ApiError> {
     let taker = req.taker;
     let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
         taker: Some(taker),
         input_token: req.input_token,
         output_token: req.output_token,
@@ -360,6 +368,7 @@ fn validate_attribution_calldata(
 
 #[derive(Debug)]
 struct SwapCalldataBuildRequest {
+    chain_id: u32,
     taker: Address,
     input_token: Address,
     output_token: Address,
@@ -387,9 +396,12 @@ struct SwapCalldataBuildResult {
     resolved_price_cap: String,
 }
 
-impl From<SwapCalldataRequest> for SwapCalldataBuildRequest {
-    fn from(req: SwapCalldataRequest) -> Self {
-        Self {
+impl TryFrom<SwapCalldataRequest> for SwapCalldataBuildRequest {
+    type Error = ApiError;
+
+    fn try_from(req: SwapCalldataRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            chain_id: request_chain_id(req.chain_id)?,
             taker: req.taker,
             input_token: req.input_token,
             output_token: req.output_token,
@@ -401,7 +413,7 @@ impl From<SwapCalldataRequest> for SwapCalldataBuildRequest {
                 field: "maximum_io_ratio",
             },
             denomination: req.denomination,
-        }
+        })
     }
 }
 
@@ -443,6 +455,7 @@ impl TryFrom<SwapCalldataV2Request> for SwapCalldataBuildRequest {
         };
 
         Ok(Self {
+            chain_id: request_chain_id(req.chain_id)?,
             taker: req.taker,
             input_token: req.input_token,
             output_token: req.output_token,
@@ -459,7 +472,9 @@ async fn process_swap_calldata(
     ds: &dyn SwapDataSource,
     req: SwapCalldataRequest,
 ) -> Result<SwapCalldataResponse, ApiError> {
-    Ok(process_swap_calldata_build(ds, req.into()).await?.calldata)
+    Ok(process_swap_calldata_build(ds, req.try_into()?)
+        .await?
+        .calldata)
 }
 
 async fn process_swap_calldata_v2(
@@ -480,7 +495,7 @@ async fn process_swap_calldata_build(
 ) -> Result<SwapCalldataBuildResult, ApiError> {
     ensure_distinct_tokens(req.input_token, req.output_token)?;
 
-    ds.validate_supported_tokens(req.input_token, req.output_token)
+    ds.validate_supported_tokens_on_chain(req.chain_id, req.input_token, req.output_token)
         .await
         .map_err(map_calldata_boundary_error)?;
 
@@ -490,6 +505,7 @@ async fn process_swap_calldata_build(
             let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
                 ds,
                 CalldataRequestNormalization {
+                    chain_id: req.chain_id,
                     denomination: req.denomination,
                     input_token: req.input_token,
                     output_token: req.output_token,
@@ -511,6 +527,7 @@ async fn process_swap_calldata_build(
             let (amount, wrap_ratios) = normalize_calldata_request_amount(
                 ds,
                 CalldataAmountNormalization {
+                    chain_id: req.chain_id,
                     denomination: req.denomination,
                     input_token: req.input_token,
                     output_token: req.output_token,
@@ -543,7 +560,7 @@ async fn process_swap_calldata_build(
                 })
                 .transpose()?;
             let orders = ds
-                .get_orders_for_pair(req.input_token, req.output_token)
+                .get_orders_for_pair_on_chain(req.chain_id, req.input_token, req.output_token)
                 .await
                 .map_err(map_calldata_boundary_error)?;
             if orders.is_empty() {
@@ -591,7 +608,7 @@ async fn process_swap_calldata_build(
 
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
-        chain_id: crate::CHAIN_ID,
+        chain_id: req.chain_id,
         sell_token: req.input_token.to_string(),
         buy_token: req.output_token.to_string(),
         mode: req.mode,
@@ -600,7 +617,7 @@ async fn process_swap_calldata_build(
     };
 
     let response = ds
-        .get_calldata(take_req)
+        .get_calldata_on_chain(req.chain_id, take_req)
         .await
         .map_err(map_calldata_boundary_error)?;
     let calldata =
@@ -679,6 +696,7 @@ mod tests {
 
     fn calldata_request(output_amount: &str, max_ratio: &str) -> SwapCalldataRequest {
         SwapCalldataRequest {
+            chain_id: Some(8453),
             taker: TAKER,
             input_token: USDC,
             output_token: WETH,
@@ -701,6 +719,7 @@ mod tests {
         price_cap: &str,
     ) -> SwapCalldataV2Request {
         SwapCalldataV2Request {
+            chain_id: Some(8453),
             taker: TAKER,
             input_token: USDC,
             output_token: WETH,
@@ -720,6 +739,7 @@ mod tests {
         max_ratio: &str,
     ) -> SwapCalldataRequest {
         SwapCalldataRequest {
+            chain_id: Some(8453),
             taker: TAKER,
             input_token,
             output_token,
@@ -737,6 +757,7 @@ mod tests {
         price_cap: &str,
     ) -> SwapCalldataV2Request {
         SwapCalldataV2Request {
+            chain_id: Some(8453),
             taker: TAKER,
             input_token,
             output_token,
@@ -755,6 +776,7 @@ mod tests {
         slippage_bps: u16,
     ) -> SwapCalldataV2Request {
         SwapCalldataV2Request {
+            chain_id: Some(8453),
             taker: TAKER,
             input_token: USDC,
             output_token: WETH,
@@ -769,6 +791,7 @@ mod tests {
 
     fn ready_response() -> SwapCalldataResponse {
         SwapCalldataResponse {
+            chain_id: 8453,
             to: ORDERBOOK,
             data: Bytes::from(vec![0xab, 0xcd, 0xef]),
             value: U256::ZERO,
@@ -780,6 +803,7 @@ mod tests {
 
     fn approval_response() -> SwapCalldataResponse {
         SwapCalldataResponse {
+            chain_id: 8453,
             to: ORDERBOOK,
             data: Bytes::new(),
             value: U256::ZERO,

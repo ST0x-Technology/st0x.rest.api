@@ -31,7 +31,7 @@ Authentication is required; see [Authentication](./authentication.md). Requests
 without valid credentials return `401 Unauthorized`.
 
 ```
-GET /v1/prices?chainId=8453
+GET /v2/prices?chainId=8453
 ```
 
 Returns every configured ST0x token on the requested network. If `chainId` is
@@ -73,7 +73,7 @@ This endpoint has the same [authentication](./authentication.md) requirement and
 may return `401 Unauthorized`.
 
 ```
-GET /v1/prices?chainId=8453&at=1784800000
+GET /v2/prices?chainId=8453&at=1784800000
 ```
 
 Returns the nearest retained observation at or before `at` for every token.
@@ -86,7 +86,7 @@ This endpoint has the same [authentication](./authentication.md) requirement and
 may return `401 Unauthorized`.
 
 ```
-GET /v1/prices/{address}/history
+GET /v2/prices/{address}/history
 ```
 
 `{address}` can use any casing and can be the current wrapped, unwrapped, or

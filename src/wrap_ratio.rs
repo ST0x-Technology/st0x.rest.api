@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioResponse {
+    #[schema(example = 8453)]
+    pub(crate) chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     pub(crate) share_address: Address,
     #[schema(value_type = String, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
@@ -209,6 +211,7 @@ pub(crate) fn find_wrap_ratio_item(
 }
 
 pub(crate) fn build_wrap_ratio_response(
+    chain_id: u32,
     item: &Erc4626BatchItem,
     expected_asset_address: Address,
     metadata: &WrapRatioMetadata,
@@ -238,6 +241,7 @@ pub(crate) fn build_wrap_ratio_response(
     }
 
     Ok(WrapRatioResponse {
+        chain_id,
         share_address: item.vault_address,
         asset_address: expected_asset_address,
         assets_per_share: assets_per_share_display(ratio.assets_display.clone()),
@@ -345,7 +349,12 @@ pub(crate) async fn read_wrap_ratio_responses_for_addresses(
 
             let row =
                 find_wrap_ratio_item(&group.response.items, input.share_address).and_then(|item| {
-                    build_wrap_ratio_response(item, input.expected_asset_address, &metadata)
+                    build_wrap_ratio_response(
+                        input.token.network.chain_id,
+                        item,
+                        input.expected_asset_address,
+                        &metadata,
+                    )
                 });
 
             match row {
@@ -435,6 +444,7 @@ fn wrap_ratio_snapshot_from_response(
     response: &WrapRatioResponse,
 ) -> Result<NewWrappedExchangeRateSnapshot, std::num::TryFromIntError> {
     Ok(NewWrappedExchangeRateSnapshot {
+        chain_id: i64::from(response.chain_id),
         share_token_address: normalized_address(response.share_address),
         asset_token_address: normalized_address(response.asset_address),
         assets_per_share: response.assets_per_share.clone(),
@@ -623,8 +633,8 @@ mod tests {
     #[test]
     fn test_build_wrap_ratio_response_maps_successful_item() {
         let item = successful_batch_item(WT_MSTR, T_MSTR);
-        let response =
-            build_wrap_ratio_response(&item, T_MSTR, &metadata()).expect("ratio should build");
+        let response = build_wrap_ratio_response(8453, &item, T_MSTR, &metadata())
+            .expect("ratio should build");
 
         assert_eq!(response.share_address, WT_MSTR);
         assert_eq!(response.asset_address, T_MSTR);
@@ -638,8 +648,8 @@ mod tests {
     fn test_build_wrap_ratio_response_rejects_asset_mismatch() {
         let item = successful_batch_item(WT_MSTR, WT_BAD);
 
-        let error =
-            build_wrap_ratio_response(&item, T_MSTR, &metadata()).expect_err("asset mismatch");
+        let error = build_wrap_ratio_response(8453, &item, T_MSTR, &metadata())
+            .expect_err("asset mismatch");
         assert!(matches!(error, WrapRatioLookupError::AssetMismatch));
     }
 
@@ -657,8 +667,8 @@ mod tests {
     #[test]
     fn test_wrap_ratio_snapshot_from_response_normalizes_addresses() {
         let item = successful_batch_item(WT_MSTR, T_MSTR);
-        let response =
-            build_wrap_ratio_response(&item, T_MSTR, &metadata()).expect("ratio should build");
+        let response = build_wrap_ratio_response(8453, &item, T_MSTR, &metadata())
+            .expect("ratio should build");
 
         let snapshot =
             wrap_ratio_snapshot_from_response(&response).expect("snapshot should convert");

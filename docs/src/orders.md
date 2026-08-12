@@ -10,7 +10,7 @@ same pattern as the [Swap Flow](./swap-flow.md).
 ## Get DCA Order Calldata
 
 ```
-POST /v1/order/dca
+POST /v2/order/dca
 ```
 
 Returns calldata to deploy a DCA order that periodically buys a token at a set
@@ -19,10 +19,11 @@ interval, with price bounds.
 ### Request
 
 ```bash
-curl -X POST https://api.st0x.io/v1/order/dca \
+curl -X POST https://api.st0x.io/v2/order/dca \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
     "budgetAmount": "10000",
@@ -35,6 +36,7 @@ curl -X POST https://api.st0x.io/v1/order/dca \
 
 | Field           | Type              | Description                                                           |
 | --------------- | ----------------- | --------------------------------------------------------------------- |
+| `chainId`       | number            | Network selected from the active registry                             |
 | `inputToken`    | string            | Token to spend                                                        |
 | `outputToken`   | string            | Token to receive                                                      |
 | `budgetAmount`  | string            | Total budget in human-readable units (e.g. `"10000"` for 10,000 USDC) |
@@ -52,6 +54,7 @@ empty and `approvals` contains the required transactions:
 
 ```json
 {
+  "chainId": 8453,
   "to": "0xOrderbookContractAddress",
   "data": "0x",
   "value": "0x0",
@@ -73,6 +76,7 @@ calldata:
 
 ```json
 {
+  "chainId": 8453,
   "to": "0xOrderbookContractAddress",
   "data": "0xabcdef...",
   "value": "0x0",
@@ -83,7 +87,7 @@ calldata:
 ## Get Order Details
 
 ```
-GET /v1/order/{order_hash}
+GET /v2/order/{order_hash}
 ```
 
 Retrieve the full state of an order including vault balances and trade history.
@@ -91,13 +95,14 @@ Retrieve the full state of an order including vault balances and trade history.
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/order/0xabc123... \
+curl "https://api.st0x.io/v2/order/0xabc123...?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter      | Type                     | Default   | Description                                                                                                               |
-| -------------- | ------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances, trade amounts, and IO ratios to unwrapped values |
+| Parameter      | Type                     | Default            | Description                                                                                                               |
+| -------------- | ------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped`          | Return wrapped token amounts as-is, or normalize wrapped token balances, trade amounts, and IO ratios to unwrapped values |
+| `chainId`      | number                   | configured network | Required when multiple networks are configured                                                                            |
 
 When `denomination=unwrapped`, order fields are normalized using the current
 wrapped exchange rate. Omit the parameter to keep the default wrapped-token
@@ -107,6 +112,7 @@ response.
 
 ```json
 {
+  "chainId": 8453,
   "orderHash": "0xabc123...",
   "owner": "0xOwnerAddress",
   "orderDetails": {
@@ -132,6 +138,7 @@ response.
   "orderbookId": "0xOrderbookAddress",
   "trades": [
     {
+      "chainId": 8453,
       "id": "trade-1",
       "txHash": "0x...",
       "inputAmount": "2000.0",
@@ -146,7 +153,7 @@ response.
 ## List Orders by Owner
 
 ```
-GET /v1/orders/owner/{address}
+GET /v2/orders/owner/{address}
 ```
 
 Paginated list of orders for a wallet address.
@@ -154,22 +161,23 @@ Paginated list of orders for a wallet address.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/orders/owner/0xOwnerAddress?state=active&page=1&pageSize=10" \
+curl "https://api.st0x.io/v2/orders/owner/0xOwnerAddress?chainId=8453&state=active&page=1&pageSize=10" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter      | Type                           | Default   | Description                                                                                               |
-| -------------- | ------------------------------ | --------- | --------------------------------------------------------------------------------------------------------- |
-| `state`        | `active`, `inactive`, or `all` | `active`  | Filter by current order state                                                                             |
-| `page`         | number                         | 1         | Page number                                                                                               |
-| `pageSize`     | number                         | 20        | Results per page                                                                                          |
-| `denomination` | `wrapped` or `unwrapped`       | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances and IO ratios to unwrapped values |
+| Parameter      | Type                           | Default      | Description                                                                                               |
+| -------------- | ------------------------------ | ------------ | --------------------------------------------------------------------------------------------------------- |
+| `state`        | `active`, `inactive`, or `all` | `active`     | Filter by current order state                                                                             |
+| `chainId`      | number                         | all networks | Optional network filter                                                                                   |
+| `page`         | number                         | 1            | Page number                                                                                               |
+| `pageSize`     | number                         | 20           | Results per page                                                                                          |
+| `denomination` | `wrapped` or `unwrapped`       | `wrapped`    | Return wrapped token amounts as-is, or normalize wrapped token balances and IO ratios to unwrapped values |
 
 Use `denomination=unwrapped` to view order balances and IO ratios normalized to
 the current unwrapped asset value:
 
 ```bash
-curl "https://api.st0x.io/v1/orders/owner/0xOwnerAddress?state=active&page=1&pageSize=10&denomination=unwrapped" \
+curl "https://api.st0x.io/v2/orders/owner/0xOwnerAddress?chainId=8453&state=active&page=1&pageSize=10&denomination=unwrapped" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -218,7 +226,7 @@ populated when available.
 ## List Orders by Token
 
 ```
-GET /v1/orders/token/{address}
+GET /v2/orders/token/{address}
 ```
 
 Paginated list of orders for a token address.
@@ -226,30 +234,31 @@ Paginated list of orders for a token address.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/orders/token/0xTokenAddress?state=all&side=output&page=1&pageSize=10" \
+curl "https://api.st0x.io/v2/orders/token/0xTokenAddress?chainId=8453&state=all&side=output&page=1&pageSize=10" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter  | Type                           | Default  | Description                          |
-| ---------- | ------------------------------ | -------- | ------------------------------------ |
-| `state`    | `active`, `inactive`, or `all` | `active` | Filter by current order state        |
-| `side`     | `input` or `output`            | all      | Match token as an input/output token |
-| `page`     | number                         | 1        | Page number                          |
-| `pageSize` | number                         | 20       | Results per page                     |
+| Parameter  | Type                           | Default      | Description                          |
+| ---------- | ------------------------------ | ------------ | ------------------------------------ |
+| `state`    | `active`, `inactive`, or `all` | `active`     | Filter by current order state        |
+| `chainId`  | number                         | all networks | Optional network filter              |
+| `side`     | `input` or `output`            | all          | Match token as an input/output token |
+| `page`     | number                         | 1            | Page number                          |
+| `pageSize` | number                         | 20           | Results per page                     |
 
 The response shape is the same as list orders by owner.
 
 ## Query Orders by Token Set
 
 ```
-POST /v1/orders/query
+POST /v2/orders/query
 ```
 
 Queries one network and one canonical token set through a single indexed SDK
 query. This is the preferred contract for network-wide orderbook views.
 
 ```bash
-curl -X POST https://api.st0x.io/v1/orders/query \
+curl -X POST https://api.st0x.io/v2/orders/query \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -293,7 +302,7 @@ and is not cached.
 ## List Orders by Transaction
 
 ```
-GET /v1/orders/tx/{tx_hash}
+GET /v2/orders/tx/{tx_hash}
 ```
 
 Get all orders created in a specific transaction.
@@ -301,7 +310,7 @@ Get all orders created in a specific transaction.
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/orders/tx/0xTxHash... \
+curl "https://api.st0x.io/v2/orders/tx/0xTxHash...?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -309,6 +318,7 @@ curl https://api.st0x.io/v1/orders/tx/0xTxHash... \
 
 ```json
 {
+  "chainId": 8453,
   "txHash": "0xTxHash...",
   "blockNumber": 12345678,
   "timestamp": 1708000000,
@@ -327,7 +337,7 @@ curl https://api.st0x.io/v1/orders/tx/0xTxHash... \
 ## Cancel an Order
 
 ```
-POST /v1/order/cancel
+POST /v2/order/cancel
 ```
 
 Returns calldata for cancelling an order and withdrawing from its vaults.
@@ -335,10 +345,11 @@ Returns calldata for cancelling an order and withdrawing from its vaults.
 ### Request
 
 ```bash
-curl -X POST https://api.st0x.io/v1/order/cancel \
+curl -X POST https://api.st0x.io/v2/order/cancel \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "orderHash": "0xabc123..."
   }'
 ```
@@ -347,6 +358,7 @@ curl -X POST https://api.st0x.io/v1/order/cancel \
 
 ```json
 {
+  "chainId": 8453,
   "transactions": [
     {
       "to": "0xOrderbookAddress",

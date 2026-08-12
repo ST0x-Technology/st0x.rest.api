@@ -1,6 +1,6 @@
 use super::{
     api_error_message, matches_token_proof_address, post_graphql, registry_tokens,
-    resolve_sft_subgraph_url, TimestampValue, SFT_PAGE_SIZE,
+    resolve_sft_subgraph_url, TimestampValue, TokenListParams, SFT_PAGE_SIZE,
 };
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
@@ -38,6 +38,8 @@ pub struct TokenDetailsListResponse {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenDetailsErrorResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     address: Address,
     #[schema(example = "SFT vault not found for token")]
@@ -47,6 +49,8 @@ pub struct TokenDetailsErrorResponse {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenDetailsSummaryResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     address: Address,
     #[schema(value_type = Option<String>, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
@@ -107,6 +111,9 @@ pub struct TokenDetailsReceiptActivity {
 #[derive(Debug, Default, FromForm, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct TokenDetailsQueryParams {
+    #[param(rename = "chainId", example = 8453)]
+    #[field(name = "chainId")]
+    chain_id: Option<u32>,
     #[param(rename = "activityLimit", example = 5, minimum = 1, maximum = 50)]
     #[field(name = "activityLimit")]
     activity_limit: Option<u32>,
@@ -575,6 +582,7 @@ fn build_token_details_summary_fields(
     )?;
 
     Ok(TokenDetailsSummaryResponse {
+        chain_id: token.network.chain_id,
         address: token.address,
         receipt_contract_address,
         name: token_name(token, vault_name),
@@ -799,9 +807,10 @@ fn activity_limit(params: &TokenDetailsQueryParams) -> u32 {
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/details",
+    path = "/v2/tokens/details",
     tag = "Tokens",
     security(("basicAuth" = [])),
+    params(TokenListParams),
     responses(
         (status = 200, description = "ST0x token detail summaries with per-token errors", body = TokenDetailsListResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
@@ -809,18 +818,31 @@ fn activity_limit(params: &TokenDetailsQueryParams) -> u32 {
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/details")]
+#[get("/details?<params..>")]
 pub async fn get_token_details(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
+    params: TokenListParams,
 ) -> Result<Json<TokenDetailsListResponse>, ApiError> {
     async move {
         tracing::info!("request received");
 
+        let chain_ids = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?
+        };
         let tokens = registry_tokens(shared_raindex).await?;
-        let st0x_tokens: Vec<TokenCfg> = tokens.into_iter().filter(is_st0x_token).collect();
+        let st0x_tokens: Vec<TokenCfg> = tokens
+            .into_iter()
+            .filter(|token| {
+                is_st0x_token(token)
+                    && chain_ids
+                        .as_ref()
+                        .is_none_or(|chain_ids| chain_ids.contains(&token.network.chain_id))
+            })
+            .collect();
         tracing::info!(count = st0x_tokens.len(), "reading ST0x token details");
 
         let batch_items = {
@@ -867,6 +889,7 @@ pub async fn get_token_details(
                         "failed to resolve token details subgraph"
                     );
                     errors.push(TokenDetailsErrorResponse {
+                        chain_id: item.token.network.chain_id,
                         address: item.token.address,
                         message: api_error_message(error),
                     });
@@ -888,6 +911,7 @@ pub async fn get_token_details(
                     );
                     for token in tokens {
                         errors.push(TokenDetailsErrorResponse {
+                            chain_id: token.network.chain_id,
                             address: token.address,
                             message: api_error_message(&error),
                         });
@@ -923,6 +947,7 @@ pub async fn get_token_details(
                         "failed to read token details"
                     );
                     errors.push(TokenDetailsErrorResponse {
+                        chain_id: item.token.network.chain_id,
                         address: item.token.address,
                         message: api_error_message(&error),
                     });
@@ -954,7 +979,7 @@ pub async fn get_token_details(
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/{address}/details",
+    path = "/v2/tokens/{address}/details",
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
@@ -982,11 +1007,16 @@ pub async fn get_token_details_by_address(
     async move {
         tracing::info!(address = %address.0, "request received");
 
+        let chain_id = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), params.chain_id)?
+        };
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| is_st0x_token(token) && matches_token_proof_address(token, address.0))
-        else {
+        let Some(token) = tokens.iter().find(|token| {
+            token.network.chain_id == chain_id
+                && is_st0x_token(token)
+                && matches_token_proof_address(token, address.0)
+        }) else {
             tracing::warn!(address = %address.0, "wrapped ST0x token not found");
             return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
         };

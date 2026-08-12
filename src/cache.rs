@@ -215,6 +215,7 @@ mod tests {
 
     fn mock_trade() -> TradeByAddress {
         TradeByAddress {
+            chain_id: 8453,
             tx_hash: B256::ZERO,
             input_amount: "1".into(),
             output_amount: "1".into(),

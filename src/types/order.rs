@@ -15,6 +15,8 @@ pub enum PeriodUnit {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployDcaOrderRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -38,6 +40,8 @@ pub struct DeployDcaOrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploySolverOrderRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -55,6 +59,8 @@ pub struct DeploySolverOrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployOrderResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57")]
     pub to: Address,
     #[schema(value_type = String, example = "0xabcdef...")]
@@ -67,6 +73,8 @@ pub struct DeployOrderResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelOrderRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
     pub order_hash: FixedBytes<32>,
 }
@@ -104,6 +112,8 @@ pub struct CancelSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelOrderResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     pub transactions: Vec<CancelTransaction>,
     pub summary: CancelSummary,
 }
@@ -112,6 +122,9 @@ pub struct CancelOrderResponse {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderDetailParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "denomination")]
     #[param(example = "wrapped")]
     pub denomination: Option<Denomination>,
@@ -137,6 +150,8 @@ pub struct OrderDetailsInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderTradeEntry {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(example = "trade-1")]
     pub id: String,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
@@ -154,6 +169,8 @@ pub struct OrderTradeEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderDetail {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
     pub order_hash: FixedBytes<32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]

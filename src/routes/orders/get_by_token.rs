@@ -17,8 +17,33 @@ use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
 
+#[cfg(test)]
 pub(crate) async fn process_get_orders_by_token(
     ds: &dyn OrdersListDataSource,
+    address: Address,
+    state: Option<OrderState>,
+    side: Option<OrderSide>,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    denomination: Denomination,
+) -> Result<OrdersListResponse, ApiError> {
+    process_get_orders_by_token_for_chains(
+        ds,
+        None,
+        address,
+        state,
+        side,
+        page,
+        page_size,
+        denomination,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_get_orders_by_token_for_chains(
+    ds: &dyn OrdersListDataSource,
+    chain_ids: Option<Vec<u32>>,
     address: Address,
     state: Option<OrderState>,
     side: Option<OrderSide>,
@@ -54,7 +79,12 @@ pub(crate) async fn process_get_orders_by_token(
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
     let (orders, total_count) = ds
-        .get_orders_list(filters, Some(page_num), Some(effective_page_size))
+        .get_orders_list(
+            chain_ids,
+            filters,
+            Some(page_num),
+            Some(effective_page_size),
+        )
         .await
         .map_err(|error| {
             tracing::error!(%error, code = %ApiErrorCode::OrdersQueryFailed, "orders-by-token query failed");
@@ -84,7 +114,7 @@ pub(crate) async fn process_get_orders_by_token(
 
 #[utoipa::path(
     get,
-    path = "/v1/orders/token/{address}",
+    path = "/v2/orders/token/{address}",
     tag = "Orders",
     security(("basicAuth" = [])),
     params(
@@ -118,36 +148,64 @@ pub async fn get_orders_by_token(
         let addr = address.0;
         let state = params.state;
         let side = params.side;
+        let (client, chain_ids) = {
+            let raindex = shared_raindex.read().await;
+            let chain_ids =
+                crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
+            (raindex.client().clone(), chain_ids)
+        };
         let page = params.page;
         let page_size = params.page_size;
         let denomination = params.denomination.unwrap_or_default();
         if !app_state.response_caches.is_enabled() {
-            let raindex = shared_raindex.read().await;
             let ds = RaindexOrdersListDataSource {
-                client: raindex.client(),
+                client: &client,
                 caches: &app_state.response_caches,
                 pool: pool.inner(),
             };
-            let response =
-                process_get_orders_by_token(&ds, addr, state, side, page, page_size, denomination)
-                    .await?;
+            let response = process_get_orders_by_token_for_chains(
+                &ds,
+                chain_ids,
+                addr,
+                state,
+                side,
+                page,
+                page_size,
+                denomination,
+            )
+            .await?;
             return Ok(Json(response));
         }
 
-        let cache_key =
-            orders_by_token_cache_key(addr, state, side.as_ref(), page, page_size, denomination);
+        let cache_key = orders_by_token_cache_key(
+            chain_ids.as_deref(),
+            addr,
+            state,
+            side.as_ref(),
+            page,
+            page_size,
+            denomination,
+        );
         let response = app_state
             .response_caches
             .orders_by_token
             .get_or_try_insert(cache_key, || async move {
-                let raindex = shared_raindex.read().await;
                 let ds = RaindexOrdersListDataSource {
-                    client: raindex.client(),
+                    client: &client,
                     caches: &app_state.response_caches,
                     pool: pool.inner(),
                 };
-                process_get_orders_by_token(&ds, addr, state, side, page, page_size, denomination)
-                    .await
+                process_get_orders_by_token_for_chains(
+                    &ds,
+                    chain_ids,
+                    addr,
+                    state,
+                    side,
+                    page,
+                    page_size,
+                    denomination,
+                )
+                .await
             })
             .await
             .map_err(|e| (*e).clone())?;
@@ -158,6 +216,7 @@ pub async fn get_orders_by_token(
 }
 
 fn orders_by_token_cache_key(
+    chain_ids: Option<&[u32]>,
     address: Address,
     state: Option<OrderState>,
     side: Option<&OrderSide>,
@@ -179,8 +238,18 @@ fn orders_by_token_cache_key(
     let page_size = page_size
         .unwrap_or(DEFAULT_PAGE_SIZE as u16)
         .min(MAX_PAGE_SIZE);
+    let chain_key = chain_ids.map_or_else(
+        || "all".to_string(),
+        |chain_ids| {
+            chain_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
     format!(
-        "orders/token/{}/{state}/{side}/{page}/{page_size}/{denomination:?}",
+        "orders/token/{chain_key}/{}/{state}/{side}/{page}/{page_size}/{denomination:?}",
         address.to_string().to_ascii_lowercase()
     )
 }
@@ -403,8 +472,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            orders_by_token_cache_key(lower, None, None, None, None, Denomination::Wrapped),
+            orders_by_token_cache_key(None, lower, None, None, None, None, Denomination::Wrapped),
             orders_by_token_cache_key(
+                None,
                 mixed,
                 None,
                 None,
@@ -415,6 +485,7 @@ mod tests {
         );
         assert_ne!(
             orders_by_token_cache_key(
+                None,
                 lower,
                 Some(OrderState::Inactive),
                 None,
@@ -423,6 +494,7 @@ mod tests {
                 Denomination::Wrapped
             ),
             orders_by_token_cache_key(
+                None,
                 lower,
                 Some(OrderState::All),
                 None,

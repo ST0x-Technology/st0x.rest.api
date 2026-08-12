@@ -22,6 +22,7 @@ curl -X POST https://api.st0x.io/v2/swap/quote \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -35,6 +36,7 @@ curl -X POST https://api.st0x.io/v2/swap/quote \
 
 | Field              | Required | Description                                                                                                                                                            |
 | ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`          | Context  | Network chain ID. May be omitted only while the API has exactly one configured network                                                                                 |
 | `taker`            | No       | Wallet that would execute the swap. Recommended because oracle-backed orders can use it when building signed context                                                   |
 | `inputToken`       | Yes      | Address of the token the taker will spend                                                                                                                              |
 | `outputToken`      | Yes      | Address of the token the taker will receive                                                                                                                            |
@@ -51,6 +53,7 @@ Provide exactly one of `priceCap` or `slippageBps`.
 
 ```json
 {
+  "chainId": 8453,
   "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "outputToken": "0x4200000000000000000000000000000000000006",
   "mode": "buyUpTo",
@@ -127,9 +130,9 @@ POST /v1/swap/quote
 ```
 
 V1 accepts `inputToken`, `outputToken`, `outputAmount`, and optional
-`denomination`. It only supports an output-targeted quote and does not apply a
-slippage limit. Existing integrations can continue using it; new mode-based
-integrations should use V2.
+`denomination`, plus the same `chainId` selector as V2. It only supports an
+output-targeted quote and does not apply a slippage limit. Existing integrations
+can continue using it; new mode-based integrations should use V2.
 
 Do not pass unwrapped-normalized quote values into other endpoints unless those
 endpoints explicitly support `denomination=unwrapped` and you call them that
@@ -155,6 +158,7 @@ curl -X POST https://api.st0x.io/v2/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -168,6 +172,7 @@ curl -X POST https://api.st0x.io/v2/swap/calldata \
 
 | Field              | Type   | Description                                                                                                                                                                                      |
 | ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `chainId`          | number | Network chain ID. May be omitted only while the API has exactly one configured network                                                                                                           |
 | `taker`            | string | Wallet that will execute the swap and whose allowance is checked                                                                                                                                 |
 | `inputToken`       | string | Wrapped/orderbook token the taker will spend                                                                                                                                                     |
 | `outputToken`      | string | Wrapped/orderbook token the taker will receive                                                                                                                                                   |
@@ -204,6 +209,7 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -215,6 +221,7 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
 
 | Field            | Type   | Description                                                                                                                                                                     |
 | ---------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`        | number | Network chain ID. May be omitted only while the API has exactly one configured network                                                                                          |
 | `taker`          | string | Your wallet address that will execute the transaction                                                                                                                           |
 | `inputToken`     | string | Wrapped/orderbook token address you are selling                                                                                                                                 |
 | `outputToken`    | string | Wrapped/orderbook token address you want to receive                                                                                                                             |
@@ -245,6 +252,7 @@ required transactions:
 
 ```json
 {
+  "chainId": 8453,
   "to": "0xOrderbookContractAddress",
   "data": "0x",
   "value": "0x0",
@@ -268,6 +276,7 @@ the swap calldata:
 
 ```json
 {
+  "chainId": 8453,
   "to": "0xOrderbookContractAddress",
   "data": "0xabcdef...",
   "value": "0x0",
@@ -280,6 +289,7 @@ the swap calldata:
 
 | Field              | Type   | Description                                                                                                                                                                                    |
 | ------------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`          | number | Network chain ID used to build the transaction                                                                                                                                                 |
 | `to`               | string | Contract address to send the transaction to                                                                                                                                                    |
 | `data`             | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed                                                                                                                        |
 | `value`            | string | Native token value to send (usually `"0x0"`)                                                                                                                                                   |
@@ -321,6 +331,7 @@ QUOTE=$(curl -s -X POST https://api.st0x.io/v2/swap/quote \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -338,6 +349,7 @@ CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -365,6 +377,7 @@ if [ "$APPROVALS" != "[]" ]; then
     -H "Authorization: Basic <credentials>" \
     -H "Content-Type: application/json" \
     -d '{
+      "chainId": 8453,
       "taker": "0xYourWalletAddress",
       "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       "outputToken": "0x4200000000000000000000000000000000000006",

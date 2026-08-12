@@ -16,6 +16,7 @@ use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrd
 use rain_orderbook_common::raindex_client::trades::{
     GetTradesByOrderHashesFilters, OrderHashes, RaindexTrade,
 };
+use rain_orderbook_common::raindex_client::types::ChainIds;
 use rain_orderbook_common::raindex_client::types::TimeFilter;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
@@ -24,6 +25,13 @@ use std::collections::HashMap;
 #[async_trait]
 pub(crate) trait OrderDataSource: Send + Sync {
     async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError>;
+    async fn get_orders_by_hash_on_chain(
+        &self,
+        _chain_id: u32,
+        hash: B256,
+    ) -> Result<Vec<RaindexOrder>, ApiError> {
+        self.get_orders_by_hash(hash).await
+    }
     async fn get_order_quotes(
         &self,
         order: &RaindexOrder,
@@ -35,6 +43,13 @@ pub(crate) trait OrderDataSource: Send + Sync {
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
+    }
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        self.get_wrap_ratios_for_tokens(token_addresses).await
     }
 }
 
@@ -57,6 +72,25 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
+                ApiError::Internal("failed to query orders".into())
+            })
+    }
+
+    async fn get_orders_by_hash_on_chain(
+        &self,
+        chain_id: u32,
+        hash: B256,
+    ) -> Result<Vec<RaindexOrder>, ApiError> {
+        let filters = GetOrdersFilters {
+            order_hash: Some(hash),
+            ..Default::default()
+        };
+        self.client
+            .get_orders(Some(ChainIds(vec![chain_id])), Some(filters), None, None)
+            .await
+            .map(|result| result.orders().to_vec())
+            .map_err(|error| {
+                tracing::error!(chain_id, %error, "failed to query orders");
                 ApiError::Internal("failed to query orders".into())
             })
     }
@@ -92,7 +126,11 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
 
         let result = self
             .client
-            .get_trades_by_order_hashes(None, OrderHashes(vec![order_hash]), Some(filters))
+            .get_trades_by_order_hashes(
+                Some(ChainIds(vec![order.chain_id()])),
+                OrderHashes(vec![order_hash]),
+                Some(filters),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query order trades");
@@ -135,6 +173,29 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
         persist_wrap_ratio_snapshots_best_effort(pool, &responses).await;
         Ok(wrap_ratio_values_from_responses(responses))
     }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let Some(pool) = self.pool else {
+            return Ok(HashMap::new());
+        };
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|error| {
+                tracing::error!(%error, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .filter(|token| token.network.chain_id == chain_id)
+            .collect();
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
+    }
 }
 
 pub use cancel::*;
@@ -149,6 +210,10 @@ pub fn routes() -> Vec<Route> {
         get_order::get_order,
         cancel::post_order_cancel
     ]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }
 
 #[cfg(test)]

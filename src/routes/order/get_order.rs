@@ -20,7 +20,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/order/{order_hash}",
+    path = "/v2/order/{order_hash}",
     tag = "Order",
     security(("basicAuth" = [])),
     params(
@@ -52,24 +52,36 @@ pub async fn get_order(
         let hash = order_hash.0;
         let denomination = params.denomination.unwrap_or_default();
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), params.chain_id)?;
         let ds = RaindexOrderDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
             pool: Some(pool.inner()),
         };
-        let detail = process_get_order(&ds, hash, denomination).await?;
+        let detail = process_get_order_for_chain(&ds, chain_id, hash, denomination).await?;
         Ok(Json(detail))
     }
     .instrument(span.0)
     .await
 }
 
+#[cfg(test)]
 async fn process_get_order(
     ds: &dyn OrderDataSource,
     hash: B256,
     denomination: Denomination,
 ) -> Result<OrderDetail, ApiError> {
-    let orders = ds.get_orders_by_hash(hash).await?;
+    process_get_order_for_chain(ds, 8453, hash, denomination).await
+}
+
+async fn process_get_order_for_chain(
+    ds: &dyn OrderDataSource,
+    chain_id: u32,
+    hash: B256,
+    denomination: Denomination,
+) -> Result<OrderDetail, ApiError> {
+    let orders = ds.get_orders_by_hash_on_chain(chain_id, hash).await?;
     let order = orders
         .into_iter()
         .next()
@@ -158,6 +170,7 @@ fn build_order_detail(
     };
 
     Ok(OrderDetail {
+        chain_id: order.chain_id(),
         order_hash: order.order_hash(),
         owner: order.owner(),
         order_details: OrderDetailsInfo {
@@ -216,6 +229,7 @@ fn map_trade(
     };
 
     Ok(OrderTradeEntry {
+        chain_id: trade.chain_id(),
         id: trade.id().to_string(),
         tx_hash: tx.id(),
         input_amount,
@@ -244,7 +258,8 @@ async fn current_wrap_ratios_for_order_detail(
     token_addresses.sort_unstable();
     token_addresses.dedup();
 
-    ds.get_wrap_ratios_for_tokens(&token_addresses).await
+    ds.get_wrap_ratios_for_tokens_on_chain(order.chain_id(), &token_addresses)
+        .await
 }
 
 #[cfg(test)]

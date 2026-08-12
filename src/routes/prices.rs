@@ -132,7 +132,7 @@ pub struct MarketPriceHistoryResponse {
 
 #[utoipa::path(
     get,
-    path = "/v1/prices",
+    path = "/v2/prices",
     tag = "Prices",
     security(("basicAuth" = [])),
     params(PricesParams),
@@ -316,7 +316,7 @@ async fn price_responses_for_market(
 
 #[utoipa::path(
     get,
-    path = "/v1/prices/{address}/history",
+    path = "/v2/prices/{address}/history",
     tag = "Prices",
     security(("basicAuth" = [])),
     params(
@@ -649,6 +649,10 @@ fn float_error(error: rain_math_float::FloatError) -> ApiError {
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![get_prices, get_price_history]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }
 
 #[cfg(test)]

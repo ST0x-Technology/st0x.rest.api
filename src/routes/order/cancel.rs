@@ -13,7 +13,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     post,
-    path = "/v1/order/cancel",
+    path = "/v2/order/cancel",
     tag = "Order",
     security(("basicAuth" = [])),
     request_body = CancelOrderRequest,
@@ -40,23 +40,34 @@ pub async fn post_order_cancel(
         tracing::info!(body = ?req, "request received");
         let hash: B256 = req.order_hash;
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
         let ds = RaindexOrderDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
             pool: None,
         };
-        let response = process_cancel_order(&ds, hash).await?;
+        let response = process_cancel_order_for_chain(&ds, chain_id, hash).await?;
         Ok(Json(response))
     }
     .instrument(span.0)
     .await
 }
 
+#[cfg(test)]
 async fn process_cancel_order(
     ds: &dyn OrderDataSource,
     hash: B256,
 ) -> Result<CancelOrderResponse, ApiError> {
-    let orders = ds.get_orders_by_hash(hash).await?;
+    process_cancel_order_for_chain(ds, 8453, hash).await
+}
+
+async fn process_cancel_order_for_chain(
+    ds: &dyn OrderDataSource,
+    chain_id: u32,
+    hash: B256,
+) -> Result<CancelOrderResponse, ApiError> {
+    let orders = ds.get_orders_by_hash_on_chain(chain_id, hash).await?;
     let order = orders
         .into_iter()
         .next()
@@ -98,6 +109,7 @@ async fn process_cancel_order(
     };
 
     Ok(CancelOrderResponse {
+        chain_id: order.chain_id(),
         transactions: vec![tx],
         summary,
     })

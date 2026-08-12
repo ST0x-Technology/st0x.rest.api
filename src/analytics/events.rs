@@ -97,6 +97,7 @@ pub(crate) fn swap_quoted_event(
 ) -> AnalyticsEvent {
     let info = key.client_info();
     let mut props = base_props(&info);
+    props.insert("chain_id".to_string(), resp.chain_id.into());
     props.insert("input_token".to_string(), token_str(input_token).into());
     props.insert("output_token".to_string(), token_str(output_token).into());
     props.insert("denomination".to_string(), denomination);
@@ -128,6 +129,7 @@ pub(crate) fn swap_quoted_v2_event(
 ) -> AnalyticsEvent {
     let info = key.client_info();
     let mut props = base_props(&info);
+    props.insert("chain_id".to_string(), resp.chain_id.into());
     props.insert(
         "input_token".to_string(),
         token_str(resp.input_token).into(),
@@ -187,6 +189,7 @@ pub(crate) fn swap_calldata_generated_event(
     let info = key.client_info();
     let taker_id = token_str(taker);
     let mut props = base_props(&info);
+    props.insert("chain_id".to_string(), resp.chain_id.into());
     props.insert("taker".to_string(), taker_id.clone().into());
     props.insert("input_token".to_string(), token_str(input_token).into());
     props.insert("output_token".to_string(), token_str(output_token).into());
@@ -214,6 +217,7 @@ pub(crate) fn swap_calldata_generated_event(
 /// sending no traffic at all. This carries the *request* instead, captured before it
 /// is consumed, so a failure reports the pair and size that produced it.
 pub(crate) struct SwapFailure<'a> {
+    pub chain_id: Option<u32>,
     pub input_token: Address,
     pub output_token: Address,
     /// The requested amount, verbatim. Which side it denominates depends on the
@@ -256,6 +260,9 @@ fn swap_failed_event(
     let info = key.client_info();
     let code = error.code();
     let mut props = base_props(&info);
+    if let Some(chain_id) = failure.chain_id {
+        props.insert("chain_id".to_string(), chain_id.into());
+    }
     props.insert(
         "input_token".to_string(),
         token_str(failure.input_token).into(),
@@ -357,6 +364,7 @@ mod tests {
     #[test]
     fn swap_quoted_event_is_client_scoped() {
         let resp = SwapQuoteResponse {
+            chain_id: 8453,
             input_token: addr(1),
             output_token: addr(2),
             output_amount: "0.5".to_string(),
@@ -381,6 +389,7 @@ mod tests {
         let event = swap_quote_failed_event(
             &test_key(),
             SwapFailure {
+                chain_id: Some(8453),
                 input_token: addr(1),
                 output_token: addr(2),
                 requested_amount: "0.01",
@@ -415,6 +424,7 @@ mod tests {
         let event = swap_quote_failed_event(
             &test_key(),
             SwapFailure {
+                chain_id: Some(8453),
                 input_token: addr(1),
                 output_token: addr(2),
                 requested_amount: "customer@example.com",
@@ -443,6 +453,7 @@ mod tests {
         let event = swap_calldata_failed_event(
             &test_key(),
             SwapFailure {
+                chain_id: Some(8453),
                 input_token: addr(7),
                 output_token: addr(7),
                 requested_amount: "100",
@@ -471,6 +482,7 @@ mod tests {
     #[test]
     fn swap_calldata_event_is_keyed_on_lowercased_taker() {
         let resp = SwapCalldataResponse {
+            chain_id: 8453,
             to: addr(9),
             data: Default::default(),
             value: alloy::primitives::U256::from(1000u64),

@@ -24,6 +24,7 @@ mod source;
 pub(crate) struct AttributionWorker {
     app_pool: DbPool,
     raindex_db_path: PathBuf,
+    chain_ids: Vec<u32>,
     signer: Address,
     start_block: u64,
     interval: Duration,
@@ -35,6 +36,7 @@ impl AttributionWorker {
     pub(crate) fn new(
         app_pool: DbPool,
         raindex_db_path: PathBuf,
+        chain_ids: Vec<u32>,
         signer: Address,
         start_block: u64,
         interval: Duration,
@@ -43,6 +45,7 @@ impl AttributionWorker {
         Self {
             app_pool,
             raindex_db_path,
+            chain_ids,
             signer,
             start_block,
             interval,
@@ -122,9 +125,10 @@ async fn finish_worker_task(mut handle: JoinHandle<()>, timeout: Duration) {
 async fn run_sync_iteration(worker: &AttributionWorker) {
     match source::open_pool(&worker.raindex_db_path).await {
         Ok(source_pool) => {
-            let result = process_available_trades(
+            let result = process_available_trades_for_chains(
                 &worker.app_pool,
                 &source_pool,
+                &worker.chain_ids,
                 worker.signer,
                 worker.start_block,
                 worker.batch_size,
@@ -153,9 +157,10 @@ pub(crate) enum AttributionReportingError {
     StartBlockOverflow,
 }
 
-pub(crate) async fn process_available_trades(
+pub(crate) async fn process_available_trades_for_chains(
     app_pool: &DbPool,
     source_pool: &SqlitePool,
+    chain_ids: &[u32],
     signer: Address,
     start_block: u64,
     batch_size: u32,
@@ -163,7 +168,10 @@ pub(crate) async fn process_available_trades(
     let start_block =
         i64::try_from(start_block).map_err(|_| AttributionReportingError::StartBlockOverflow)?;
     attribution_db::record_signer(app_pool, signer).await?;
-    let targets = source::list_targets(source_pool, crate::CHAIN_ID).await?;
+    let mut targets = Vec::new();
+    for chain_id in chain_ids {
+        targets.extend(source::list_targets(source_pool, *chain_id).await?);
+    }
     attribution_db::snapshot_current_api_keys(app_pool).await?;
     let identities = attribution_db::load_api_key_identities(app_pool).await?;
     let identity_by_hash: HashMap<B256, attribution_db::ApiKeyIdentity> = identities
@@ -195,6 +203,25 @@ pub(crate) async fn process_available_trades(
         source_transaction.commit().await?;
     }
     Ok(attributed_count)
+}
+
+#[cfg(test)]
+async fn process_available_trades(
+    app_pool: &DbPool,
+    source_pool: &SqlitePool,
+    signer: Address,
+    start_block: u64,
+    batch_size: u32,
+) -> Result<u64, AttributionReportingError> {
+    process_available_trades_for_chains(
+        app_pool,
+        source_pool,
+        &[8453],
+        signer,
+        start_block,
+        batch_size,
+    )
+    .await
 }
 
 async fn process_target(
@@ -468,7 +495,7 @@ mod tests {
                 input_token, input_delta, output_vault_id, output_token, output_delta\
              ) VALUES (?, ?, ?, 'take', 'sell', ?, ?, '0', ?, ?, ?, ?, ?, '0', ?, ?, '0', ?, ?)",
         )
-        .bind(i64::from(crate::CHAIN_ID))
+        .bind(8453_i64)
         .bind(raindex)
         .bind(trade_id)
         .bind(ORDER_HASH.to_string())
@@ -497,7 +524,7 @@ mod tests {
                 output_io_index, taker_input, taker_output\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', 0, 0, ?, ?)",
         )
-        .bind(i64::from(crate::CHAIN_ID))
+        .bind(8453_i64)
         .bind(raindex)
         .bind(&tx_hash)
         .bind(log_index)
@@ -516,7 +543,7 @@ mod tests {
                 context_index, context_value\
              ) VALUES (?, ?, ?, ?, 0, ?)",
         )
-        .bind(i64::from(crate::CHAIN_ID))
+        .bind(8453_i64)
         .bind(raindex)
         .bind(&tx_hash)
         .bind(log_index)
@@ -531,7 +558,7 @@ mod tests {
                     context_index, value_index, value\
                  ) VALUES (?, ?, ?, ?, 0, ?, ?)",
             )
-            .bind(i64::from(crate::CHAIN_ID))
+            .bind(8453_i64)
             .bind(raindex)
             .bind(&tx_hash)
             .bind(log_index)
@@ -546,7 +573,7 @@ mod tests {
              VALUES (?, ?, ?) \
              ON CONFLICT(chain_id, raindex_address) DO UPDATE SET last_block = excluded.last_block",
         )
-        .bind(i64::from(crate::CHAIN_ID))
+        .bind(8453_i64)
         .bind(raindex)
         .bind(watermark)
         .execute(&mut *transaction)

@@ -40,7 +40,7 @@ struct ValidatedOrdersQuery {
 
 #[utoipa::path(
     post,
-    path = "/v1/orders/query",
+    path = "/v2/orders/query",
     tag = "Orders",
     security(("basicAuth" = [])),
     request_body = OrdersQueryRequest,
@@ -373,6 +373,7 @@ mod tests {
     impl OrdersListDataSource for MockDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,

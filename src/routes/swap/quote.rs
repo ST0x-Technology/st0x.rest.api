@@ -1,6 +1,6 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, snapshot_swap_context, RaindexSwapDataSource,
-    SwapAnalyticsContext, SwapDataSource,
+    capture_swap_outcome, ensure_distinct_tokens, request_chain_id, snapshot_swap_context,
+    RaindexSwapDataSource, SwapAnalyticsContext, SwapDataSource,
 };
 use crate::analytics::{
     swap_quote_failed_event, swap_quoted_event, swap_quoted_v2_event, Analytics, ApiVersion,
@@ -64,9 +64,12 @@ pub async fn post_swap_quote(
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     async move {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
+        req.chain_id = Some(chain_id);
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
@@ -111,7 +114,7 @@ pub async fn post_swap_quote_v2(
     request: Json<SwapQuoteV2Request>,
 ) -> Result<Json<SwapQuoteV2Response>, ApiError> {
     async move {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         tracing::info!(
             mode = ?req.mode,
             denomination = ?req.denomination,
@@ -119,6 +122,9 @@ pub async fn post_swap_quote_v2(
             "request received"
         );
         let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_chain_id(raindex.raindex_yaml(), req.chain_id)?;
+        req.chain_id = Some(chain_id);
         let ds = RaindexSwapDataSource {
             client: raindex.client(),
             caches: &app_state.response_caches,
@@ -139,6 +145,7 @@ async fn handle_swap_quote(
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
     let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         requested_amount: req.output_amount.clone(),
@@ -173,6 +180,7 @@ async fn handle_swap_quote_v2(
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
     let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         requested_amount: req.amount.clone(),
@@ -196,14 +204,15 @@ async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
+    let chain_id = request_chain_id(req.chain_id)?;
     ensure_distinct_tokens(req.input_token, req.output_token)?;
 
-    ds.validate_supported_tokens(req.input_token, req.output_token)
+    ds.validate_supported_tokens_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let orders = ds
-        .get_orders_for_pair(req.input_token, req.output_token)
+        .get_orders_for_pair_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
 
@@ -241,6 +250,7 @@ async fn process_swap_quote(
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
         ds,
+        chain_id,
         req.denomination,
         req.input_token,
         req.output_token,
@@ -271,6 +281,7 @@ async fn process_swap_quote(
     })?;
 
     Ok(SwapQuoteResponse {
+        chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         output_amount: req.output_amount,
@@ -285,10 +296,11 @@ async fn process_swap_quote_v2(
     ds: &dyn SwapDataSource,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
+    let chain_id = request_chain_id(req.chain_id)?;
     ensure_distinct_tokens(req.input_token, req.output_token)?;
     let price_limit = validate_quote_v2_price_limit(&req)?;
 
-    ds.validate_supported_tokens(req.input_token, req.output_token)
+    ds.validate_supported_tokens_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
@@ -296,6 +308,7 @@ async fn process_swap_quote_v2(
     let (amount, wrap_ratios) = normalize_calldata_request_amount(
         ds,
         CalldataAmountNormalization {
+            chain_id,
             denomination: req.denomination,
             input_token: req.input_token,
             output_token: req.output_token,
@@ -310,7 +323,7 @@ async fn process_swap_quote_v2(
         ParsedTakeOrdersMode::parse(mode, &amount).map_err(super::map_raindex_error)?;
 
     let orders = ds
-        .get_orders_for_pair(req.input_token, req.output_token)
+        .get_orders_for_pair_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
     if orders.is_empty() {
@@ -406,6 +419,7 @@ async fn process_swap_quote_v2(
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
         ds,
+        chain_id,
         req.denomination,
         req.input_token,
         req.output_token,
@@ -435,6 +449,7 @@ async fn process_swap_quote_v2(
     };
 
     Ok(SwapQuoteV2Response {
+        chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         mode: req.mode,
@@ -580,6 +595,7 @@ mod tests {
 
     fn quote_request(output_amount: &str) -> SwapQuoteRequest {
         SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
@@ -589,6 +605,7 @@ mod tests {
 
     fn quote_v2_request(mode: SwapCalldataMode, amount: &str) -> SwapQuoteV2Request {
         SwapQuoteV2Request {
+            chain_id: Some(8453),
             taker: None,
             input_token: USDC,
             output_token: WETH,
@@ -649,6 +666,7 @@ mod tests {
         output_amount: &str,
     ) -> SwapQuoteRequest {
         SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token,
             output_token,
             output_amount: output_amount.to_string(),

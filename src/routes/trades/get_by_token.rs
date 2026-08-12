@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 #[utoipa::path(
     get,
-    path = "/v1/trades/token/{address}",
+    path = "/v2/trades/token/{address}",
     tag = "Trades",
     security(("basicAuth" = [])),
     params(
@@ -46,13 +46,18 @@ pub async fn get_trades_by_token(
     async move {
         tracing::info!(address = ?address, params = ?params, "request received");
         let addr = address.0;
-        if !app_state.response_caches.is_enabled() {
+        let (client, chain_ids) = {
             let raindex = shared_raindex.read().await;
+            let chain_ids =
+                crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), params.chain_id)?;
+            (raindex.client().clone(), chain_ids)
+        };
+        if !app_state.response_caches.is_enabled() {
             let ds = RaindexTradesDataSource {
-                client: raindex.client(),
+                client: &client,
                 pool: pool.inner(),
             };
-            return process_get_trades_by_token(&ds, addr, params).await;
+            return process_get_trades_by_token_for_chains(&ds, chain_ids, addr, params).await;
         }
 
         let cache_key = trades_cache_key("trades/token", addr, &params);
@@ -60,12 +65,11 @@ pub async fn get_trades_by_token(
             .response_caches
             .trades_by_token
             .get_or_try_insert(cache_key, || async move {
-                let raindex = shared_raindex.read().await;
                 let ds = RaindexTradesDataSource {
-                    client: raindex.client(),
+                    client: &client,
                     pool: pool.inner(),
                 };
-                process_get_trades_by_token(&ds, addr, params)
+                process_get_trades_by_token_for_chains(&ds, chain_ids, addr, params)
                     .await
                     .map(Json::into_inner)
             })
@@ -83,7 +87,11 @@ pub(super) fn trades_cache_key(
     params: &TradesPaginationParams,
 ) -> String {
     format!(
-        "{route}/{}/{}/{}/{}/{}/{:?}",
+        "{route}/{}/{}/{}/{}/{}/{}/{:?}",
+        params
+            .chain_id
+            .map(|chain_id| chain_id.to_string())
+            .unwrap_or_else(|| "all".to_string()),
         address.to_string().to_ascii_lowercase(),
         params.page.unwrap_or(1),
         params.page_size.unwrap_or(20),
@@ -99,8 +107,18 @@ pub(super) fn trades_cache_key(
     )
 }
 
+#[cfg(test)]
 pub(super) async fn process_get_trades_by_token(
     ds: &dyn TradesDataSource,
+    token: Address,
+    params: TradesPaginationParams,
+) -> Result<Json<TradesByAddressResponse>, ApiError> {
+    process_get_trades_by_token_for_chains(ds, None, token, params).await
+}
+
+async fn process_get_trades_by_token_for_chains(
+    ds: &dyn TradesDataSource,
+    chain_ids: Option<Vec<u32>>,
     token: Address,
     params: TradesPaginationParams,
 ) -> Result<Json<TradesByAddressResponse>, ApiError> {
@@ -109,7 +127,7 @@ pub(super) async fn process_get_trades_by_token(
 
     tracing::info!(token = ?token, page, page_size, "querying trades by token");
     let result = ds
-        .get_trades_for_token(token, sdk_page, sdk_page_size, time_filter)
+        .get_trades_for_token_on_chains(chain_ids, token, sdk_page, sdk_page_size, time_filter)
         .await?;
 
     build_trades_list_response(ds, result, page, page_size, denomination).await
@@ -181,6 +199,7 @@ mod tests {
             token_result: Ok(mock_trades_list_result()),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -217,6 +236,7 @@ mod tests {
             .parse()
             .unwrap();
         let default_params = TradesPaginationParams {
+            chain_id: None,
             page: None,
             page_size: None,
             start_time: None,
@@ -224,6 +244,7 @@ mod tests {
             denomination: None,
         };
         let explicit_params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -243,6 +264,7 @@ mod tests {
             token_result: Ok(mock_empty_trades_list_result()),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,
@@ -270,6 +292,7 @@ mod tests {
             token_result: Err(ApiError::Internal("subgraph error".into())),
         };
         let params = TradesPaginationParams {
+            chain_id: None,
             page: Some(1),
             page_size: Some(20),
             start_time: None,

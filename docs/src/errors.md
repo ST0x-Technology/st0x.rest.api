@@ -87,7 +87,7 @@ curl -X POST https://api.st0x.io/v1/swap/quote \
 ### Not Found
 
 ```bash
-curl https://api.st0x.io/v1/order/0xinvalidhash \
+curl "https://api.st0x.io/v2/order/0xinvalidhash?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 

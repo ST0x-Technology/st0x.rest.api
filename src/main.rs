@@ -24,8 +24,6 @@ mod telemetry;
 mod types;
 mod wrap_ratio;
 
-pub(crate) const CHAIN_ID: u32 = 8453;
-
 #[cfg(test)]
 mod test_helpers;
 
@@ -231,13 +229,19 @@ pub(crate) fn rocket(
         .manage(market_price_state)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
+        .mount("/v2/tokens", routes::tokens::routes_v2())
         .mount("/v1/prices", routes::prices::routes())
+        .mount("/v2/prices", routes::prices::routes_v2())
         .mount("/v1/swap", routes::swap::routes())
         .mount("/v2/swap", routes::swap::routes_v2())
         .mount("/v1/order", routes::order::routes())
+        .mount("/v2/order", routes::order::routes_v2())
         .mount("/v1/orders", routes::orders::routes())
+        .mount("/v2/orders", routes::orders::routes_v2())
         .mount("/v1/vaults", routes::vaults::routes())
+        .mount("/v2/vaults", routes::vaults::routes_v2())
         .mount("/v1/trades", routes::trades::routes())
+        .mount("/v2/trades", routes::trades::routes_v2())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
         .mount("/admin/attribution", routes::attribution_admin::routes())
@@ -466,6 +470,21 @@ async fn main() {
                     }
                 };
 
+            let attribution_chain_ids =
+                match routes::configured_chain_ids(raindex_config.raindex_yaml()) {
+                    Ok(chain_ids) if !chain_ids.is_empty() => chain_ids,
+                    Ok(_) => {
+                        tracing::error!("registry has no configured networks");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to resolve configured networks");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
+
             let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
@@ -565,6 +584,7 @@ async fn main() {
                 rocket = rocket.attach(attribution_reporting::AttributionWorker::new(
                     attribution_pool,
                     std::path::PathBuf::from(&cfg.local_db_path),
+                    attribution_chain_ids,
                     attribution_signer_address,
                     start_block,
                     std::time::Duration::from_secs(cfg.attribution_sync_interval_seconds.max(1)),
@@ -611,11 +631,11 @@ mod tests {
     #[test]
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
-        let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
+        let proofs_path = &openapi["paths"]["/v2/tokens/{address}/proofs"]["get"];
         let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
-        let orders_query_path = &openapi["paths"]["/v1/orders/query"]["post"];
-        let trades_query_path = &openapi["paths"]["/v1/trades/query"]["post"];
+        let orders_query_path = &openapi["paths"]["/v2/orders/query"]["post"];
+        let trades_query_path = &openapi["paths"]["/v2/trades/query"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
         assert_eq!(
@@ -734,7 +754,7 @@ mod tests {
     #[test]
     fn test_openapi_documents_token_details_activity_limit() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
-        let details_path = &openapi["paths"]["/v1/tokens/{address}/details"]["get"];
+        let details_path = &openapi["paths"]["/v2/tokens/{address}/details"]["get"];
         let parameters = details_path["parameters"]
             .as_array()
             .expect("parameters is an array");
@@ -742,6 +762,9 @@ mod tests {
         assert!(parameters
             .iter()
             .any(|parameter| parameter["name"] == "activityLimit"));
+        assert!(parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "chainId"));
         assert!(!parameters
             .iter()
             .any(|parameter| parameter["name"] == "activity_limit"));

@@ -35,6 +35,7 @@ type OrderQuoteResult = Result<Vec<RaindexOrderQuote>, ApiError>;
 type OrderQuoteBatchResult = Result<Vec<Vec<RaindexOrderQuote>>, ApiError>;
 type IndexedOrder = (usize, RaindexOrder);
 type GroupedOrders = BTreeMap<u32, Vec<IndexedOrder>>;
+pub(crate) type OrderWrapRatioMap = HashMap<(u32, Address), WrapRatioValue>;
 
 enum OrderQuoteCacheResult {
     ApiError(ApiError),
@@ -51,6 +52,7 @@ pub(crate) struct OrderQuoteSummary {
 pub(crate) trait OrdersListDataSource: Send + Sync {
     async fn get_orders_list(
         &self,
+        chain_ids: Option<Vec<u32>>,
         filters: GetOrdersFilters,
         page: Option<u16>,
         page_size: Option<u16>,
@@ -79,6 +81,14 @@ pub(crate) trait OrdersListDataSource: Send + Sync {
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
+    }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        self.get_wrap_ratios_for_tokens(token_addresses).await
     }
 }
 
@@ -308,13 +318,14 @@ where
 impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
     async fn get_orders_list(
         &self,
+        chain_ids: Option<Vec<u32>>,
         filters: GetOrdersFilters,
         page: Option<u16>,
         page_size: Option<u16>,
     ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
         let result = self
             .client
-            .get_orders(None, Some(filters), page, page_size)
+            .get_orders(chain_ids.map(ChainIds), Some(filters), page, page_size)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
@@ -454,6 +465,27 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
                 ApiError::Internal("failed to retrieve curated tokens".into())
             })?
             .into_values()
+            .collect();
+
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
+    }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|error| {
+                tracing::error!(%error, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .filter(|token| token.network.chain_id == chain_id)
             .collect();
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
@@ -653,7 +685,7 @@ pub(crate) fn build_orders_list_response(
     page_size: u32,
     quote_results: Vec<OrderQuoteResult>,
     denomination: Denomination,
-    wrap_ratios: &HashMap<Address, WrapRatioValue>,
+    wrap_ratios: &OrderWrapRatioMap,
 ) -> Result<OrdersListResponse, ApiError> {
     if quote_results.len() != orders.len() {
         tracing::error!(
@@ -667,12 +699,18 @@ pub(crate) fn build_orders_list_response(
     let mut summaries = Vec::with_capacity(orders.len());
     for (order, quotes_result) in orders.iter().zip(quote_results) {
         let quote_summary = quote_result_to_summary(order, quotes_result);
+        let order_wrap_ratios = wrap_ratios
+            .iter()
+            .filter_map(|((chain_id, address), ratio)| {
+                (*chain_id == order.chain_id()).then_some((*address, ratio.clone()))
+            })
+            .collect();
         summaries.push(build_order_summary(
             order,
             &quote_summary.io_ratio,
             quote_summary.max_output,
             denomination,
-            wrap_ratios,
+            &order_wrap_ratios,
         )?);
     }
 
@@ -686,21 +724,32 @@ pub(crate) async fn current_wrap_ratios_for_orders(
     ds: &dyn OrdersListDataSource,
     denomination: Denomination,
     orders: &[RaindexOrder],
-) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+) -> Result<OrderWrapRatioMap, ApiError> {
     if denomination == Denomination::Wrapped || orders.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut token_addresses = Vec::new();
+    let mut token_addresses_by_chain: BTreeMap<u32, Vec<Address>> = BTreeMap::new();
     for order in orders {
         let (input, output) = super::resolve_io_vaults(order)?;
+        let token_addresses = token_addresses_by_chain
+            .entry(order.chain_id())
+            .or_default();
         token_addresses.push(input.token().address());
         token_addresses.push(output.token().address());
     }
-    token_addresses.sort_unstable();
-    token_addresses.dedup();
-
-    ds.get_wrap_ratios_for_tokens(&token_addresses).await
+    let mut ratios = HashMap::new();
+    for (chain_id, mut token_addresses) in token_addresses_by_chain {
+        token_addresses.sort_unstable();
+        token_addresses.dedup();
+        ratios.extend(
+            ds.get_wrap_ratios_for_tokens_on_chain(chain_id, &token_addresses)
+                .await?
+                .into_iter()
+                .map(|(address, ratio)| ((chain_id, address), ratio)),
+        );
+    }
+    Ok(ratios)
 }
 
 pub use get_by_owner::*;
@@ -715,6 +764,10 @@ pub fn routes() -> Vec<Route> {
         get_by_token::get_orders_by_token,
         query::post_orders_query
     ]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }
 
 #[cfg(test)]
@@ -741,6 +794,7 @@ pub(crate) mod test_fixtures {
     impl OrdersListDataSource for MockOrdersListDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,
@@ -766,6 +820,7 @@ pub(crate) mod test_fixtures {
     impl OrdersListDataSource for RecordingOrdersListDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,
@@ -804,6 +859,7 @@ mod tests {
     impl OrdersListDataSource for BatchingTestDataSource {
         async fn get_orders_list(
             &self,
+            _chain_ids: Option<Vec<u32>>,
             _filters: GetOrdersFilters,
             _page: Option<u16>,
             _page_size: Option<u16>,

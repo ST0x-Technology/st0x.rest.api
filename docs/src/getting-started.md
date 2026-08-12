@@ -42,7 +42,7 @@ echo -n "your_key_id:your_secret" | base64
 Then make an authenticated request to list available tokens:
 
 ```bash
-curl https://api.st0x.io/v1/tokens \
+curl "https://api.st0x.io/v2/tokens?chainId=8453" \
   -H "Authorization: Basic <base64_credentials>"
 ```
 
@@ -52,8 +52,10 @@ See [Authentication](./authentication.md) for details on the auth format.
 
 A common integration flow looks like this:
 
-1. **List tokens** — `GET /v1/tokens` to discover available trading pairs
-2. **Get a quote** — `POST /v1/swap/quote` to see estimated pricing
+1. **List tokens** — `GET /v2/tokens?chainId=<chain-id>` to discover available
+   trading pairs
+2. **Get a quote** — `POST /v2/swap/quote` with `chainId` to see estimated
+   pricing
 3. **Get calldata** — `POST /v2/swap/calldata` to generate the transaction
 4. **Handle approvals** — If the response includes `approvals`, send those
    transactions on-chain, then call the calldata endpoint again
@@ -63,12 +65,12 @@ A common integration flow looks like this:
 You can also create orders and monitor their trades. Like swaps, the order
 endpoints return calldata that you execute on-chain yourself:
 
-1. **Get order calldata** — `POST /v1/order/dca`
+1. **Get order calldata** — `POST /v2/order/dca` with `chainId`
 2. **Handle approvals** — If approvals are returned, send them on-chain, then
    call the endpoint again to get the deployment calldata
-3. **Monitor** — `GET /v1/order/{order_hash}` for status,
-   `GET /v1/trades/{address}` for fills
-4. **Cancel** — `POST /v1/order/cancel` to get cancellation calldata, then
-   execute on-chain
+3. **Monitor** — `GET /v2/order/{order_hash}?chainId=<chain-id>` for status,
+   `GET /v2/trades/{address}?chainId=<chain-id>` for fills
+4. **Cancel** — `POST /v2/order/cancel` with `chainId` to get cancellation
+   calldata, then execute on-chain
 
 Each of these flows is covered in detail in the following sections.

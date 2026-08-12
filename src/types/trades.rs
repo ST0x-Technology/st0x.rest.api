@@ -8,6 +8,9 @@ use utoipa::{IntoParams, ToSchema};
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct TradesPaginationParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "page")]
     #[param(example = 1)]
     pub page: Option<u32>,
@@ -29,6 +32,9 @@ pub struct TradesPaginationParams {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct TradesByTxParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "denomination")]
     #[param(example = "wrapped")]
     pub denomination: Option<Denomination>,
@@ -37,6 +43,8 @@ pub struct TradesByTxParams {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TradeByAddress {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
     pub tx_hash: FixedBytes<32>,
     #[schema(example = "1000000")]
@@ -165,6 +173,8 @@ pub struct TradeResult {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TradeByTxEntry {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
     pub order_hash: FixedBytes<32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
@@ -187,6 +197,8 @@ pub struct TradesTotals {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TradesByTxResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
     pub tx_hash: FixedBytes<32>,
     #[schema(example = 12345678)]
