@@ -523,11 +523,12 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         .unwrap();
 
     let oracle_body = services.oracle_bodies.lock().unwrap()[0].clone();
-    let oracle_request = <(OrderV4, U256, U256, Address)>::abi_decode(&oracle_body).unwrap();
-    assert_eq!(oracle_request.0, order);
-    assert_eq!(oracle_request.1, U256::ZERO);
-    assert_eq!(oracle_request.2, U256::ZERO);
-    assert_eq!(oracle_request.3, owner);
+    let oracle_request = <Vec<(OrderV4, U256, U256, Address)>>::abi_decode(&oracle_body).unwrap();
+    assert_eq!(oracle_request.len(), 1);
+    assert_eq!(oracle_request[0].0, order);
+    assert_eq!(oracle_request[0].1, U256::ZERO);
+    assert_eq!(oracle_request[0].2, U256::ZERO);
+    assert_eq!(oracle_request[0].3, owner);
 
     services.oracle_available.store(false, Ordering::SeqCst);
     let error = process_swap_calldata(&data_source, request)
