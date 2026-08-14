@@ -1,4 +1,4 @@
-use super::map_raindex_error;
+use super::{map_raindex_error, no_liquidity_error};
 use crate::error::ApiError;
 use alloy::primitives::Address;
 use rain_math_float::Float;
@@ -58,7 +58,7 @@ pub(crate) fn resolve_slippage_price_cap(
     let simulation = select_best_raindex_simulation(candidates, mode, simulation_price_cap)?;
     let worst_price = worst_price(&simulation)?.ok_or_else(|| {
         tracing::warn!("slippage simulation selected no order legs");
-        ApiError::NotFound("no liquidity found for this pair".into())
+        no_liquidity_error()
     })?;
     let multiplier = basis_points_multiplier(slippage_bps)?;
     worst_price.mul(multiplier).map_err(|error| {
@@ -122,7 +122,7 @@ pub(crate) fn select_best_raindex_simulation(
 
     best.map(|(_, simulation)| simulation).ok_or_else(|| {
         tracing::warn!("no raindex simulation produced liquidity for slippage resolution");
-        ApiError::NotFound("no liquidity found for this pair".into())
+        no_liquidity_error()
     })
 }
 

@@ -4,10 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
-use rain_orderbook_common::take_orders::TakeOrderCandidate;
 
+use crate::routes::swap::SwapCandidateBuild;
 use crate::types::orders::OrdersListResponse;
 use crate::types::trades::{TradesByAddressResponse, TradesQueryResponse};
+
+enum ConditionalCacheError<V, E> {
+    NotCacheable(V),
+    Fetch(E),
+}
 
 pub(crate) struct AppCache<K, V>(pub(crate) Cache<K, V>)
 where
@@ -58,6 +63,39 @@ where
         self.0.try_get_with(key, async move { fetch().await }).await
     }
 
+    pub(crate) async fn get_or_try_insert_if<F, Fut, E, P>(
+        &self,
+        key: K,
+        fetch: F,
+        should_cache: P,
+    ) -> Result<V, Arc<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<V, E>>,
+        E: Clone + Send + Sync + 'static,
+        P: FnOnce(&V) -> bool,
+    {
+        let result = self
+            .0
+            .try_get_with(key, async move {
+                let value = fetch().await.map_err(ConditionalCacheError::Fetch)?;
+                if should_cache(&value) {
+                    Ok(value)
+                } else {
+                    Err(ConditionalCacheError::NotCacheable(value))
+                }
+            })
+            .await;
+
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match error.as_ref() {
+                ConditionalCacheError::NotCacheable(value) => Ok(value.clone()),
+                ConditionalCacheError::Fetch(error) => Err(Arc::new(error.clone())),
+            },
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn invalidate_all(&self) {
         self.0.invalidate_all()
@@ -70,7 +108,7 @@ pub(crate) struct RouteResponseCaches {
     pub order_quotes: AppCache<String, Vec<RaindexOrderQuote>>,
     pub orders_by_token: AppCache<String, OrdersListResponse>,
     pub orders_query: AppCache<String, OrdersListResponse>,
-    pub swap_candidates: AppCache<String, Vec<TakeOrderCandidate>>,
+    pub swap_candidates: AppCache<String, SwapCandidateBuild>,
     pub trades_by_token: AppCache<String, TradesByAddressResponse>,
     pub trades_by_taker: AppCache<String, TradesByAddressResponse>,
     pub trades_query: AppCache<String, TradesQueryResponse>,
@@ -342,6 +380,23 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(cache.get(&"key").await.is_none());
+    }
+
+    #[rocket::async_test]
+    async fn test_get_or_try_insert_if_skips_rejected_values() {
+        let cache: AppCache<&str, u32> = AppCache::new(10, Duration::from_secs(60));
+
+        let first: Result<u32, Arc<String>> = cache
+            .get_or_try_insert_if("key", || async { Ok(1) }, |value| value.is_multiple_of(2))
+            .await;
+        assert_eq!(first.unwrap(), 1);
+        assert!(cache.get(&"key").await.is_none());
+
+        let second: Result<u32, Arc<String>> = cache
+            .get_or_try_insert_if("key", || async { Ok(2) }, |value| value.is_multiple_of(2))
+            .await;
+        assert_eq!(second.unwrap(), 2);
+        assert_eq!(cache.get(&"key").await, Some(2));
     }
 
     #[rocket::async_test]

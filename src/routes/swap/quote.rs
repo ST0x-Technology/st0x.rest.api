@@ -1,6 +1,6 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, snapshot_swap_context, RaindexSwapDataSource,
-    SwapAnalyticsContext, SwapDataSource,
+    capture_swap_outcome, ensure_distinct_tokens, no_liquidity_error, snapshot_swap_context,
+    RaindexSwapDataSource, SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
 };
 use crate::analytics::{
     swap_quote_failed_event, swap_quoted_event, swap_quoted_v2_event, Analytics, ApiVersion,
@@ -49,6 +49,7 @@ const FULL_FILL_RELATIVE_TOLERANCE: Float = Float::from_raw(fixed_bytes!(
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 503, description = "Required swap oracle unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
@@ -96,6 +97,8 @@ pub async fn post_swap_quote(
         (status = 422, description = "Request body could not be parsed", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
+        (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 503, description = "Required swap oracle unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
@@ -211,13 +214,18 @@ async fn process_swap_quote(
         return Err(no_liquidity_error());
     }
 
-    let candidates = ds
+    let SwapCandidateBuild {
+        candidates,
+        failures,
+    } = ds
         .build_candidates_for_pair(&orders, req.input_token, req.output_token, Address::ZERO)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     if candidates.is_empty() {
-        return Err(no_liquidity_error());
+        return Err(failures
+            .oracle_unavailable_error()
+            .unwrap_or_else(no_liquidity_error));
     }
 
     let buy_target = Float::parse(req.output_amount.clone()).map_err(|e| {
@@ -236,7 +244,15 @@ async fn process_swap_quote(
     })?;
 
     if sim.legs.is_empty() {
-        return Err(no_liquidity_error());
+        return Err(failures
+            .oracle_unavailable_error()
+            .unwrap_or_else(no_liquidity_error));
+    }
+
+    if !is_quote_fully_filled(sim.total_output, buy_target, false)? {
+        if let Some(error) = failures.oracle_unavailable_error() {
+            return Err(error);
+        }
     }
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
@@ -317,7 +333,10 @@ async fn process_swap_quote_v2(
         return Err(no_liquidity_error());
     }
 
-    let candidates = ds
+    let SwapCandidateBuild {
+        candidates,
+        failures,
+    } = ds
         .build_candidates_for_pair(
             &orders,
             req.input_token,
@@ -327,7 +346,9 @@ async fn process_swap_quote_v2(
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
     if candidates.is_empty() {
-        return Err(no_liquidity_error());
+        return Err(failures
+            .oracle_unavailable_error()
+            .unwrap_or_else(no_liquidity_error));
     }
 
     let price_cap = match price_limit {
@@ -349,6 +370,9 @@ async fn process_swap_quote_v2(
             slippage_bps,
             reference_io_ratio,
         } => {
+            if let Some(error) = failures.oracle_unavailable_error() {
+                return Err(error);
+            }
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
@@ -384,14 +408,27 @@ async fn process_swap_quote_v2(
     let is_exact_mode = parsed_mode.is_exact_mode();
     let target_amount = parsed_mode.target_amount();
     let simulation =
-        super::slippage::select_best_raindex_simulation(candidates, parsed_mode, price_cap)?;
+        super::slippage::select_best_raindex_simulation(candidates, parsed_mode, price_cap)
+            .map_err(|error| {
+                if matches!(
+                    &error,
+                    ApiError::Coded {
+                        code: ApiErrorCode::SwapNoLiquidity,
+                        ..
+                    }
+                ) {
+                    failures.oracle_unavailable_error().unwrap_or(error)
+                } else {
+                    error
+                }
+            })?;
     let achieved_amount = if is_buy_mode {
         simulation.total_output
     } else {
         simulation.total_input
     };
     let fully_filled = is_quote_fully_filled(achieved_amount, target_amount, is_exact_mode)?;
-    if is_exact_mode && !fully_filled {
+    if !fully_filled {
         let requested = target_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format requested quote amount");
             quote_failed_error()
@@ -401,7 +438,12 @@ async fn process_swap_quote_v2(
             quote_failed_error()
         })?;
         tracing::warn!(%requested, %available, "insufficient executable liquidity");
-        return Err(no_liquidity_error());
+        if let Some(error) = failures.oracle_unavailable_error() {
+            return Err(error);
+        }
+        if is_exact_mode {
+            return Err(no_liquidity_error());
+        }
     }
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
@@ -521,13 +563,6 @@ fn validate_quote_v2_price_limit(
     }
 }
 
-fn no_liquidity_error() -> ApiError {
-    ApiError::coded(
-        ApiErrorCode::SwapNoLiquidity,
-        "no executable liquidity is available for this pair",
-    )
-}
-
 fn quote_failed_error() -> ApiError {
     ApiError::coded(
         ApiErrorCode::SwapQuoteFailed,
@@ -636,6 +671,21 @@ mod tests {
         assert!(is_quote_fully_filled(overfill, target, false).unwrap());
     }
 
+    fn candidate_outcome_data_source(
+        candidates: Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>,
+        failures: Vec<super::super::SwapQuoteFailure>,
+    ) -> CandidateOutcomeDataSource {
+        CandidateOutcomeDataSource {
+            base: MockSwapDataSource {
+                supported_tokens: Ok(()),
+                orders: Ok(vec![mock_order()]),
+                candidates,
+                calldata_result: Err(ApiError::Internal("unused".into())),
+            },
+            failures: failures.into_iter().collect(),
+        }
+    }
+
     fn assert_error_code<T>(result: Result<T, ApiError>, expected: ApiErrorCode) {
         assert!(matches!(
             result,
@@ -676,6 +726,55 @@ mod tests {
         counterparties: Mutex<Vec<alloy::primitives::Address>>,
     }
 
+    struct CandidateOutcomeDataSource {
+        base: MockSwapDataSource,
+        failures: super::super::SwapQuoteFailures,
+    }
+
+    #[async_trait]
+    impl SwapDataSource for CandidateOutcomeDataSource {
+        async fn validate_supported_tokens(
+            &self,
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<(), ApiError> {
+            self.base
+                .validate_supported_tokens(input_token, output_token)
+                .await
+        }
+
+        async fn get_orders_for_pair(
+            &self,
+            input_token: alloy::primitives::Address,
+            output_token: alloy::primitives::Address,
+        ) -> Result<Vec<rain_orderbook_common::raindex_client::orders::RaindexOrder>, ApiError>
+        {
+            self.base
+                .get_orders_for_pair(input_token, output_token)
+                .await
+        }
+
+        async fn build_candidates_for_pair(
+            &self,
+            _orders: &[rain_orderbook_common::raindex_client::orders::RaindexOrder],
+            _input_token: alloy::primitives::Address,
+            _output_token: alloy::primitives::Address,
+            _counterparty: alloy::primitives::Address,
+        ) -> Result<super::super::SwapCandidateBuild, ApiError> {
+            Ok(super::super::SwapCandidateBuild {
+                candidates: self.base.candidates.clone(),
+                failures: self.failures.clone(),
+            })
+        }
+
+        async fn get_calldata(
+            &self,
+            request: rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest,
+        ) -> Result<crate::types::swap::SwapCalldataResponse, ApiError> {
+            self.base.get_calldata(request).await
+        }
+    }
+
     #[async_trait]
     impl SwapDataSource for RecordingCounterpartyDataSource {
         async fn validate_supported_tokens(
@@ -705,7 +804,7 @@ mod tests {
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
             counterparty: alloy::primitives::Address,
-        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+        ) -> Result<super::super::SwapCandidateBuild, ApiError> {
             self.counterparties
                 .lock()
                 .map_err(|_| ApiError::Internal("counterparty recorder poisoned".into()))?
@@ -752,7 +851,7 @@ mod tests {
             input_token: alloy::primitives::Address,
             output_token: alloy::primitives::Address,
             counterparty: alloy::primitives::Address,
-        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+        ) -> Result<super::super::SwapCandidateBuild, ApiError> {
             self.base
                 .build_candidates_for_pair(orders, input_token, output_token, counterparty)
                 .await
@@ -1307,6 +1406,94 @@ mod tests {
         };
         let result = process_swap_quote(&ds, quote_request("100")).await;
         assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_reports_oracle_unavailable() {
+        let ds = candidate_outcome_data_source(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_treats_order_reverts_as_no_liquidity() {
+        let ds = candidate_outcome_data_source(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::QuoteFailed],
+        );
+
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_succeeds_with_executable_and_unavailable_candidates() {
+        let ds = candidate_outcome_data_source(
+            vec![mock_candidate("1000", "1.5")],
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result = process_swap_quote(&ds, quote_request("100")).await.unwrap();
+
+        assert_eq!(result.estimated_input, "150");
+        assert_eq!(result.estimated_output, "100");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_partial_fill_reports_oracle_unavailable() {
+        let ds = candidate_outcome_data_source(
+            vec![mock_candidate("3", "2")],
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result = process_swap_quote(&ds, quote_request("8")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_exact_shortfall_reports_oracle_unavailable() {
+        let ds = candidate_outcome_data_source(
+            vec![mock_candidate("3", "2")],
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result =
+            process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendExact, "8")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_incomplete_price_cap_filter_reports_oracle_unavailable() {
+        let ds = candidate_outcome_data_source(
+            vec![mock_candidate("100", "3")],
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result =
+            process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::BuyUpTo, "5")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_up_to_shortfall_reports_oracle_unavailable() {
+        let ds = candidate_outcome_data_source(
+            vec![mock_candidate("3", "2")],
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result =
+            process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendUpTo, "8")).await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
     }
 
     #[rocket::async_test]

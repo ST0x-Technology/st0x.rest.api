@@ -21,6 +21,7 @@ pub enum ApiErrorCode {
     SwapUnsupportedToken,
     SwapSameToken,
     SwapNoLiquidity,
+    SwapOracleUnavailable,
     SwapQuoteFailed,
     SwapPreflightFailed,
     SwapCalldataFailed,
@@ -43,6 +44,7 @@ impl ApiErrorCode {
             Self::SwapUnsupportedToken => "SWAP_UNSUPPORTED_TOKEN",
             Self::SwapSameToken => "SWAP_SAME_TOKEN",
             Self::SwapNoLiquidity => "SWAP_NO_LIQUIDITY",
+            Self::SwapOracleUnavailable => "SWAP_ORACLE_UNAVAILABLE",
             Self::SwapQuoteFailed => "SWAP_QUOTE_FAILED",
             Self::SwapPreflightFailed => "SWAP_PREFLIGHT_FAILED",
             Self::SwapCalldataFailed => "SWAP_CALLDATA_FAILED",
@@ -65,7 +67,7 @@ impl ApiErrorCode {
             Self::RateLimited => Status::TooManyRequests,
             Self::NotYetIndexed => Status::Accepted,
             Self::OrdersQueryFailed | Self::TradesQueryFailed => Status::BadGateway,
-            Self::UpstreamUnavailable => Status::ServiceUnavailable,
+            Self::SwapOracleUnavailable | Self::UpstreamUnavailable => Status::ServiceUnavailable,
             Self::InternalError | Self::SwapQuoteFailed | Self::SwapCalldataFailed => {
                 Status::InternalServerError
             }
@@ -363,6 +365,10 @@ mod tests {
             (ApiErrorCode::SwapSameToken, Status::BadRequest),
             (ApiErrorCode::SwapPreflightFailed, Status::BadRequest),
             (ApiErrorCode::SwapNoLiquidity, Status::NotFound),
+            (
+                ApiErrorCode::SwapOracleUnavailable,
+                Status::ServiceUnavailable,
+            ),
             (ApiErrorCode::SwapQuoteFailed, Status::InternalServerError),
             (
                 ApiErrorCode::SwapCalldataFailed,

@@ -537,7 +537,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     assert!(matches!(
         error,
         ApiError::Coded {
-            code: ApiErrorCode::SwapNoLiquidity,
+            code: ApiErrorCode::SwapOracleUnavailable,
             ..
         }
     ));

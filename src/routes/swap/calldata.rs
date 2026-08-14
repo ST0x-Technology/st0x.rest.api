@@ -1,6 +1,6 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, snapshot_swap_context, RaindexSwapDataSource,
-    SwapAnalyticsContext, SwapDataSource,
+    capture_swap_outcome, ensure_distinct_tokens, no_liquidity_error, snapshot_swap_context,
+    RaindexSwapDataSource, SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
 };
 use crate::analytics::{
     swap_calldata_failed_event, swap_calldata_generated_event, Analytics, ApiVersion,
@@ -45,7 +45,7 @@ use tracing::Instrument;
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
-        (status = 503, description = "Required upstream unavailable", body = ApiErrorResponse),
+        (status = 503, description = "Required upstream or swap oracle unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
@@ -103,7 +103,7 @@ pub async fn post_swap_calldata(
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
-        (status = 503, description = "Required upstream unavailable", body = ApiErrorResponse),
+        (status = 503, description = "Required upstream or swap oracle unavailable", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
@@ -474,6 +474,33 @@ async fn process_swap_calldata_v2(
     })
 }
 
+async fn build_calldata_candidates(
+    ds: &dyn SwapDataSource,
+    input_token: Address,
+    output_token: Address,
+    taker: Address,
+) -> Result<SwapCandidateBuild, ApiError> {
+    let orders = ds
+        .get_orders_for_pair(input_token, output_token)
+        .await
+        .map_err(map_calldata_boundary_error)?;
+    if orders.is_empty() {
+        return Err(no_liquidity_error());
+    }
+
+    let candidate_build = ds
+        .build_candidates_for_pair(&orders, input_token, output_token, taker)
+        .await
+        .map_err(map_calldata_boundary_error)?;
+    if let Some(error) = candidate_build.failures.oracle_unavailable_error() {
+        return Err(error);
+    }
+    if candidate_build.candidates.is_empty() {
+        return Err(no_liquidity_error());
+    }
+    Ok(candidate_build)
+}
+
 async fn process_swap_calldata_build(
     ds: &dyn SwapDataSource,
     req: SwapCalldataBuildRequest,
@@ -502,6 +529,7 @@ async fn process_swap_calldata_build(
             )
             .await
             .map_err(map_calldata_boundary_error)?;
+            build_calldata_candidates(ds, req.input_token, req.output_token, req.taker).await?;
             (amount, price_cap, resolved_price_cap, wrap_ratios)
         }
         SwapCalldataPriceLimit::SlippageBps {
@@ -542,22 +570,10 @@ async fn process_swap_calldata_build(
                     })
                 })
                 .transpose()?;
-            let orders = ds
-                .get_orders_for_pair(req.input_token, req.output_token)
-                .await
-                .map_err(map_calldata_boundary_error)?;
-            if orders.is_empty() {
-                return Err(ApiError::coded(
-                    ApiErrorCode::SwapNoLiquidity,
-                    "no executable liquidity is available for this pair",
-                ));
-            }
-            let candidates = ds
-                .build_candidates_for_pair(&orders, req.input_token, req.output_token, req.taker)
-                .await
-                .map_err(map_calldata_boundary_error)?;
+            let candidate_build =
+                build_calldata_candidates(ds, req.input_token, req.output_token, req.taker).await?;
             let price_cap = super::slippage::resolve_slippage_price_cap(
-                candidates,
+                candidate_build.candidates,
                 req.mode,
                 &amount,
                 slippage_bps,
@@ -618,10 +634,7 @@ fn map_calldata_boundary_error(error: ApiError) -> ApiError {
     }
     if matches!(error, ApiError::NotFound(_)) {
         tracing::warn!(%error, code = %ApiErrorCode::SwapNoLiquidity, "swap calldata found no executable liquidity");
-        return ApiError::coded(
-            ApiErrorCode::SwapNoLiquidity,
-            "no executable liquidity is available for this pair",
-        );
+        return no_liquidity_error();
     }
     tracing::error!(%error, code = %ApiErrorCode::SwapCalldataFailed, "swap calldata boundary failed");
     ApiError::coded(
@@ -818,10 +831,11 @@ mod tests {
             MockCalldataDataSource {
                 base: MockSwapDataSource {
                     supported_tokens: Ok(()),
-                    orders: Ok(vec![]),
-                    candidates: vec![],
+                    orders: Ok(vec![mock_order()]),
+                    candidates: vec![mock_candidate("1000", "1.5")],
                     calldata_result: Ok(response),
                 },
+                failures: super::super::SwapQuoteFailures::default(),
                 wrap_ratios,
                 captured_request: Arc::clone(&captured_request),
                 captured_counterparty: Arc::new(Mutex::new(None)),
@@ -847,6 +861,7 @@ mod tests {
                     candidates: vec![mock_candidate("100", "2")],
                     calldata_result: Ok(ready_response()),
                 },
+                failures: super::super::SwapQuoteFailures::default(),
                 wrap_ratios: Ok(wrap_ratios),
                 captured_request: Arc::clone(&captured_request),
                 captured_counterparty: Arc::clone(&captured_counterparty),
@@ -856,8 +871,19 @@ mod tests {
         )
     }
 
+    fn capture_candidate_outcome_ds(
+        candidates: Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>,
+        failures: Vec<super::super::SwapQuoteFailure>,
+    ) -> (MockCalldataDataSource, CapturedTakeOrdersRequest) {
+        let (mut ds, captured_request, _) = capture_slippage_ds(HashMap::new());
+        ds.base.candidates = candidates;
+        ds.failures = failures.into_iter().collect();
+        (ds, captured_request)
+    }
+
     struct MockCalldataDataSource {
         base: MockSwapDataSource,
+        failures: super::super::SwapQuoteFailures,
         wrap_ratios: Result<HashMap<Address, WrapRatioValue>, ApiError>,
         captured_request: CapturedTakeOrdersRequest,
         captured_counterparty: CapturedCounterparty,
@@ -892,11 +918,14 @@ mod tests {
             input_token: Address,
             output_token: Address,
             counterparty: Address,
-        ) -> Result<Vec<rain_orderbook_common::take_orders::TakeOrderCandidate>, ApiError> {
+        ) -> Result<super::super::SwapCandidateBuild, ApiError> {
             *self.captured_counterparty.lock().unwrap() = Some(counterparty);
-            self.base
+            let mut candidate_build = self
+                .base
                 .build_candidates_for_pair(orders, input_token, output_token, counterparty)
-                .await
+                .await?;
+            candidate_build.failures = self.failures.clone();
+            Ok(candidate_build)
         }
 
         async fn get_calldata(
@@ -937,8 +966,8 @@ mod tests {
     async fn test_process_swap_calldata_ready() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Ok(ready_response()),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
@@ -957,8 +986,8 @@ mod tests {
     async fn test_handle_swap_calldata_captures_v1_analytics() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Ok(approval_response()),
         };
         let recording = RecordingSink::new();
@@ -992,8 +1021,8 @@ mod tests {
     async fn test_handle_swap_calldata_captures_v2_analytics() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Ok(approval_response()),
         };
         let recording = RecordingSink::new();
@@ -1026,8 +1055,8 @@ mod tests {
     async fn test_handle_swap_calldata_captures_v1_failure_analytics() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
         };
         let recording = RecordingSink::new();
@@ -1067,8 +1096,8 @@ mod tests {
     async fn test_handle_swap_calldata_v2_captures_attribution_failure_analytics() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             // Deliberately invalid ABI: processing succeeds, attribution embedding fails.
             calldata_result: Ok(ready_response()),
         };
@@ -1185,8 +1214,8 @@ mod tests {
     async fn test_process_swap_calldata_needs_approval() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Ok(approval_response()),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5"))
@@ -1322,6 +1351,74 @@ mod tests {
         assert_eq!(request.price_cap, "2.01");
         assert_eq!(result.resolved_price_cap, "2.01");
         assert_eq!(*captured_counterparty.lock().unwrap(), Some(TAKER));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_slippage_reports_oracle_unavailable() {
+        let (ds, captured_request) = capture_candidate_outcome_ds(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result = process_swap_calldata_v2(
+            &ds,
+            slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
+        )
+        .await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_slippage_treats_order_reverts_as_no_liquidity() {
+        let (ds, captured_request) = capture_candidate_outcome_ds(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::QuoteFailed],
+        );
+
+        let result = process_swap_calldata_v2(
+            &ds,
+            slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
+        )
+        .await;
+
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_slippage_rejects_incomplete_price_basis() {
+        let (ds, captured_request) = capture_candidate_outcome_ds(
+            vec![mock_candidate("100", "2")],
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result = process_swap_calldata_v2(
+            &ds,
+            slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
+        )
+        .await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        no_take_orders_request_was_made(&captured_request);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_calldata_v2_explicit_reports_oracle_unavailable() {
+        let (ds, captured_request) = capture_candidate_outcome_ds(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::OracleUnavailable],
+        );
+
+        let result = process_swap_calldata_v2(
+            &ds,
+            calldata_v2_request(SwapCalldataMode::SpendExact, "100", "2"),
+        )
+        .await;
+
+        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        no_take_orders_request_was_made(&captured_request);
     }
 
     #[rocket::async_test]
@@ -1755,8 +1852,8 @@ mod tests {
     async fn test_process_swap_calldata_bad_request() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::BadRequest("invalid parameters".into())),
         };
         let result = process_swap_calldata(&ds, calldata_request("not-a-number", "2.5")).await;
@@ -1767,8 +1864,8 @@ mod tests {
     async fn test_process_swap_calldata_internal_error() {
         let ds = MockSwapDataSource {
             supported_tokens: Ok(()),
-            orders: Ok(vec![]),
-            candidates: vec![],
+            orders: Ok(vec![mock_order()]),
+            candidates: vec![mock_candidate("1000", "1.5")],
             calldata_result: Err(ApiError::Internal("failed to generate calldata".into())),
         };
         let result = process_swap_calldata(&ds, calldata_request("100", "2.5")).await;
