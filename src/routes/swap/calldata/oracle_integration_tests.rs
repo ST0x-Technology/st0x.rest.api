@@ -17,7 +17,7 @@ use rain_orderbook_common::dotrain_order::DotrainOrder;
 use rain_orderbook_common::raindex_client::RaindexClient;
 use raindex_test_fixtures::LocalEvm;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,16 +31,25 @@ struct MockSwapServices {
 }
 
 impl MockSwapServices {
+    #[allow(dead_code)]
     async fn start(oracle_response: Value) -> Self {
+        Self::start_sequence(vec![oracle_response]).await
+    }
+
+    async fn start_sequence(oracle_responses: Vec<Value>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let subgraph_order = Arc::new(RwLock::new(None));
         let oracle_available = Arc::new(AtomicBool::new(true));
         let oracle_bodies = Arc::new(Mutex::new(Vec::new()));
+        let oracle_responses = Arc::new(Mutex::new(oracle_responses));
+        let oracle_call_index = Arc::new(AtomicUsize::new(0));
 
         let orders = Arc::clone(&subgraph_order);
         let available = Arc::clone(&oracle_available);
         let bodies = Arc::clone(&oracle_bodies);
+        let responses = Arc::clone(&oracle_responses);
+        let call_index = Arc::clone(&oracle_call_index);
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -49,7 +58,8 @@ impl MockSwapServices {
                 let orders = Arc::clone(&orders);
                 let available = Arc::clone(&available);
                 let bodies = Arc::clone(&bodies);
-                let oracle_response = oracle_response.clone();
+                let responses = Arc::clone(&responses);
+                let call_index = Arc::clone(&call_index);
                 tokio::spawn(async move {
                     let Some((path, body)) = read_request(&mut socket).await else {
                         return;
@@ -57,7 +67,11 @@ impl MockSwapServices {
                     let (status, response) = match path.as_str() {
                         "/oracle" if available.load(Ordering::SeqCst) => {
                             bodies.lock().unwrap().push(body);
-                            ("200 OK", oracle_response.to_string())
+                            let idx = call_index.fetch_add(1, Ordering::SeqCst);
+                            let responses = responses.lock().unwrap();
+                            let response =
+                                responses[idx.min(responses.len().saturating_sub(1))].to_string();
+                            ("200 OK", response)
                         }
                         "/oracle" => {
                             bodies.lock().unwrap().push(body);
@@ -330,18 +344,37 @@ fn subgraph_order_json(order: &OrderV4, order_hash: B256, meta: &[u8], raindex: 
 async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution() {
     let mut local_evm = LocalEvm::new().await;
     let oracle_signer = PrivateKeySigner::from(local_evm.anvil.keys()[0].clone());
-    let oracle_context = B256::from(U256::from(42));
-    let oracle_signature = oracle_signer
-        .sign_message(keccak256(oracle_context).as_slice())
-        .await
-        .unwrap();
-    let oracle_signature = Bytes::from(oracle_signature.as_bytes().to_vec());
+    let stale_oracle_context = B256::from(U256::from(42));
+    let fresh_oracle_context = B256::from(U256::from(99));
+    let stale_oracle_signature = Bytes::from(
+        oracle_signer
+            .sign_message(keccak256(stale_oracle_context).as_slice())
+            .await
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+    );
+    let fresh_oracle_signature = Bytes::from(
+        oracle_signer
+            .sign_message(keccak256(fresh_oracle_context).as_slice())
+            .await
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+    );
     let oracle_signer_address = oracle_signer.address();
-    let services = MockSwapServices::start(json!([{
-        "signer": oracle_signer_address,
-        "context": [oracle_context],
-        "signature": oracle_signature,
-    }]))
+    let services = MockSwapServices::start_sequence(vec![
+        json!([{
+            "signer": oracle_signer_address,
+            "context": [stale_oracle_context],
+            "signature": stale_oracle_signature,
+        }]),
+        json!([{
+            "signer": oracle_signer_address,
+            "context": [fresh_oracle_context],
+            "signature": fresh_oracle_signature,
+        }]),
+    ])
     .await;
     let owner = local_evm.signer_wallets[0].default_signer().address();
     let input = local_evm
@@ -450,8 +483,12 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     assert_eq!(decoded.config.orders[0].signedContext.len(), 2);
     let signed_context = &decoded.config.orders[0].signedContext[0];
     assert_eq!(signed_context.signer, oracle_signer_address);
-    assert_eq!(signed_context.context[0], oracle_context);
-    assert_eq!(signed_context.signature, oracle_signature);
+    assert_eq!(signed_context.context[0], fresh_oracle_context);
+    assert_eq!(signed_context.signature, fresh_oracle_signature);
+    assert!(
+        services.oracle_bodies.lock().unwrap().len() >= 2,
+        "calldata should refetch signed context after quote/preflight"
+    );
 
     let attributed_context = &decoded.config.orders[0].signedContext[1];
     assert_eq!(
@@ -507,8 +544,8 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     assert_eq!(v2_decoded.config.orders[0].signedContext.len(), 2);
     let v2_oracle_context = &v2_decoded.config.orders[0].signedContext[0];
     assert_eq!(v2_oracle_context.signer, oracle_signer_address);
-    assert_eq!(v2_oracle_context.context[0], oracle_context);
-    assert_eq!(v2_oracle_context.signature, oracle_signature);
+    assert_eq!(v2_oracle_context.context[0], fresh_oracle_context);
+    assert_eq!(v2_oracle_context.signature, fresh_oracle_signature);
     let v2_context = &v2_decoded.config.orders[0].signedContext[1];
     assert_eq!(v2_context.context[1], v2_attribution.api_key_hash);
 

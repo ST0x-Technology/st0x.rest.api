@@ -20,15 +20,20 @@ use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request, SwapCalldataV2RequestBody,
     SwapCalldataV2Response,
 };
-use alloy::primitives::{keccak256, Address, Bytes, Signature};
+use alloy::primitives::{keccak256, Address, Bytes, Signature, B256};
 use alloy::sol_types::{SolCall, SolValue};
+use futures::{stream, StreamExt, TryStreamExt};
 use rain_math_float::Float;
-use rain_orderbook_bindings::IRaindexV6::takeOrders4Call;
+use rain_orderbook_bindings::IRaindexV6::{takeOrders4Call, OrderV4};
+use rain_orderbook_common::oracle::{encode_oracle_body_batch, fetch_signed_context_batch};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::TakeOrdersMode;
 use rocket::serde::json::Json;
 use rocket::State;
+use std::collections::BTreeMap;
 use tracing::Instrument;
+
+const ORACLE_REFRESH_CONCURRENCY_LIMIT: usize = 8;
 
 #[utoipa::path(
     post,
@@ -619,13 +624,185 @@ async fn process_swap_calldata_build(
         .get_calldata(take_req)
         .await
         .map_err(map_calldata_boundary_error)?;
-    let calldata =
+    let mut calldata =
         normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
             .map_err(map_calldata_boundary_error)?;
+    refresh_oracle_signed_context(
+        ds,
+        &mut calldata,
+        req.input_token,
+        req.output_token,
+        req.taker,
+    )
+    .await
+    .map_err(map_calldata_boundary_error)?;
     Ok(SwapCalldataBuildResult {
         calldata,
         resolved_price_cap,
     })
+}
+
+/// Replace oracle signed context in executable takeOrders calldata with a
+/// freshly fetched frame. Quote/preflight reuse a frame that can already be
+/// near expiry (~20s TTL) by the time the response is returned.
+async fn refresh_oracle_signed_context(
+    ds: &dyn SwapDataSource,
+    calldata: &mut SwapCalldataResponse,
+    input_token: Address,
+    output_token: Address,
+    taker: Address,
+) -> Result<(), ApiError> {
+    if !calldata.approvals.is_empty() || calldata.data.is_empty() {
+        return Ok(());
+    }
+    let Ok(mut decoded) = takeOrders4Call::abi_decode(&calldata.data) else {
+        return Ok(());
+    };
+    if decoded
+        .config
+        .orders
+        .iter()
+        .all(|order| order.signedContext.is_empty())
+    {
+        return Ok(());
+    }
+
+    struct RefreshItem {
+        order_index: usize,
+        order_hash: B256,
+        order: OrderV4,
+        input_io_index: u32,
+        output_io_index: u32,
+    }
+
+    let orders = ds.get_orders_for_pair(input_token, output_token).await?;
+    let mut batches = BTreeMap::<String, Vec<RefreshItem>>::new();
+    for (order_index, order_config) in decoded.config.orders.iter().enumerate() {
+        if order_config.signedContext.is_empty() {
+            continue;
+        }
+        let encoded_order = Bytes::from(order_config.order.abi_encode());
+        let order_hash = B256::from(keccak256(&encoded_order));
+        let Some(order) = orders
+            .iter()
+            .find(|order| order.order_hash() == order_hash || order.order_bytes() == encoded_order)
+        else {
+            tracing::error!(
+                %order_hash,
+                pair_orders = orders.len(),
+                "cannot refresh oracle context; order missing from pair query"
+            );
+            return Err(ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            ));
+        };
+        let Some(oracle_url) = order.oracle_url() else {
+            tracing::error!(
+                %order_hash,
+                "cannot refresh oracle context; order has no oracle URL"
+            );
+            return Err(ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            ));
+        };
+        let input_io_index = u32::try_from(order_config.inputIOIndex).map_err(|error| {
+            tracing::error!(%error, %order_hash, "takeOrders inputIOIndex does not fit u32");
+            ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            )
+        })?;
+        let output_io_index = u32::try_from(order_config.outputIOIndex).map_err(|error| {
+            tracing::error!(%error, %order_hash, "takeOrders outputIOIndex does not fit u32");
+            ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            )
+        })?;
+        batches.entry(oracle_url).or_default().push(RefreshItem {
+            order_index,
+            order_hash,
+            order: order_config.order.clone(),
+            input_io_index,
+            output_io_index,
+        });
+    }
+
+    let oracle_endpoint_count = batches.len();
+    let refreshed_batches = stream::iter(batches)
+        .map(|(oracle_url, items)| async move {
+            let body = encode_oracle_body_batch(
+                items
+                    .iter()
+                    .map(|item| {
+                        (
+                            &item.order,
+                            item.input_io_index,
+                            item.output_io_index,
+                            taker,
+                        )
+                    })
+                    .collect(),
+            );
+            let expected_count = items.len();
+            let fresh = fetch_signed_context_batch(&oracle_url, body, expected_count)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        %error,
+                        oracle_request_count = expected_count,
+                        "failed to refresh oracle signed context before returning calldata"
+                    );
+                    ApiError::coded(
+                        ApiErrorCode::SwapCalldataFailed,
+                        "swap calldata could not be generated",
+                    )
+                })?;
+
+            Ok::<_, ApiError>(items.into_iter().zip(fresh).collect::<Vec<_>>())
+        })
+        .buffer_unordered(ORACLE_REFRESH_CONCURRENCY_LIMIT)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut refreshed = 0usize;
+    for (item, fresh) in refreshed_batches.into_iter().flatten() {
+        let Some(order_config) = decoded.config.orders.get_mut(item.order_index) else {
+            tracing::error!(
+                order_index = item.order_index,
+                order_hash = %item.order_hash,
+                "oracle refresh target is missing from decoded calldata"
+            );
+            return Err(ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            ));
+        };
+        let Some(oracle_context) = order_config.signedContext.first_mut() else {
+            tracing::error!(
+                order_index = item.order_index,
+                order_hash = %item.order_hash,
+                "oracle refresh target has no signed context"
+            );
+            return Err(ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            ));
+        };
+        *oracle_context = fresh;
+        refreshed += 1;
+    }
+    if refreshed > 0 {
+        tracing::info!(
+            refreshed,
+            oracle_endpoint_count,
+            "refreshed oracle signed context in swap calldata"
+        );
+        calldata.data = Bytes::from(decoded.abi_encode());
+    }
+    Ok(())
 }
 
 fn map_calldata_boundary_error(error: ApiError) -> ApiError {
@@ -652,15 +829,24 @@ mod tests {
     use crate::analytics::{Analytics, RecordingSink};
     use crate::auth::AuthenticatedKey;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
-    use crate::test_helpers::{mock_candidate, mock_order, TestClientBuilder};
+    use crate::test_helpers::{mock_candidate, mock_order, order_json, TestClientBuilder};
     use crate::types::common::Approval;
     use crate::types::swap::{SwapCalldataMode, SwapDenomination};
     use crate::wrap_ratio::WrapRatioValue;
     use alloy::primitives::{address, Address, Bytes, U256};
+    use alloy::sol_types::SolValue;
     use async_trait::async_trait;
+    use rain_orderbook_bindings::IRaindexV6::{
+        SignedContextV1, TakeOrderConfigV4, TakeOrdersConfigV5,
+    };
+    use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rocket::http::{ContentType, Status};
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const WETH: Address = address!("4200000000000000000000000000000000000006");
@@ -806,6 +992,274 @@ mod tests {
                 approval_data: Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]),
             }],
         }
+    }
+
+    fn test_signed_context(value: u64) -> SignedContextV1 {
+        SignedContextV1 {
+            signer: TAKER,
+            context: vec![B256::from(U256::from(value))],
+            signature: Bytes::from(vec![value as u8; 65]),
+        }
+    }
+
+    fn oracle_calldata_response(orders: Vec<OrderV4>) -> SwapCalldataResponse {
+        let orders = orders
+            .into_iter()
+            .map(|order| TakeOrderConfigV4 {
+                order,
+                inputIOIndex: U256::ZERO,
+                outputIOIndex: U256::ZERO,
+                signedContext: vec![test_signed_context(1)],
+            })
+            .collect();
+        let data = takeOrders4Call {
+            config: TakeOrdersConfigV5 {
+                minimumIO: U256::ZERO.into(),
+                maximumIO: U256::from(1).into(),
+                maximumIORatio: U256::from(1).into(),
+                orders,
+                IOIsInput: true,
+                data: Bytes::new(),
+            },
+        }
+        .abi_encode();
+        SwapCalldataResponse {
+            to: ORDERBOOK,
+            data: Bytes::from(data),
+            value: U256::ZERO,
+            estimated_input: "1".to_string(),
+            denomination: SwapDenomination::Wrapped,
+            approvals: vec![],
+        }
+    }
+
+    fn raindex_order_for(order: &OrderV4, oracle_url: Option<&str>) -> RaindexOrder {
+        let encoded_order = Bytes::from(order.abi_encode());
+        let mut value = order_json();
+        value["orderBytes"] = json!(encoded_order);
+        value["orderHash"] = json!(keccak256(&encoded_order));
+        value["parsedMeta"] = oracle_url.map_or_else(
+            || json!([]),
+            |url| json!([{"RaindexSignedContextOracleV1": url}]),
+        );
+        serde_json::from_value(value).expect("deserialize oracle test order")
+    }
+
+    struct BatchOracleServer {
+        base_url: String,
+        calls: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl BatchOracleServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind batch oracle");
+            let address = listener.local_addr().expect("batch oracle address");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let max_in_flight = Arc::new(AtomicUsize::new(0));
+            let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+
+            let server_calls = Arc::clone(&calls);
+            let server_in_flight = Arc::clone(&in_flight);
+            let server_max_in_flight = Arc::clone(&max_in_flight);
+            let server_batch_sizes = Arc::clone(&batch_sizes);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let calls = Arc::clone(&server_calls);
+                    let in_flight = Arc::clone(&server_in_flight);
+                    let max_in_flight = Arc::clone(&server_max_in_flight);
+                    let batch_sizes = Arc::clone(&server_batch_sizes);
+                    tokio::spawn(async move {
+                        let Some(body) = read_test_request_body(&mut socket).await else {
+                            return;
+                        };
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(current, Ordering::SeqCst);
+                        let requests = <Vec<(OrderV4, U256, U256, Address)>>::abi_decode(&body)
+                            .expect("decode batch oracle request");
+                        batch_sizes
+                            .lock()
+                            .expect("batch sizes lock")
+                            .push(requests.len());
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let response = json!(requests
+                            .iter()
+                            .map(|_| json!({
+                                "signer": TAKER,
+                                "context": [B256::from(U256::from(99))],
+                                "signature": Bytes::from(vec![99u8; 65]),
+                            }))
+                            .collect::<Vec<_>>())
+                        .to_string();
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        write_test_response(&mut socket, &response).await;
+                    });
+                }
+            });
+
+            Self {
+                base_url: format!("http://{address}"),
+                calls,
+                max_in_flight,
+                batch_sizes,
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{path}", self.base_url)
+        }
+    }
+
+    async fn read_test_request_body(socket: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let (header_end, content_length) = loop {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                break (header_end, content_length);
+            }
+        };
+        while request.len() < header_end + content_length {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        Some(request[header_end..header_end + content_length].to_vec())
+    }
+
+    async fn write_test_response(socket: &mut tokio::net::TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write batch oracle response");
+    }
+
+    #[rocket::async_test]
+    async fn test_refresh_oracle_context_batches_by_url_and_runs_endpoints_concurrently() {
+        let server = BatchOracleServer::start().await;
+        let mut first_order = mock_candidate("1", "1").order;
+        first_order.nonce = U256::from(1).into();
+        let mut second_order = first_order.clone();
+        second_order.nonce = U256::from(2).into();
+        let mut third_order = first_order.clone();
+        third_order.nonce = U256::from(3).into();
+        let first_url = server.url("/first");
+        let second_url = server.url("/second");
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![
+                raindex_order_for(&first_order, Some(&first_url)),
+                raindex_order_for(&second_order, Some(&first_url)),
+                raindex_order_for(&third_order, Some(&second_url)),
+            ]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+        let mut calldata = oracle_calldata_response(vec![first_order, second_order, third_order]);
+
+        refresh_oracle_signed_context(&ds, &mut calldata, USDC, WETH, TAKER)
+            .await
+            .expect("refresh batched oracle contexts");
+
+        assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(server.max_in_flight.load(Ordering::SeqCst), 2);
+        let mut batch_sizes = server.batch_sizes.lock().expect("batch sizes lock").clone();
+        batch_sizes.sort_unstable();
+        assert_eq!(batch_sizes, vec![1, 2]);
+        let decoded =
+            takeOrders4Call::abi_decode(&calldata.data).expect("decode refreshed calldata");
+        for order in decoded.config.orders {
+            assert_eq!(
+                order.signedContext[0].context,
+                test_signed_context(99).context
+            );
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_refresh_oracle_context_fails_when_order_cannot_be_resolved() {
+        let order = mock_candidate("1", "1").order;
+        let mut calldata = oracle_calldata_response(vec![order]);
+        let original_data = calldata.data.clone();
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+
+        let result = refresh_oracle_signed_context(&ds, &mut calldata, USDC, WETH, TAKER).await;
+
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
+        assert_eq!(calldata.data, original_data);
+    }
+
+    #[rocket::async_test]
+    async fn test_refresh_oracle_context_fails_when_order_has_no_oracle_url() {
+        let order = mock_candidate("1", "1").order;
+        let mut calldata = oracle_calldata_response(vec![order.clone()]);
+        let original_data = calldata.data.clone();
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![raindex_order_for(&order, None)]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+
+        let result = refresh_oracle_signed_context(&ds, &mut calldata, USDC, WETH, TAKER).await;
+
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
+        assert_eq!(calldata.data, original_data);
+    }
+
+    #[rocket::async_test]
+    #[tracing_test::traced_test]
+    async fn test_refresh_oracle_context_does_not_log_raw_oracle_url() {
+        const SECRET: &str = "unique-refresh-secret-do-not-log";
+        let order = mock_candidate("1", "1").order;
+        let oracle_url =
+            format!("ftp://user:password@example.com/oracle?api_key={SECRET}#fragment");
+        let ds = MockSwapDataSource {
+            supported_tokens: Ok(()),
+            orders: Ok(vec![raindex_order_for(&order, Some(&oracle_url))]),
+            candidates: vec![],
+            calldata_result: Ok(ready_response()),
+        };
+        let mut calldata = oracle_calldata_response(vec![order]);
+
+        let result = refresh_oracle_signed_context(&ds, &mut calldata, USDC, WETH, TAKER).await;
+
+        assert_error_code(result, ApiErrorCode::SwapCalldataFailed);
+        assert!(!logs_contain(SECRET));
     }
 
     fn wrap_ratio(share_address: Address, assets_per_share: &str) -> WrapRatioValue {
