@@ -525,7 +525,10 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         .unwrap();
 
     let oracle_body = services.oracle_bodies.lock().unwrap()[0].clone();
-    let oracle_request = <(OrderV4, U256, U256, Address)>::abi_decode(&oracle_body).unwrap();
+    let oracle_requests = <Vec<(OrderV4, U256, U256, Address)>>::abi_decode(&oracle_body).unwrap();
+    let [oracle_request] = oracle_requests.as_slice() else {
+        panic!("expected exactly one batched oracle request");
+    };
     assert_eq!(oracle_request.0, order);
     assert_eq!(oracle_request.1, U256::ZERO);
     assert_eq!(oracle_request.2, U256::ZERO);
