@@ -268,7 +268,7 @@ curl -X POST https://api.st0x.io/v1/orders/query \
 
 | Field              | Type                           | Default   | Bounds and behavior                                                               |
 | ------------------ | ------------------------------ | --------- | --------------------------------------------------------------------------------- |
-| `chainId`          | number                         | required  | Must be a network in the active Raindex registry                                  |
+| `chainId`          | number                         | required  | Must have a Raindex/orderbook in the active registry                              |
 | `tokenAddresses`   | string[]                       | `[]`      | At most 64; normalized and deduplicated; required unless `orderHash` is supplied  |
 | `ownerAddresses`   | string[]                       | `[]`      | Optional SDK owner filter; at most 64; normalized and deduplicated                |
 | `raindexAddresses` | string[]                       | `[]`      | Optional SDK contract filter; at most 64; normalized and deduplicated             |

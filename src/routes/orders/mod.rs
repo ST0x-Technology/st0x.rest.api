@@ -5,6 +5,7 @@ mod query;
 
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
+use crate::routes::{raindex_backed_tokens, required_raindex_chain_ids};
 use crate::types::common::{Denomination, TokenRef};
 use crate::types::orders::{
     OrderState, OrderSummary, OrderSummaryOrderType, OrdersListResponse, OrdersPagination,
@@ -312,9 +313,10 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         page: Option<u16>,
         page_size: Option<u16>,
     ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
+        let chain_ids = required_raindex_chain_ids(self.client)?;
         let result = self
             .client
-            .get_orders(None, Some(filters), page, page_size)
+            .get_orders(Some(ChainIds(chain_ids)), Some(filters), page, page_size)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query orders");
@@ -446,15 +448,7 @@ impl<'a> OrdersListDataSource for RaindexOrdersListDataSource<'a> {
         &self,
         token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
-        let tokens: Vec<_> = self
-            .client
-            .get_all_tokens()
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to retrieve curated tokens");
-                ApiError::Internal("failed to retrieve curated tokens".into())
-            })?
-            .into_values()
-            .collect();
+        let tokens = raindex_backed_tokens(self.client)?;
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;

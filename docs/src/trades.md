@@ -167,9 +167,11 @@ Omit `orderHashes` and provide `chainId`, `tokenAddresses`, `startTime`, and
 }
 ```
 
-Token-set mode requires 1 through 64 token addresses, a configured non-zero
-`chainId`, and both time bounds. The inclusive time window may not exceed 90
-days. `page` is bounded to 1 through 1000 and `pageSize` to 1 through 500.
+Token-set mode requires 1 through 64 token addresses, a non-zero `chainId` with
+a configured Raindex/orderbook, and both time bounds. A registry network without
+a Raindex is not queryable through this route. The inclusive time window may not
+exceed 90 days. `page` is bounded to 1 through 1000 and `pageSize` to 1 through
+500.
 
 The response is `TradesByAddressResponse`, with the same `trades` and
 `pagination` fields as the existing single-token route. Trades that match both
@@ -209,10 +211,13 @@ The response remains:
 
 Order-hash mode supports up to 64 hashes. It also accepts optional `chainId` and
 up to 64 `tokenAddresses`, which the SDK combines with the order-hash set in the
-same indexed query. Existing clients may continue omitting both. `page` and
-`pageSize` are intentionally rejected in this legacy grouped mode. The
-deduplicated grouped result is bounded to 5,000 trades; requests producing more
-must narrow their hashes, token addresses, chain, or time window.
+same indexed query. An explicit `chainId` must have a configured
+Raindex/orderbook. Existing clients may continue omitting both; in that case the
+API queries all Raindex-backed networks and ignores standalone registry
+networks. `page` and `pageSize` are intentionally rejected in this legacy
+grouped mode. The deduplicated grouped result is bounded to 5,000 trades;
+requests producing more must narrow their hashes, token addresses, chain, or
+time window.
 
 Both modes normalize and deduplicate addresses and hashes before querying. Their
 short-lived cache keys are order-insensitive and include every

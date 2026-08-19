@@ -2,6 +2,7 @@ use super::DbPool;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewWrappedExchangeRateSnapshot {
+    pub chain_id: i64,
     pub share_token_address: String,
     pub asset_token_address: String,
     pub assets_per_share: String,
@@ -12,6 +13,7 @@ pub(crate) struct NewWrappedExchangeRateSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(crate) struct WrappedExchangeRateSnapshot {
+    pub chain_id: i64,
     pub share_token_address: String,
     pub asset_token_address: String,
     pub assets_per_share: String,
@@ -30,9 +32,10 @@ pub(crate) async fn insert_wrapped_exchange_rate_snapshots(
     for snapshot in snapshots {
         let result = sqlx::query(
             "INSERT OR IGNORE INTO wrapped_exchange_rate_snapshots \
-             (share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp, captured_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (chain_id, share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp, captured_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(snapshot.chain_id)
         .bind(&snapshot.share_token_address)
         .bind(&snapshot.asset_token_address)
         .bind(&snapshot.assets_per_share)
@@ -50,13 +53,15 @@ pub(crate) async fn insert_wrapped_exchange_rate_snapshots(
 
 pub(crate) async fn count_wrapped_exchange_rate_snapshots_for_share(
     pool: &DbPool,
+    chain_id: u32,
     share_token_address: &str,
 ) -> Result<u64, sqlx::Error> {
     let (count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) \
          FROM wrapped_exchange_rate_snapshots \
-         WHERE share_token_address = ?",
+         WHERE chain_id = ? AND share_token_address = ?",
     )
+    .bind(i64::from(chain_id))
     .bind(share_token_address)
     .fetch_one(pool)
     .await?;
@@ -66,17 +71,19 @@ pub(crate) async fn count_wrapped_exchange_rate_snapshots_for_share(
 
 pub(crate) async fn list_wrapped_exchange_rate_snapshots_for_share(
     pool: &DbPool,
+    chain_id: u32,
     share_token_address: &str,
     limit: u32,
     offset: u32,
 ) -> Result<Vec<WrappedExchangeRateSnapshot>, sqlx::Error> {
     sqlx::query_as::<_, WrappedExchangeRateSnapshot>(
-        "SELECT share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp, captured_at \
+        "SELECT chain_id, share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp, captured_at \
          FROM wrapped_exchange_rate_snapshots \
-         WHERE share_token_address = ? \
+         WHERE chain_id = ? AND share_token_address = ? \
          ORDER BY block_number DESC, captured_at DESC \
          LIMIT ? OFFSET ?",
     )
+    .bind(i64::from(chain_id))
     .bind(share_token_address)
     .bind(i64::from(limit))
     .bind(i64::from(offset))
@@ -116,6 +123,7 @@ mod tests {
         captured_at: &str,
     ) -> NewWrappedExchangeRateSnapshot {
         NewWrappedExchangeRateSnapshot {
+            chain_id: 8453,
             share_token_address: share_token_address.to_string(),
             asset_token_address: asset_token_address.to_string(),
             assets_per_share: assets_per_share.to_string(),
@@ -181,6 +189,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_token_and_block_are_distinct_across_chains() {
+        let pool = test_pool().await;
+        let base = snapshot("0xshare", "0xasset", "1.0", 100, "2026-06-04T10:00:00Z");
+        let mut ethereum = base.clone();
+        ethereum.chain_id = 1;
+
+        let inserted = insert_wrapped_exchange_rate_snapshots(&pool, &[base, ethereum])
+            .await
+            .expect("insert cross-chain snapshots");
+        assert_eq!(inserted, 2);
+
+        assert_eq!(
+            count_wrapped_exchange_rate_snapshots_for_share(&pool, 8453, "0xshare")
+                .await
+                .expect("count Base snapshots"),
+            1
+        );
+        assert_eq!(
+            count_wrapped_exchange_rate_snapshots_for_share(&pool, 1, "0xshare")
+                .await
+                .expect("count Ethereum snapshots"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn schema_supports_token_and_time_window_queries() {
         let pool = test_pool().await;
         let snapshots = vec![
@@ -224,12 +258,12 @@ mod tests {
             .await
             .expect("insert snapshots");
 
-        let count = count_wrapped_exchange_rate_snapshots_for_share(&pool, "0xshare")
+        let count = count_wrapped_exchange_rate_snapshots_for_share(&pool, 8453, "0xshare")
             .await
             .expect("count snapshots");
         assert_eq!(count, 3);
 
-        let rows = list_wrapped_exchange_rate_snapshots_for_share(&pool, "0xshare", 2, 1)
+        let rows = list_wrapped_exchange_rate_snapshots_for_share(&pool, 8453, "0xshare", 2, 1)
             .await
             .expect("list snapshots");
         assert_eq!(rows.len(), 2);

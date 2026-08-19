@@ -5,6 +5,7 @@ pub(crate) mod get_by_tx;
 pub(crate) mod query;
 
 use crate::error::{ApiError, ApiErrorCode};
+use crate::routes::{raindex_backed_tokens, required_raindex_chain_ids};
 use crate::types::common::{Denomination, TokenRef};
 use crate::types::trades::{
     TradeByAddress, TradesByAddressResponse, TradesPagination, TradesPaginationParams,
@@ -88,8 +89,9 @@ pub(crate) struct RaindexTradesDataSource<'a> {
 #[async_trait]
 impl TradesDataSource for RaindexTradesDataSource<'_> {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = required_raindex_chain_ids(self.client)?;
         self.client
-            .get_trades_for_transaction(None, None, tx_hash)
+            .get_trades_for_transaction(Some(ChainIds(chain_ids)), None, tx_hash)
             .await
             .map_err(|e| match e {
                 RaindexError::TransactionIndexingTimeout { tx_hash, attempts } => {
@@ -110,6 +112,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         pagination: PaginationParams,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = required_raindex_chain_ids(self.client)?;
         let filters = GetTradesFilters {
             owners: vec![owner],
             time_filter: Some(time_filter),
@@ -117,7 +120,12 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades(None, Some(filters), pagination.page, pagination.page_size)
+            .get_trades(
+                Some(ChainIds(chain_ids)),
+                Some(filters),
+                pagination.page,
+                pagination.page_size,
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for owner");
@@ -132,6 +140,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         page_size: u16,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = required_raindex_chain_ids(self.client)?;
         let filters = GetTradesFilters {
             tokens: Some(GetTradesTokenFilter {
                 inputs: Some(vec![token]),
@@ -142,7 +151,12 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades(None, Some(filters), Some(page), Some(page_size))
+            .get_trades(
+                Some(ChainIds(chain_ids)),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for token");
@@ -157,6 +171,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         page_size: u16,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = required_raindex_chain_ids(self.client)?;
         let filters = GetTradesFilters {
             takers: vec![taker],
             time_filter: Some(time_filter),
@@ -164,7 +179,12 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         };
 
         self.client
-            .get_trades(None, Some(filters), Some(page), Some(page_size))
+            .get_trades(
+                Some(ChainIds(chain_ids)),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query trades for taker");
@@ -176,15 +196,7 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         &self,
         token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
-        let tokens: Vec<_> = self
-            .client
-            .get_all_tokens()
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to retrieve curated tokens");
-                ApiError::Internal("failed to retrieve curated tokens".into())
-            })?
-            .into_values()
-            .collect();
+        let tokens = raindex_backed_tokens(self.client)?;
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
@@ -224,9 +236,13 @@ impl BatchTradesDataSource for RaindexTradesDataSource<'_> {
         order_hashes: Vec<B256>,
         filters: GetTradesByOrderHashesFilters,
     ) -> Result<RaindexTradesByOrderHashResult, ApiError> {
+        let chain_ids = match chain_id {
+            Some(chain_id) => vec![chain_id],
+            None => required_raindex_chain_ids(self.client)?,
+        };
         self.client
             .get_trades_by_order_hashes(
-                chain_id.map(|chain_id| ChainIds(vec![chain_id])),
+                Some(ChainIds(chain_ids)),
                 OrderHashes(order_hashes),
                 Some(filters),
             )

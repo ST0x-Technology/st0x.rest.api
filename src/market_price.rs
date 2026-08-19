@@ -8,7 +8,10 @@ use crate::raindex::SharedRaindexProvider;
 use crate::routes::orders::{
     get_order_quotes_for_summaries, RaindexOrdersListDataSource, MAX_PAGE_SIZE,
 };
-use crate::routes::{configured_chain_ids, optional_chain_ids_filter, resolve_required_chain_id};
+use crate::routes::{
+    configured_chain_ids, optional_chain_ids_filter, required_raindex_chain_ids,
+    resolve_required_chain_id,
+};
 use crate::types::health::MarketPriceHealthStatus;
 use crate::wrap_ratio::{
     legacy_address, persist_wrap_ratio_snapshots_best_effort,
@@ -238,7 +241,7 @@ impl MarketPriceSampler {
         let (client, discovery) = {
             let raindex = self.state.shared_raindex.read().await;
             let client = raindex.client().clone();
-            let chain_ids = configured_chain_ids(raindex.raindex_yaml())?;
+            let chain_ids = required_raindex_chain_ids(&client)?;
             let tokens = client.get_all_tokens().map_err(token_registry_error)?;
             let discovery = discover_price_markets(tokens.into_values(), &chain_ids);
             (client, discovery)

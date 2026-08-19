@@ -4,21 +4,13 @@ use alloy::primitives::Address;
 use rain_orderbook_common::raindex_client::RaindexClient;
 
 use crate::error::ApiError;
+use crate::routes::validate_raindex_chain_id;
 
 pub(crate) fn validate_configured_chain(
     client: &RaindexClient,
     chain_id: u32,
 ) -> Result<(), ApiError> {
-    let configured_chain_ids = client.get_unique_chain_ids().map_err(|error| {
-        tracing::error!(%error, "failed to read configured chain IDs");
-        ApiError::Internal("failed to validate chainId".into())
-    })?;
-    if configured_chain_ids.contains(&chain_id) {
-        Ok(())
-    } else {
-        tracing::warn!(chain_id, "unsupported chainId");
-        Err(ApiError::BadRequest("unsupported chainId".into()))
-    }
+    validate_raindex_chain_id(client, chain_id).map(|_| ())
 }
 
 pub(crate) fn parse_canonical_addresses(

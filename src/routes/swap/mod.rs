@@ -7,6 +7,7 @@ use crate::analytics::{Analytics, AnalyticsEvent, ApiVersion, SwapFailure};
 use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorCode};
+use crate::routes::raindex_backed_tokens;
 use crate::types::swap::{SwapCalldataMode, SwapCalldataResponse, SwapDenomination};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
@@ -240,8 +241,12 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ApiError::Internal("failed to read the token registry".into())
         })?;
 
-        let input_supported = tokens.values().any(|token| token.address == input_token);
-        let output_supported = tokens.values().any(|token| token.address == output_token);
+        let input_supported = tokens
+            .values()
+            .any(|token| token.network.chain_id == crate::CHAIN_ID && token.address == input_token);
+        let output_supported = tokens.values().any(|token| {
+            token.network.chain_id == crate::CHAIN_ID && token.address == output_token
+        });
 
         if input_supported && output_supported {
             tracing::info!(input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
@@ -428,15 +433,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         &self,
         token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
-        let tokens: Vec<_> = self
-            .client
-            .get_all_tokens()
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to retrieve curated tokens");
-                ApiError::Internal("failed to read the token registry".into())
-            })?
-            .into_values()
-            .collect();
+        let tokens = raindex_backed_tokens(self.client)?;
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;

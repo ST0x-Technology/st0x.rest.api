@@ -29,6 +29,43 @@ fn multiple_networks_yaml() -> RaindexYaml {
     )
 }
 
+fn standalone_network_with_one_raindex_yaml() -> String {
+    r#"version: 6
+networks:
+  base:
+    rpcs:
+      - https://mainnet.base.org
+    chain-id: 8453
+  ethereum:
+    rpcs:
+      - https://ethereum-rpc.publicnode.com
+    chain-id: 1
+  hyperevm:
+    rpcs:
+      - https://rpc.hyperliquid.xyz/evm
+    chain-id: 999
+subgraphs:
+  base: https://example.com/base
+raindexes:
+  base:
+    address: 0xd2938e7c9fe3597f78832ce780feb61945c377d7
+    network: base
+    subgraph: base
+    deployment-block: 0
+tokens:
+  base-token:
+    address: 0x1111111111111111111111111111111111111111
+    network: base
+  ethereum-token:
+    address: 0x1111111111111111111111111111111111111111
+    network: ethereum
+  hyperevm-token:
+    address: 0x1111111111111111111111111111111111111111
+    network: hyperevm
+"#
+    .to_string()
+}
+
 #[get("/shared-client")]
 async fn shared_client_contract(
     provider: &State<RaindexProvider>,
@@ -117,6 +154,37 @@ fn optional_chain_filter_supports_all_chains_and_validates_requested_chain() {
     );
     assert!(matches!(
         super::optional_chain_ids_filter(&multiple, Some(1)),
+        Err(ApiError::BadRequest(message)) if message == "unsupported chainId"
+    ));
+}
+
+#[rocket::async_test]
+async fn raindex_chain_selection_excludes_standalone_networks() {
+    let client = rain_orderbook_common::raindex_client::RaindexClient::new(
+        vec![standalone_network_with_one_raindex_yaml()],
+        None,
+        None,
+    )
+    .await
+    .expect("valid raindex client");
+
+    assert_eq!(
+        super::configured_raindex_chain_ids(&client).expect("read configured raindexes"),
+        vec![8453]
+    );
+    assert_eq!(
+        super::required_raindex_chain_ids(&client).expect("select all raindex chains"),
+        vec![8453]
+    );
+    let tokens = super::raindex_backed_tokens(&client).expect("select Raindex-backed tokens");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].network.chain_id, 8453);
+    assert!(matches!(
+        super::validate_raindex_chain_id(&client, 1),
+        Err(ApiError::BadRequest(message)) if message == "unsupported chainId"
+    ));
+    assert!(matches!(
+        super::validate_raindex_chain_id(&client, 999),
         Err(ApiError::BadRequest(message)) if message == "unsupported chainId"
     ));
 }

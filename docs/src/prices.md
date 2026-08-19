@@ -39,6 +39,10 @@ omitted, prices from all registry networks are returned. Addresses are canonical
 lowercase wrapped token addresses. Tokens without a retained sample have
 `source: "unavailable"` and null price fields.
 
+The sampler only queries networks with a configured Raindex/orderbook. Tokens on
+standalone registry networks are still included in this response, but remain
+`unavailable` until that network has an orderbook-backed price source.
+
 ```json
 {
   "data": [

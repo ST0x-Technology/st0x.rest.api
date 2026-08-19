@@ -12,8 +12,59 @@ pub mod trades;
 pub mod vaults;
 
 use crate::error::ApiError;
+use rain_orderbook_app_settings::token::TokenCfg;
 use rain_orderbook_app_settings::yaml::{raindex::RaindexYaml, FieldErrorKind, YamlError};
 use rain_orderbook_common::raindex_client::vaults::{RaindexVault, RaindexVaultType};
+use rain_orderbook_common::raindex_client::RaindexClient;
+
+pub(crate) fn configured_raindex_chain_ids(client: &RaindexClient) -> Result<Vec<u32>, ApiError> {
+    let mut chain_ids = client
+        .get_all_raindexes()
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read configured raindexes");
+            ApiError::Internal("failed to read configured raindexes".into())
+        })?
+        .into_values()
+        .map(|raindex| raindex.network.chain_id)
+        .collect::<Vec<_>>();
+    chain_ids.sort_unstable();
+    chain_ids.dedup();
+    Ok(chain_ids)
+}
+
+pub(crate) fn required_raindex_chain_ids(client: &RaindexClient) -> Result<Vec<u32>, ApiError> {
+    let chain_ids = configured_raindex_chain_ids(client)?;
+    if chain_ids.is_empty() {
+        tracing::error!("registry has no configured raindexes");
+        Err(ApiError::Internal("no configured raindexes".into()))
+    } else {
+        Ok(chain_ids)
+    }
+}
+
+pub(crate) fn raindex_backed_tokens(client: &RaindexClient) -> Result<Vec<TokenCfg>, ApiError> {
+    let chain_ids = required_raindex_chain_ids(client)?;
+    let tokens = client.get_all_tokens().map_err(|error| {
+        tracing::error!(%error, "failed to retrieve curated tokens");
+        ApiError::Internal("failed to retrieve curated tokens".into())
+    })?;
+    Ok(tokens
+        .into_values()
+        .filter(|token| chain_ids.contains(&token.network.chain_id))
+        .collect())
+}
+
+pub(crate) fn validate_raindex_chain_id(
+    client: &RaindexClient,
+    chain_id: u32,
+) -> Result<u32, ApiError> {
+    if configured_raindex_chain_ids(client)?.contains(&chain_id) {
+        Ok(chain_id)
+    } else {
+        tracing::warn!(chain_id, "chainId has no configured raindex");
+        Err(ApiError::BadRequest("unsupported chainId".into()))
+    }
+}
 
 pub(crate) fn configured_chain_ids(raindex_yaml: &RaindexYaml) -> Result<Vec<u32>, ApiError> {
     let networks = match raindex_yaml.get_networks() {

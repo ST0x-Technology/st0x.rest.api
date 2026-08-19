@@ -46,9 +46,20 @@ pub struct TokenResponse {
     isin: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, FromForm, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenChainParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    chain_id: Option<u32>,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioErrorResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     share_address: Address,
     #[schema(example = "failed to read ERC4626 ratio")]
@@ -66,6 +77,9 @@ pub struct WrapRatioBatchResponse {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioHistoryParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    chain_id: Option<u32>,
     #[field(name = "page")]
     #[param(example = 1)]
     page: Option<u32>,
@@ -77,6 +91,8 @@ pub struct WrapRatioHistoryParams {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapRatioHistoryResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     share_address: Address,
     #[schema(value_type = String, example = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe")]
@@ -119,6 +135,8 @@ pub struct WrapRatioHistoryPagination {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenProofsResponse {
+    #[schema(example = 8453)]
+    chain_id: u32,
     #[schema(value_type = String, example = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2")]
     address: Address,
     metadata: Vec<TokenProofMetadata>,
@@ -331,18 +349,55 @@ pub(super) fn matches_token_proof_address(token: &TokenCfg, address: Address) ->
     crate::wrap_ratio::token_address_variants(token).contains(&address)
 }
 
+fn select_st0x_token<'a>(
+    tokens: &'a [TokenCfg],
+    requested_address: Address,
+    requested_chain_id: Option<u32>,
+    matches_address: impl Fn(&TokenCfg) -> bool,
+    not_found_message: &'static str,
+) -> Result<&'a TokenCfg, ApiError> {
+    let mut matches = tokens.iter().filter(|token| {
+        is_st0x_token(token)
+            && requested_chain_id.is_none_or(|chain_id| token.network.chain_id == chain_id)
+            && matches_address(token)
+    });
+    let Some(token) = matches.next() else {
+        tracing::warn!(address = %requested_address, ?requested_chain_id, "ST0x token not found");
+        return Err(ApiError::NotFound(not_found_message.into()));
+    };
+
+    if requested_chain_id.is_none() && matches.next().is_some() {
+        tracing::warn!(address = %requested_address, "token address is ambiguous across networks");
+        return Err(ApiError::BadRequest(
+            "chainId is required when an address exists on multiple networks".into(),
+        ));
+    }
+
+    Ok(token)
+}
+
+async fn validated_requested_chain_id(
+    shared_raindex: &State<SharedRaindexProvider>,
+    requested_chain_id: Option<u32>,
+) -> Result<Option<u32>, ApiError> {
+    let raindex = shared_raindex.read().await;
+    requested_chain_id
+        .map(|chain_id| crate::routes::validate_chain_id(raindex.raindex_yaml(), chain_id))
+        .transpose()
+}
+
 fn resolve_proof_subgraph_urls(
     yaml: &rain_orderbook_app_settings::yaml::raindex::RaindexYaml,
     network_key: &str,
 ) -> Result<(String, String), ApiError> {
     let sft_subgraph = resolve_sft_subgraph_url(yaml, network_key)?;
     let metaboard = yaml.get_metaboard(network_key).map_err(|error| {
-        tracing::error!(
+        tracing::warn!(
             network_key,
             error = %error,
-            "failed to resolve metadata subgraph"
+            "token proofs are not supported on this network"
         );
-        ApiError::Internal("metadata subgraph is not configured".into())
+        ApiError::BadRequest("token proofs are not supported on this chain".into())
     })?;
     tracing::info!(
         network_key,
@@ -569,6 +624,7 @@ async fn read_limited_response_body(response: reqwest::Response, limit: u64) -> 
 }
 
 fn build_token_proofs_response(
+    chain_id: u32,
     address: Address,
     sft: SftProofsData,
     metadata: MetadataProofsData,
@@ -597,6 +653,7 @@ fn build_token_proofs_response(
     )?);
 
     Ok(TokenProofsResponse {
+        chain_id,
         address,
         metadata: metadata.meta_v1_s,
         schemas,
@@ -652,6 +709,7 @@ pub(super) fn api_error_message(error: &ApiError) -> String {
 }
 
 async fn read_token_proofs(
+    chain_id: u32,
     address: Address,
     sft_subgraph_url: &str,
     metadata_subgraph_url: &str,
@@ -724,7 +782,7 @@ query TokenMetadata($subject: String!) {
         ),
     )?;
 
-    build_token_proofs_response(address, sft, metadata)
+    build_token_proofs_response(chain_id, address, sft, metadata)
 }
 
 #[utoipa::path(
@@ -839,6 +897,7 @@ pub async fn get_wrap_ratios(
                         "failed to read wrapped token ratio"
                     );
                     errors.push(WrapRatioErrorResponse {
+                        chain_id: token.network.chain_id,
                         share_address: token.address,
                         message: error.batch_message(),
                     });
@@ -846,13 +905,29 @@ pub async fn get_wrap_ratios(
             }
         }
 
-        for group in read_wrap_ratios_batch(&inputs).await? {
-            let metadata = WrapRatioMetadata::from_batch_response(&group.response);
+        for group in read_wrap_ratios_batch(&inputs).await {
+            let response = match group.response {
+                Ok(response) => response,
+                Err(_) => {
+                    for index in group.input_indices {
+                        let Some(input) = inputs.get(index) else {
+                            continue;
+                        };
+                        errors.push(WrapRatioErrorResponse {
+                            chain_id: input.token.network.chain_id,
+                            share_address: input.share_address,
+                            message: "failed to read ERC4626 ratio".into(),
+                        });
+                    }
+                    continue;
+                }
+            };
+            let metadata = WrapRatioMetadata::from_batch_response(&response);
 
-            if group.response.items.len() != group.input_indices.len() {
+            if response.items.len() != group.input_indices.len() {
                 tracing::error!(
                     expected = group.input_indices.len(),
-                    actual = group.response.items.len(),
+                    actual = response.items.len(),
                     "ERC4626 batch response item count mismatch"
                 );
             }
@@ -862,9 +937,14 @@ pub async fn get_wrap_ratios(
                     continue;
                 };
 
-                let row = find_wrap_ratio_item(&group.response.items, input.share_address)
-                    .and_then(|item| {
-                        build_wrap_ratio_response(item, input.expected_asset_address, &metadata)
+                let row =
+                    find_wrap_ratio_item(&response.items, input.share_address).and_then(|item| {
+                        build_wrap_ratio_response(
+                            input.token.network.chain_id,
+                            item,
+                            input.expected_asset_address,
+                            &metadata,
+                        )
                     });
 
                 match row {
@@ -876,6 +956,7 @@ pub async fn get_wrap_ratios(
                             "failed to read wrapped token ratio"
                         );
                         errors.push(WrapRatioErrorResponse {
+                            chain_id: input.token.network.chain_id,
                             share_address: input.share_address,
                             message: error.batch_message(),
                         });
@@ -903,10 +984,12 @@ pub async fn get_wrap_ratios(
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
-        ("address" = String, Path, description = "Wrapped token / ERC4626 vault address")
+        ("address" = String, Path, description = "Wrapped token / ERC4626 vault address"),
+        TokenChainParams
     ),
     responses(
         (status = 200, description = "Wrapped token ratio", body = WrapRatioResponse),
+        (status = 400, description = "Ambiguous token address or unsupported chainId", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "Wrapped ST0x token not found", body = ApiErrorResponse),
         (status = 422, description = "Invalid wrapped token address", body = ApiErrorResponse),
@@ -914,7 +997,7 @@ pub async fn get_wrap_ratios(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/wrap-ratio/<address>")]
+#[get("/wrap-ratio/<address>?<params..>")]
 pub async fn get_wrap_ratio_by_address(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
@@ -922,18 +1005,20 @@ pub async fn get_wrap_ratio_by_address(
     shared_raindex: &State<SharedRaindexProvider>,
     pool: &State<DbPool>,
     address: ValidatedAddress,
+    params: TokenChainParams,
 ) -> Result<Json<WrapRatioResponse>, ApiError> {
     async move {
         tracing::info!(share_address = %address.0, "request received");
 
+        let chain_id = validated_requested_chain_id(shared_raindex, params.chain_id).await?;
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| token.address == address.0 && is_st0x_token(token))
-        else {
-            tracing::warn!(share_address = %address.0, "wrapped ST0x token not found");
-            return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
-        };
+        let token = select_st0x_token(
+            &tokens,
+            address.0,
+            chain_id,
+            |token| token.address == address.0,
+            "wrapped ST0x token not found",
+        )?;
 
         let expected_asset_address = unwrapped_address(token).map_err(|error| {
             tracing::error!(
@@ -949,7 +1034,7 @@ pub async fn get_wrap_ratio_by_address(
             share_address: token.address,
             expected_asset_address,
         }];
-        let mut groups = read_wrap_ratios_batch(&inputs).await?;
+        let mut groups = read_wrap_ratios_batch(&inputs).await;
         let group = groups.pop().ok_or_else(|| {
             tracing::error!(
                 share_address = %token.address,
@@ -957,18 +1042,19 @@ pub async fn get_wrap_ratio_by_address(
             );
             ApiError::Internal("failed to read ERC4626 ratio".into())
         })?;
+        let response = group.response?;
 
-        if group.response.items.len() != 1 {
+        if response.items.len() != 1 {
             tracing::error!(
                 expected = 1,
-                actual = group.response.items.len(),
+                actual = response.items.len(),
                 "ERC4626 batch response item count mismatch"
             );
             return Err(ApiError::Internal("failed to read ERC4626 ratio".into()));
         }
 
-        let metadata = WrapRatioMetadata::from_batch_response(&group.response);
-        let item = find_wrap_ratio_item(&group.response.items, token.address).map_err(|error| {
+        let metadata = WrapRatioMetadata::from_batch_response(&response);
+        let item = find_wrap_ratio_item(&response.items, token.address).map_err(|error| {
             tracing::error!(
                 share_address = %token.address,
                 error = %error,
@@ -977,16 +1063,20 @@ pub async fn get_wrap_ratio_by_address(
             error.into_api_error()
         })?;
 
-        let response = build_wrap_ratio_response(item, expected_asset_address, &metadata).map_err(
-            |error| {
-                tracing::error!(
-                    share_address = %token.address,
-                    error = %error,
-                    "failed to read wrapped token ratio"
-                );
-                error.into_api_error()
-            },
-        )?;
+        let response = build_wrap_ratio_response(
+            token.network.chain_id,
+            item,
+            expected_asset_address,
+            &metadata,
+        )
+        .map_err(|error| {
+            tracing::error!(
+                share_address = %token.address,
+                error = %error,
+                "failed to read wrapped token ratio"
+            );
+            error.into_api_error()
+        })?;
 
         persist_wrap_ratio_snapshots_best_effort(pool.inner(), std::slice::from_ref(&response))
             .await;
@@ -1009,7 +1099,7 @@ pub async fn get_wrap_ratio_by_address(
     ),
     responses(
         (status = 200, description = "Wrapped token ratio snapshot history", body = WrapRatioHistoryResponse),
-        (status = 400, description = "Invalid pagination parameters", body = ApiErrorResponse),
+        (status = 400, description = "Invalid pagination, ambiguous token address, or unsupported chainId", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "Wrapped ST0x token not found", body = ApiErrorResponse),
         (status = 422, description = "Invalid wrapped token address", body = ApiErrorResponse),
@@ -1030,14 +1120,15 @@ pub async fn get_wrap_ratio_history_by_address(
     async move {
         tracing::info!(share_address = %address.0, "request received");
 
+        let chain_id = validated_requested_chain_id(shared_raindex, params.chain_id).await?;
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| token.address == address.0 && is_st0x_token(token))
-        else {
-            tracing::warn!(share_address = %address.0, "wrapped ST0x token not found");
-            return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
-        };
+        let token = select_st0x_token(
+            &tokens,
+            address.0,
+            chain_id,
+            |token| token.address == address.0,
+            "wrapped ST0x token not found",
+        )?;
 
         let asset_address = unwrapped_address(token).map_err(|error| {
             tracing::error!(
@@ -1050,19 +1141,23 @@ pub async fn get_wrap_ratio_history_by_address(
 
         let (page, page_size, offset) = wrap_ratio_history_pagination_params(params)?;
         let share_token_address = normalize_address(token.address);
-        let total_events =
-            count_wrapped_exchange_rate_snapshots_for_share(pool.inner(), &share_token_address)
-                .await
-                .map_err(|error| {
-                    tracing::error!(
-                        share_address = %token.address,
-                        error = %error,
-                        "failed to count wrapped token ratio history"
-                    );
-                    ApiError::Internal("failed to query wrapped token ratio history".into())
-                })?;
+        let total_events = count_wrapped_exchange_rate_snapshots_for_share(
+            pool.inner(),
+            token.network.chain_id,
+            &share_token_address,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                share_address = %token.address,
+                error = %error,
+                "failed to count wrapped token ratio history"
+            );
+            ApiError::Internal("failed to query wrapped token ratio history".into())
+        })?;
         let snapshots = list_wrapped_exchange_rate_snapshots_for_share(
             pool.inner(),
+            token.network.chain_id,
             &share_token_address,
             page_size,
             offset,
@@ -1092,6 +1187,7 @@ pub async fn get_wrap_ratio_history_by_address(
             "returning wrapped token ratio history"
         );
         Ok(Json(WrapRatioHistoryResponse {
+            chain_id: token.network.chain_id,
             share_address: token.address,
             asset_address,
             events,
@@ -1108,10 +1204,12 @@ pub async fn get_wrap_ratio_history_by_address(
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
-        ("address" = String, Path, description = "Wrapped, unwrapped, or legacy ST0x token address")
+        ("address" = String, Path, description = "Wrapped, unwrapped, or legacy ST0x token address"),
+        TokenChainParams
     ),
     responses(
         (status = 200, description = "Raw ST0x proof metadata, schemas, and receipts", body = TokenProofsResponse),
+        (status = 400, description = "Ambiguous token address or proofs unsupported on the selected chain", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "Wrapped ST0x token or SFT vault not found", body = ApiErrorResponse),
         (status = 422, description = "Invalid token address", body = ApiErrorResponse),
@@ -1119,25 +1217,27 @@ pub async fn get_wrap_ratio_history_by_address(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/<address>/proofs", rank = 10)]
+#[get("/<address>/proofs?<params..>", rank = 10)]
 pub async fn get_token_proofs(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
     address: ValidatedAddress,
+    params: TokenChainParams,
 ) -> Result<Json<TokenProofsResponse>, ApiError> {
     async move {
         tracing::info!(address = %address.0, "request received");
 
+        let chain_id = validated_requested_chain_id(shared_raindex, params.chain_id).await?;
         let tokens = registry_tokens(shared_raindex).await?;
-        let Some(token) = tokens
-            .iter()
-            .find(|token| is_st0x_token(token) && matches_token_proof_address(token, address.0))
-        else {
-            tracing::warn!(address = %address.0, "wrapped ST0x token not found");
-            return Err(ApiError::NotFound("wrapped ST0x token not found".into()));
-        };
+        let token = select_st0x_token(
+            &tokens,
+            address.0,
+            chain_id,
+            |token| matches_token_proof_address(token, address.0),
+            "wrapped ST0x token not found",
+        )?;
 
         let (sft_subgraph_url, metadata_subgraph_url) = {
             let raindex = shared_raindex.read().await;
@@ -1151,8 +1251,13 @@ pub async fn get_token_proofs(
             "querying token proofs"
         );
 
-        let response =
-            read_token_proofs(token.address, &sft_subgraph_url, &metadata_subgraph_url).await?;
+        let response = read_token_proofs(
+            token.network.chain_id,
+            token.address,
+            &sft_subgraph_url,
+            &metadata_subgraph_url,
+        )
+        .await?;
 
         tracing::info!(
             wrapped_address = %token.address,
@@ -1258,6 +1363,7 @@ mod tests {
         captured_at: &str,
     ) -> NewWrappedExchangeRateSnapshot {
         NewWrappedExchangeRateSnapshot {
+            chain_id: 8453,
             share_token_address: format!("{share_token_address:#x}"),
             asset_token_address: format!("{asset_token_address:#x}"),
             assets_per_share: assets_per_share.to_string(),
@@ -1584,6 +1690,52 @@ using-tokens-from:
             .raindex_config(config)
             .build()
             .await
+    }
+
+    #[rocket::async_test]
+    async fn token_lookup_requires_chain_id_only_for_ambiguous_addresses() {
+        let client = wrap_ratio_multi_network_client(
+            "http://127.0.0.1:1/base",
+            "http://127.0.0.1:1/polygon",
+        )
+        .await;
+        let shared_raindex = client
+            .rocket()
+            .state::<crate::raindex::SharedRaindexProvider>()
+            .expect("shared raindex state");
+        let mut tokens = shared_raindex
+            .read()
+            .await
+            .client()
+            .get_all_tokens()
+            .expect("registry tokens")
+            .into_values()
+            .collect::<Vec<_>>();
+        tokens
+            .iter_mut()
+            .find(|token| token.network.chain_id == 137)
+            .expect("second-network token")
+            .address = WT_MSTR;
+
+        let error = super::select_st0x_token(
+            &tokens,
+            WT_MSTR,
+            None,
+            |token| token.address == WT_MSTR,
+            "token not found",
+        )
+        .expect_err("duplicate address should require chainId");
+        assert!(matches!(error, crate::error::ApiError::BadRequest(_)));
+
+        let base = super::select_st0x_token(
+            &tokens,
+            WT_MSTR,
+            Some(8453),
+            |token| token.address == WT_MSTR,
+            "token not found",
+        )
+        .expect("Base token should resolve");
+        assert_eq!(base.network.chain_id, 8453);
     }
 
     async fn mock_proofs_subgraphs(
@@ -2466,6 +2618,7 @@ using-tokens-from:
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["chainId"], 8453);
         assert_eq!(body["address"], format!("{WT_MSTR:#x}"));
         assert_eq!(body["receiptContractAddress"], format!("{T_SECOND:#x}"));
         assert_eq!(body["sftVaultAddress"], format!("{T_MSTR:#x}"));
@@ -2656,10 +2809,12 @@ using-tokens-from:
         let errors = body["errors"].as_array().expect("errors is an array");
         assert_eq!(data.len(), 1);
         assert_eq!(errors.len(), 1);
+        assert_eq!(data[0]["chainId"], 8453);
         assert_eq!(data[0]["address"], format!("{WT_MSTR:#x}"));
         assert_eq!(data[0]["holderCount"], 1001);
         assert_eq!(data[0]["transferCount"], 1002);
         assert_eq!(data[0]["bridgedSupply"], "260");
+        assert_eq!(errors[0]["chainId"], 8453);
         assert_eq!(errors[0]["address"], format!("{WT_SECOND:#x}"));
         assert_eq!(errors[0]["message"], "SFT vault not found for token");
     }
@@ -2834,6 +2989,7 @@ using-tokens-from:
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["chainId"], 8453);
         assert_eq!(body["address"], format!("{WT_MSTR:#x}"));
         assert_eq!(body["metadata"][0]["meta"], "0xRAWMETA");
         assert_eq!(body["metadata"][0]["metaHash"], "0xmetahash");
@@ -2921,6 +3077,7 @@ using-tokens-from:
         assert_eq!(data.len(), 1);
         assert_eq!(errors.len(), 1);
 
+        assert_eq!(data[0]["chainId"], 8453);
         assert_eq!(data[0]["shareAddress"], format!("{WT_MSTR:#x}"));
         assert_eq!(data[0]["assetAddress"], format!("{T_MSTR:#x}"));
         assert_eq!(data[0]["assetsPerShare"], "1.0");
@@ -2932,21 +3089,24 @@ using-tokens-from:
             .rocket()
             .state::<crate::db::DbPool>()
             .expect("pool in state");
-        let persisted = sqlx::query_as::<_, (String, String, String, i64, Option<i64>)>(
-            "SELECT share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp \
+        let persisted = sqlx::query_as::<_, (i64, String, String, String, i64, Option<i64>)>(
+            "SELECT chain_id, share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp \
              FROM wrapped_exchange_rate_snapshots \
-             WHERE share_token_address = ?",
+             WHERE chain_id = ? AND share_token_address = ?",
         )
+        .bind(8453)
         .bind(format!("{WT_MSTR:#x}"))
         .fetch_one(pool)
         .await
         .expect("read persisted snapshot");
-        assert_eq!(persisted.0, format!("{WT_MSTR:#x}"));
-        assert_eq!(persisted.1, format!("{T_MSTR:#x}"));
-        assert_eq!(persisted.2, "1.0");
-        assert_eq!(persisted.3, 123);
-        assert_eq!(persisted.4, Some(456));
+        assert_eq!(persisted.0, 8453);
+        assert_eq!(persisted.1, format!("{WT_MSTR:#x}"));
+        assert_eq!(persisted.2, format!("{T_MSTR:#x}"));
+        assert_eq!(persisted.3, "1.0");
+        assert_eq!(persisted.4, 123);
+        assert_eq!(persisted.5, Some(456));
 
+        assert_eq!(errors[0]["chainId"], 8453);
         assert_eq!(errors[0]["shareAddress"], format!("{WT_BAD:#x}"));
         assert_eq!(errors[0]["message"], "failed to read ERC4626 ratio");
     }
@@ -2982,16 +3142,44 @@ using-tokens-from:
         assert_eq!(data.len(), 2);
         assert!(errors.is_empty());
 
-        assert!(data
-            .iter()
-            .any(|row| row["shareAddress"] == format!("{WT_MSTR:#x}")
-                && row["assetAddress"] == format!("{T_MSTR:#x}")
-                && row["assetsPerShare"] == "1.0"));
-        assert!(data
-            .iter()
-            .any(|row| row["shareAddress"] == format!("{WT_SECOND:#x}")
-                && row["assetAddress"] == format!("{T_SECOND:#x}")
-                && row["assetsPerShare"] == "3"));
+        assert!(data.iter().any(|row| row["chainId"] == 8453
+            && row["shareAddress"] == format!("{WT_MSTR:#x}")
+            && row["assetAddress"] == format!("{T_MSTR:#x}")
+            && row["assetsPerShare"] == "1.0"));
+        assert!(data.iter().any(|row| row["chainId"] == 137
+            && row["shareAddress"] == format!("{WT_SECOND:#x}")
+            && row["assetAddress"] == format!("{T_SECOND:#x}")
+            && row["assetsPerShare"] == "3"));
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratios_keeps_other_networks_when_one_rpc_fails() {
+        let base_rpc_url =
+            mock_erc4626_batch_rpc(WT_MSTR, T_MSTR, 18, 18, U256::from(10).pow(U256::from(18)))
+                .await;
+        let client =
+            wrap_ratio_multi_network_client(&base_rpc_url, "http://127.0.0.1:1/unavailable").await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/v1/tokens/wrap-ratio")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let data = body["data"].as_array().expect("data is an array");
+        let errors = body["errors"].as_array().expect("errors is an array");
+        assert_eq!(data.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(data[0]["chainId"], 8453);
+        assert_eq!(data[0]["shareAddress"], format!("{WT_MSTR:#x}"));
+        assert_eq!(errors[0]["chainId"], 137);
+        assert_eq!(errors[0]["shareAddress"], format!("{WT_SECOND:#x}"));
+        assert_eq!(errors[0]["message"], "failed to read ERC4626 ratio");
     }
 
     #[rocket::async_test]
@@ -3017,6 +3205,7 @@ using-tokens-from:
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["chainId"], 8453);
         assert_eq!(body["shareAddress"], format!("{WT_MSTR:#x}"));
         assert_eq!(body["assetAddress"], format!("{T_MSTR:#x}"));
         assert_eq!(body["assetsPerShare"], "2");
@@ -3055,6 +3244,7 @@ using-tokens-from:
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value =
             serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["chainId"], 8453);
         assert_eq!(body["shareAddress"], format!("{WT_MSTR:#x}"));
         assert_eq!(body["assetAddress"], format!("{T_MSTR:#x}"));
 

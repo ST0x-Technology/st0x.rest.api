@@ -5,6 +5,8 @@ mod get_order;
 
 use crate::cache::RouteResponseCaches;
 use crate::error::ApiError;
+use crate::routes::raindex_backed_tokens;
+use crate::routes::required_raindex_chain_ids;
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
     wrap_ratio_values_from_responses, WrapRatioValue,
@@ -16,7 +18,7 @@ use rain_orderbook_common::raindex_client::orders::{GetOrdersFilters, RaindexOrd
 use rain_orderbook_common::raindex_client::trades::{
     GetTradesByOrderHashesFilters, OrderHashes, RaindexTrade,
 };
-use rain_orderbook_common::raindex_client::types::TimeFilter;
+use rain_orderbook_common::raindex_client::types::{ChainIds, TimeFilter};
 use rain_orderbook_common::raindex_client::RaindexClient;
 use rocket::Route;
 use std::collections::HashMap;
@@ -47,12 +49,13 @@ pub(crate) struct RaindexOrderDataSource<'a> {
 #[async_trait]
 impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
     async fn get_orders_by_hash(&self, hash: B256) -> Result<Vec<RaindexOrder>, ApiError> {
+        let chain_ids = required_raindex_chain_ids(self.client)?;
         let filters = GetOrdersFilters {
             order_hash: Some(hash),
             ..Default::default()
         };
         self.client
-            .get_orders(None, Some(filters), None, None)
+            .get_orders(Some(ChainIds(chain_ids)), Some(filters), None, None)
             .await
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
@@ -92,7 +95,11 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
 
         let result = self
             .client
-            .get_trades_by_order_hashes(None, OrderHashes(vec![order_hash]), Some(filters))
+            .get_trades_by_order_hashes(
+                Some(ChainIds(vec![order.chain_id()])),
+                OrderHashes(vec![order_hash]),
+                Some(filters),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to query order trades");
@@ -121,15 +128,7 @@ impl<'a> OrderDataSource for RaindexOrderDataSource<'a> {
         let Some(pool) = self.pool else {
             return Ok(HashMap::new());
         };
-        let tokens: Vec<_> = self
-            .client
-            .get_all_tokens()
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to retrieve curated tokens");
-                ApiError::Internal("failed to retrieve curated tokens".into())
-            })?
-            .into_values()
-            .collect();
+        let tokens = raindex_backed_tokens(self.client)?;
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(pool, &responses).await;
