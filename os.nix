@@ -49,9 +49,14 @@ let
         ExecStart = "${path} serve --config /etc/st0x-rest-api/config.toml";
         LoadCredential =
           [ "attribution-signer:${env.dataDir}/secrets/attribution-signer" ];
+        LogsDirectory = "st0x-rest-api";
+        LogsDirectoryMode = "0775";
         Restart = "always";
         RestartSec = 5;
-        ReadWritePaths = [ "/mnt/data" ];
+        ReadWritePaths = [
+          "/mnt/data"
+          "/var/log/st0x-rest-api"
+        ];
       };
     };
 
@@ -182,6 +187,7 @@ in {
   fileSystems."/mnt/data" = {
     device = "/dev/disk/by-id/scsi-0DO_Volume_${env.dataVolumeName}";
     fsType = "ext4";
+    autoResize = true;
   };
 
   nix = {
@@ -215,7 +221,6 @@ in {
 
   systemd.tmpfiles.rules = [
     "d ${env.dataDir} 0775 root st0x -"
-    "d ${env.dataDir}/logs 0775 root st0x -"
     "d ${env.dataDir}/secrets 0700 root root -"
   ];
   systemd.services = lib.mapAttrs mkService enabledServices;
