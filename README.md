@@ -1,6 +1,7 @@
 # st0x REST API
 
-REST API for st0x orderbook operations. Built with Rocket, backed by SQLite, and authenticated via API keys using HTTP Basic auth.
+REST API for st0x orderbook operations. Built with Rocket, backed by SQLite, and
+authenticated via API keys using HTTP Basic auth.
 
 ## Setup
 
@@ -35,11 +36,13 @@ st0x_rest_api keys      Manage API keys
 nix develop -c cargo run serve
 ```
 
-The server starts on `http://localhost:8000` by default. Swagger UI is available at `/swagger`.
+The server starts on `http://localhost:8000` by default. Swagger UI is available
+at `/swagger`.
 
 ### API key management
 
-All API routes (except `/health`) require HTTP Basic authentication. Use the `keys` subcommand to manage credentials.
+All API routes (except `/health`) require HTTP Basic authentication. Use the
+`keys` subcommand to manage credentials.
 
 #### Create a key
 
@@ -68,7 +71,22 @@ The secret is hashed with Argon2 before storage. There is no way to recover it.
 nix develop -c cargo run keys list
 ```
 
-Shows all keys with their ID, label, owner, active status, and timestamps.
+Shows all keys with their ID, label, owner, active status, rate-limit override,
+and timestamps.
+
+#### Override a key's rate limit
+
+```sh
+nix develop -c cargo run -- keys --config config/prod.toml set-rate-limit <KEY_ID> 300
+```
+
+Sets a requests-per-minute override for one API key. The override is read on
+each authenticated request, so restarting the server is not required. Clear it
+to return the key to the configured default:
+
+```sh
+nix develop -c cargo run -- keys --config config/prod.toml clear-rate-limit <KEY_ID>
+```
 
 #### Revoke a key
 
@@ -88,7 +106,8 @@ Permanently removes the key from the database.
 
 ### Authenticating API requests
 
-Use HTTP Basic auth with the key ID as the username and the secret as the password:
+Use HTTP Basic auth with the key ID as the username and the secret as the
+password:
 
 ```sh
 curl -u "<KEY_ID>:<SECRET>" http://localhost:8000/v1/tokens

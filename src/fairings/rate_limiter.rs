@@ -103,8 +103,13 @@ impl RateLimiter {
         }
     }
 
-    pub fn check_per_key(&self, key_id: i64) -> Result<(bool, Option<RateLimitInfo>), ApiError> {
-        if self.per_key_rpm == 0 {
+    pub fn check_per_key(
+        &self,
+        key_id: i64,
+        rate_limit_rpm: Option<u64>,
+    ) -> Result<(bool, Option<RateLimitInfo>), ApiError> {
+        let rate_limit_rpm = rate_limit_rpm.unwrap_or(self.per_key_rpm);
+        if rate_limit_rpm == 0 {
             return Ok((true, None));
         }
         let mut windows = match self.per_key_windows.lock() {
@@ -129,14 +134,14 @@ impl RateLimiter {
         let window = windows.entry(key_id).or_default();
         Self::prune_window(window, cutoff);
 
-        if (window.len() as u64) < self.per_key_rpm {
+        if (window.len() as u64) < rate_limit_rpm {
             window.push_back(now);
-            let remaining = self.per_key_rpm - window.len() as u64;
+            let remaining = rate_limit_rpm - window.len() as u64;
             let reset = Self::compute_reset(window, now);
             Ok((
                 true,
                 Some(RateLimitInfo {
-                    limit: self.per_key_rpm,
+                    limit: rate_limit_rpm,
                     remaining,
                     reset,
                 }),
@@ -146,7 +151,7 @@ impl RateLimiter {
             Ok((
                 false,
                 Some(RateLimitInfo {
-                    limit: self.per_key_rpm,
+                    limit: rate_limit_rpm,
                     remaining: 0,
                     reset,
                 }),
@@ -281,16 +286,26 @@ mod tests {
     fn test_per_key_check_allows_under_limit() {
         let rl = RateLimiter::new(100, 3);
         for _ in 0..3 {
-            assert!(matches!(rl.check_per_key(1), Ok((true, _))));
+            assert!(matches!(rl.check_per_key(1, None), Ok((true, _))));
         }
     }
 
     #[test]
     fn test_per_key_check_blocks_over_limit() {
         let rl = RateLimiter::new(100, 2);
-        assert!(matches!(rl.check_per_key(1), Ok((true, _))));
-        assert!(matches!(rl.check_per_key(1), Ok((true, _))));
-        assert!(matches!(rl.check_per_key(1), Ok((false, _))));
+        assert!(matches!(rl.check_per_key(1, None), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1, None), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1, None), Ok((false, _))));
+    }
+
+    #[test]
+    fn test_per_key_check_uses_override() {
+        let rl = RateLimiter::new(100, 1);
+        assert!(matches!(rl.check_per_key(1, Some(2)), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1, Some(2)), Ok((true, _))));
+        let (allowed, info) = rl.check_per_key(1, Some(2)).expect("rate limit check");
+        assert!(!allowed);
+        assert_eq!(info.map(|info| info.limit), Some(2));
     }
 
     #[test]
@@ -305,7 +320,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                matches!(rl.check_per_key(42), Ok((true, _)))
+                matches!(rl.check_per_key(42, None), Ok((true, _)))
             }));
         }
 
@@ -322,10 +337,10 @@ mod tests {
     #[test]
     fn test_per_key_limits_are_independent() {
         let rl = RateLimiter::new(100, 1);
-        assert!(matches!(rl.check_per_key(1), Ok((true, _))));
-        assert!(matches!(rl.check_per_key(1), Ok((false, _))));
-        assert!(matches!(rl.check_per_key(2), Ok((true, _))));
-        assert!(matches!(rl.check_per_key(2), Ok((false, _))));
+        assert!(matches!(rl.check_per_key(1, None), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(1, None), Ok((false, _))));
+        assert!(matches!(rl.check_per_key(2, None), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(2, None), Ok((false, _))));
     }
 
     #[test]
@@ -341,7 +356,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                (1_i64, matches!(rl.check_per_key(1), Ok((true, _))))
+                (1_i64, matches!(rl.check_per_key(1, None), Ok((true, _))))
             }));
         }
         for _ in 0..workers_per_key {
@@ -349,7 +364,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                (2_i64, matches!(rl.check_per_key(2), Ok((true, _))))
+                (2_i64, matches!(rl.check_per_key(2, None), Ok((true, _))))
             }));
         }
 
@@ -375,7 +390,7 @@ mod tests {
         let rl = RateLimiter::new(0, 0);
         for _ in 0..1000 {
             assert!(matches!(rl.check_global(), Ok((true, _))));
-            assert!(matches!(rl.check_per_key(1), Ok((true, _))));
+            assert!(matches!(rl.check_per_key(1, None), Ok((true, _))));
         }
     }
 
@@ -401,7 +416,7 @@ mod tests {
             window.push_back(stale);
             window.push_back(Instant::now());
         }
-        assert!(matches!(rl.check_per_key(7), Ok((true, _))));
+        assert!(matches!(rl.check_per_key(7, None), Ok((true, _))));
     }
 
     #[test]
@@ -423,7 +438,10 @@ mod tests {
             panic!("poison per-key lock");
         });
 
-        assert!(matches!(rl.check_per_key(1), Err(ApiError::Internal(_))));
+        assert!(matches!(
+            rl.check_per_key(1, None),
+            Err(ApiError::Internal(_))
+        ));
     }
 
     #[test]
@@ -439,7 +457,7 @@ mod tests {
         }
 
         for _ in 0..PER_KEY_CLEANUP_EVERY {
-            assert!(rl.check_per_key(999).is_ok());
+            assert!(rl.check_per_key(999, None).is_ok());
         }
 
         let windows = rl.per_key_windows.lock().expect("lock");
@@ -654,6 +672,47 @@ mod tests {
         assert_eq!(
             json["error"]["message"],
             "Too many requests, please try again later"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn test_database_override_controls_per_key_limit_and_headers() {
+        let rl = RateLimiter::new(10000, 1);
+        let client = TestClientBuilder::new().rate_limiter(rl).build().await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let pool = client.rocket().state::<crate::db::DbPool>().expect("pool");
+        sqlx::query("UPDATE api_keys SET rate_limit_rpm = 2 WHERE key_id = ?")
+            .bind(&key_id)
+            .execute(pool)
+            .await
+            .expect("set rate limit override");
+        let header = basic_auth_header(&key_id, &secret);
+
+        for expected_remaining in [1, 0] {
+            let expected_remaining = expected_remaining.to_string();
+            let response = client
+                .get("/v1/tokens")
+                .header(HttpHeader::new("Authorization", header.clone()))
+                .dispatch()
+                .await;
+            assert_ne!(response.status(), Status::TooManyRequests);
+            assert_eq!(response.headers().get_one("X-RateLimit-Limit"), Some("2"));
+            assert_eq!(
+                response.headers().get_one("X-RateLimit-Remaining"),
+                Some(expected_remaining.as_str())
+            );
+        }
+
+        let response = client
+            .get("/v1/tokens")
+            .header(HttpHeader::new("Authorization", header))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::TooManyRequests);
+        assert_eq!(response.headers().get_one("X-RateLimit-Limit"), Some("2"));
+        assert_eq!(
+            response.headers().get_one("X-RateLimit-Remaining"),
+            Some("0")
         );
     }
 

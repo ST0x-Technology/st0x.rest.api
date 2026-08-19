@@ -42,6 +42,10 @@ pub enum KeysCommand {
     },
     #[command(about = "List all API keys")]
     List,
+    #[command(about = "Set a requests-per-minute override for an API key")]
+    SetRateLimit { key_id: String, rpm: u64 },
+    #[command(about = "Clear an API key's requests-per-minute override")]
+    ClearRateLimit { key_id: String },
     #[command(about = "Revoke an API key (set inactive)")]
     Revoke { key_id: String },
     #[command(about = "Delete an API key permanently")]
@@ -69,6 +73,8 @@ pub async fn handle_keys_command(
             admin,
         } => create_key(&pool, &label, &owner, admin).await,
         KeysCommand::List => list_keys(&pool).await,
+        KeysCommand::SetRateLimit { key_id, rpm } => set_rate_limit(&pool, &key_id, rpm).await,
+        KeysCommand::ClearRateLimit { key_id } => clear_rate_limit(&pool, &key_id).await,
         KeysCommand::Revoke { key_id } => revoke_key(&pool, &key_id).await,
         KeysCommand::Delete { key_id } => delete_key(&pool, &key_id).await,
     }
@@ -136,7 +142,7 @@ async fn create_key(
 
 async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
     let rows = sqlx::query_as::<_, auth::ApiKeyRow>(
-        "SELECT id, key_id, secret_hash, label, owner, active, is_admin, created_at, updated_at \
+        "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, created_at, updated_at \
          FROM api_keys ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -150,25 +156,68 @@ async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "{:<38} {:<20} {:<30} {:<8} {:<8} {:<20} {:<20}",
-        "KEY_ID", "LABEL", "OWNER", "ACTIVE", "ADMIN", "CREATED_AT", "UPDATED_AT"
+        "{:<38} {:<20} {:<30} {:<8} {:<8} {:<12} {:<20} {:<20}",
+        "KEY_ID", "LABEL", "OWNER", "ACTIVE", "ADMIN", "RATE_RPM", "CREATED_AT", "UPDATED_AT"
     );
-    println!("{}", "-".repeat(144));
+    println!("{}", "-".repeat(157));
 
     for row in &rows {
         println!(
-            "{:<38} {:<20} {:<30} {:<8} {:<8} {:<20} {:<20}",
+            "{:<38} {:<20} {:<30} {:<8} {:<8} {:<12} {:<20} {:<20}",
             row.key_id,
             row.label,
             row.owner,
             row.active,
             row.is_admin,
+            row.rate_limit_rpm
+                .map_or_else(|| "default".to_string(), |rpm| rpm.to_string()),
             row.created_at,
             row.updated_at
         );
     }
     println!();
 
+    Ok(())
+}
+
+async fn set_rate_limit(
+    pool: &DbPool,
+    key_id: &str,
+    rpm: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if rpm == 0 {
+        return Err("rate limit RPM must be greater than zero".into());
+    }
+    let rpm = i64::try_from(rpm).map_err(|_| "rate limit RPM is too large")?;
+    let result = sqlx::query("UPDATE api_keys SET rate_limit_rpm = ? WHERE key_id = ?")
+        .bind(rpm)
+        .bind(key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("failed to set API key rate limit: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("API key {key_id} not found").into());
+    }
+
+    tracing::info!(key_id, rate_limit_rpm = rpm, "API key rate limit set");
+    println!("API key {key_id} rate limit set to {rpm} requests per minute");
+    Ok(())
+}
+
+async fn clear_rate_limit(pool: &DbPool, key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let result = sqlx::query("UPDATE api_keys SET rate_limit_rpm = NULL WHERE key_id = ?")
+        .bind(key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("failed to clear API key rate limit: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("API key {key_id} not found").into());
+    }
+
+    tracing::info!(key_id, "API key rate limit cleared");
+    println!("API key {key_id} rate limit reset to the configured default");
     Ok(())
 }
 
@@ -289,7 +338,7 @@ mod tests {
         .expect("create key");
 
         let row = sqlx::query_as::<_, auth::ApiKeyRow>(
-            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, created_at, updated_at \
+            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, created_at, updated_at \
              FROM api_keys",
         )
         .fetch_one(&pool)
@@ -300,6 +349,7 @@ mod tests {
         assert_eq!(row.owner, "contact@example.com");
         assert!(row.active);
         assert!(!row.is_admin);
+        assert_eq!(row.rate_limit_rpm, None);
         assert!(PasswordHash::new(&row.secret_hash).is_ok());
         let snapshotted_key_id: String =
             sqlx::query_scalar("SELECT api_key_id FROM attribution_api_keys")
@@ -324,6 +374,81 @@ mod tests {
 
         let result = handle_keys_command(KeysCommand::List, pool).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_set_and_clear_rate_limit() {
+        let pool = test_pool().await;
+        let key_id = seed_key(&pool).await;
+
+        handle_keys_command(
+            KeysCommand::SetRateLimit {
+                key_id: key_id.clone(),
+                rpm: 300,
+            },
+            pool.clone(),
+        )
+        .await
+        .expect("set rate limit");
+
+        let rate_limit_rpm: Option<i64> =
+            sqlx::query_scalar("SELECT rate_limit_rpm FROM api_keys WHERE key_id = ?")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch rate limit");
+        assert_eq!(rate_limit_rpm, Some(300));
+
+        handle_keys_command(
+            KeysCommand::ClearRateLimit {
+                key_id: key_id.clone(),
+            },
+            pool.clone(),
+        )
+        .await
+        .expect("clear rate limit");
+
+        let rate_limit_rpm: Option<i64> =
+            sqlx::query_scalar("SELECT rate_limit_rpm FROM api_keys WHERE key_id = ?")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch cleared rate limit");
+        assert_eq!(rate_limit_rpm, None);
+    }
+
+    #[tokio::test]
+    async fn test_set_rate_limit_rejects_zero() {
+        let pool = test_pool().await;
+        let key_id = seed_key(&pool).await;
+
+        let result = handle_keys_command(KeysCommand::SetRateLimit { key_id, rpm: 0 }, pool).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_set_and_clear_rate_limit_reject_missing_key() {
+        let pool = test_pool().await;
+
+        let set_result = handle_keys_command(
+            KeysCommand::SetRateLimit {
+                key_id: "nonexistent".into(),
+                rpm: 300,
+            },
+            pool.clone(),
+        )
+        .await;
+        let clear_result = handle_keys_command(
+            KeysCommand::ClearRateLimit {
+                key_id: "nonexistent".into(),
+            },
+            pool,
+        )
+        .await;
+
+        assert!(set_result.is_err());
+        assert!(clear_result.is_err());
     }
 
     #[tokio::test]

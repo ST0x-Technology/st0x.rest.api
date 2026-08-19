@@ -21,6 +21,7 @@ pub struct ApiKeyRow {
     pub owner: String,
     pub active: bool,
     pub is_admin: bool,
+    pub rate_limit_rpm: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -112,7 +113,7 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
         };
 
         let row: Option<ApiKeyRow> = match sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, created_at, updated_at \
+            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, created_at, updated_at \
              FROM api_keys WHERE key_id = ? AND active = 1",
         )
         .bind(key_id)
@@ -186,7 +187,25 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
             }
         };
 
-        match rl.check_per_key(row.id) {
+        let rate_limit_rpm = match row.rate_limit_rpm {
+            Some(rate_limit_rpm) => match u64::try_from(rate_limit_rpm) {
+                Ok(rate_limit_rpm) if rate_limit_rpm > 0 => Some(rate_limit_rpm),
+                _ => {
+                    tracing::error!(
+                        key_id = %row.key_id,
+                        rate_limit_rpm,
+                        "invalid per-key rate limit in database"
+                    );
+                    return Outcome::Error((
+                        Status::InternalServerError,
+                        ApiError::Internal("authentication check failed".into()),
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        match rl.check_per_key(row.id, rate_limit_rpm) {
             Ok((true, info)) => {
                 if let Some(info) = info {
                     let cache = req.local_cache(|| CachedRateLimitInfo(Mutex::new(None)));
