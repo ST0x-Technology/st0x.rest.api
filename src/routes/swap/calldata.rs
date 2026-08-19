@@ -70,11 +70,8 @@ pub async fn post_swap_calldata(
         tracing::info!(body = ?req, "request received");
         let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
-        let ds = RaindexSwapDataSource {
-            client: raindex.client(),
-            caches: &app_state.response_caches,
-            pool: pool.inner(),
-        };
+        let ds =
+            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
         let response = handle_swap_calldata(
             &ds,
             &key,
@@ -132,11 +129,8 @@ pub async fn post_swap_calldata_v2(
         );
         let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
-        let ds = RaindexSwapDataSource {
-            client: raindex.client(),
-            caches: &app_state.response_caches,
-            pool: pool.inner(),
-        };
+        let ds =
+            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
         let response = handle_swap_calldata_v2(
             &ds,
             &key,

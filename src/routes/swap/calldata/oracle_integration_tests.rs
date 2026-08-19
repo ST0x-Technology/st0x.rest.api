@@ -459,11 +459,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     );
     assert_eq!(oracle_signer_address, attribution_state.signer.address());
     let attribution = attribution_state.for_api_key("customer-key", owner);
-    let data_source = RaindexSwapDataSource {
-        client: &client,
-        caches: &caches,
-        pool: &pool,
-    };
+    let data_source = RaindexSwapDataSource::new(&client, &caches, &pool);
     let request = SwapCalldataRequest {
         taker: owner,
         input_token: input_address,

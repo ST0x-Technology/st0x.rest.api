@@ -3,6 +3,7 @@ extern crate rocket;
 
 mod analytics;
 mod app_state;
+mod atomic_liquidity;
 mod attribution;
 mod attribution_reporting;
 mod auth;

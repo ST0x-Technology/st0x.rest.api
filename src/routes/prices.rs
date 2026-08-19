@@ -1,6 +1,7 @@
 use crate::auth::AuthenticatedKey;
 use crate::db::market_price_history::{
-    list_market_price_history, list_market_prices_at_or_before, MarketPriceSnapshot,
+    list_current_market_prices, list_market_price_history, list_market_prices_at_or_before,
+    MarketPriceSnapshot,
 };
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -214,18 +215,32 @@ async fn price_responses_for_market(
     historical: bool,
 ) -> Result<Vec<MarketPriceResponse>, ApiError> {
     let quote_address = normalize_address(market.quote_token_address);
-    let current_query = list_market_prices_at_or_before(
-        &state.pool,
-        i64::from(market.chain_id),
-        &quote_address,
-        retained_start,
-        query_time,
-    );
     let (rows, previous) = if historical {
-        (current_query.await.map_err(database_error)?, Vec::new())
+        (
+            list_market_prices_at_or_before(
+                &state.pool,
+                i64::from(market.chain_id),
+                &quote_address,
+                retained_start,
+                query_time,
+            )
+            .await
+            .map_err(database_error)?,
+            Vec::new(),
+        )
     } else {
         tokio::try_join!(
-            async { current_query.await.map_err(database_error) },
+            async {
+                list_current_market_prices(
+                    &state.pool,
+                    i64::from(market.chain_id),
+                    &quote_address,
+                    retained_start,
+                    query_time,
+                )
+                .await
+                .map_err(database_error)
+            },
             async {
                 list_market_prices_at_or_before(
                     &state.pool,
@@ -654,7 +669,9 @@ pub fn routes() -> Vec<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::market_price_history::{insert_market_price_snapshots, NewMarketPriceSnapshot};
+    use crate::db::market_price_history::{
+        insert_market_price_snapshots, replace_market_price_sample, NewMarketPriceSnapshot,
+    };
     use crate::db::DbPool;
     use crate::test_helpers::{
         basic_auth_header, mock_raindex_registry_url_with_settings_and_tokens, seed_api_key,
@@ -689,7 +706,9 @@ mod tests {
         assert!(1_209_600 / interval < MAX_HISTORY_POINTS);
     }
 
-    async fn price_client() -> rocket::local::asynchronous::Client {
+    async fn price_client_with_database_url(
+        database_url: Option<String>,
+    ) -> rocket::local::asynchronous::Client {
         let settings = r#"version: 6
 networks:
   base:
@@ -745,10 +764,15 @@ using-tokens-from:
         let config = crate::raindex::RaindexProvider::load(&registry_url, None)
             .await
             .expect("load market price registry");
-        TestClientBuilder::new()
-            .raindex_config(config)
-            .build()
-            .await
+        let builder = TestClientBuilder::new().raindex_config(config);
+        match database_url {
+            Some(database_url) => builder.database_url(database_url).build().await,
+            None => builder.build().await,
+        }
+    }
+
+    async fn price_client() -> rocket::local::asynchronous::Client {
+        price_client_with_database_url(None).await
     }
 
     async fn multichain_price_client() -> rocket::local::asynchronous::Client {
@@ -915,6 +939,41 @@ using-tokens-from:
         assert!(body["data"][0].get("observedAt").is_some());
         assert!(body["data"][0].get("change24hPercent").is_some());
         assert!(body["data"][0].get("asset_address").is_none());
+    }
+
+    #[rocket::async_test]
+    async fn completed_empty_sample_hides_retained_bad_price_after_restart() {
+        let directory = tempfile::tempdir().expect("create temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("prices.db").display());
+        let client = price_client_with_database_url(Some(database_url.clone())).await;
+        let now = unix_now().expect("current time");
+        seed_price(&client, now - 60, "97").await;
+        seed_price(&client, now, "133.2849473639369669757361259939914873505").await;
+        let state = client
+            .rocket()
+            .state::<MarketPriceState>()
+            .expect("market price state");
+        replace_market_price_sample(&state.pool, now, &[])
+            .await
+            .expect("replace completed sample bucket");
+        drop(client);
+
+        let client = price_client_with_database_url(Some(database_url)).await;
+
+        let response = authorized_get(&client, "/v1/prices?chainId=8453").await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = response.into_json().await.expect("price response");
+        assert_eq!(body["data"][0]["source"], "unavailable");
+        assert!(body["data"][0]["midpoint"].is_null());
+        assert!(body["data"][0]["observedAt"].is_null());
+
+        let historical_path = format!("/v1/prices?chainId=8453&at={}", now - 60);
+        let historical = authorized_get(&client, &historical_path).await;
+        assert_eq!(historical.status(), Status::Ok);
+        let historical_body: serde_json::Value =
+            historical.into_json().await.expect("historical response");
+        assert_eq!(historical_body["data"][0]["source"], "historical");
+        assert_eq!(historical_body["data"][0]["midpoint"], "97");
     }
 
     #[rocket::async_test]

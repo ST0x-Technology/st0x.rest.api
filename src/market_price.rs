@@ -1,6 +1,7 @@
+use crate::atomic_liquidity::has_executable_atomic_amounts;
 use crate::cache::RouteResponseCaches;
 use crate::db::market_price_history::{
-    delete_market_price_snapshots_before, insert_market_price_snapshots, NewMarketPriceSnapshot,
+    delete_market_price_snapshots_before, replace_market_price_sample, NewMarketPriceSnapshot,
 };
 use crate::db::DbPool;
 use crate::error::ApiError;
@@ -303,17 +304,19 @@ impl MarketPriceSampler {
                 tracing::error!(error = %error, "failed to prune market price snapshots");
                 ApiError::Internal("failed to prune market price snapshots".into())
             })?;
-        let inserted = insert_market_price_snapshots(&self.state.pool, &snapshots)
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, "failed to persist market price snapshots");
-                ApiError::Internal("failed to persist market price snapshots".into())
-            })?;
+        let (replaced, inserted) =
+            replace_market_price_sample(&self.state.pool, observed_at, &snapshots)
+                .await
+                .map_err(|error| {
+                    tracing::error!(error = %error, "failed to persist market price snapshots");
+                    ApiError::Internal("failed to persist market price snapshots".into())
+                })?;
 
         tracing::info!(
             market_count,
             snapshot_count = snapshots.len(),
             inserted,
+            replaced,
             deleted,
             "market price sampling complete"
         );
@@ -349,6 +352,7 @@ impl MarketPriceSampler {
         persist_wrap_ratio_snapshots_best_effort(&self.state.pool, &wrap_ratio_responses).await;
         let wrap_ratios = wrap_ratio_values_from_responses(wrap_ratio_responses);
         let variant_map = token_variant_map(&market.tokens, &wrap_ratios)?;
+        let token_decimals = market_token_decimals(market);
         let orders = fetch_active_market_orders(
             client,
             market.chain_id,
@@ -371,6 +375,7 @@ impl MarketPriceSampler {
                 &quotes,
                 market.quote_token_address,
                 &variant_map,
+                &token_decimals,
             )?);
         }
         let snapshots = aggregate_observations(
@@ -491,9 +496,7 @@ fn discover_price_markets(
         }
         let registry_tokens = tokens
             .iter()
-            .filter(|token| {
-                token.network.chain_id == chain_id && crate::wrap_ratio::is_st0x_token(token)
-            })
+            .filter(|token| token.network.chain_id == chain_id)
             .cloned()
             .collect::<Vec<_>>();
         let quote_tokens = tokens
@@ -674,6 +677,23 @@ fn token_variant_map(
     Ok(variants)
 }
 
+fn market_token_decimals(market: &PriceMarket) -> HashMap<Address, u8> {
+    let mut decimals = market
+        .registry_tokens
+        .iter()
+        .filter(|token| token.network.chain_id == market.chain_id)
+        .filter_map(|token| token.decimals.map(|decimals| (token.address, decimals)))
+        .collect::<HashMap<_, _>>();
+    for token in &market.tokens {
+        if let Some(canonical_decimals) = decimals.get(&token.canonical_address).copied() {
+            for variant in &token.variants {
+                decimals.entry(*variant).or_insert(canonical_decimals);
+            }
+        }
+    }
+    decimals
+}
+
 async fn fetch_active_market_orders(
     client: &RaindexClient,
     chain_id: u32,
@@ -756,6 +776,7 @@ fn observed_quotes_from_order(
     quotes: &[rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote],
     quote_token: Address,
     variant_map: &HashMap<Address, MarketVariant>,
+    token_decimals: &HashMap<Address, u8>,
 ) -> Result<Vec<ObservedQuote>, ApiError> {
     let decoded_order = OrderV4::abi_decode(order.order_bytes().as_ref()).map_err(|error| {
         tracing::error!(
@@ -770,6 +791,7 @@ fn observed_quotes_from_order(
         quotes,
         quote_token,
         variant_map,
+        token_decimals,
         order.order_hash(),
     )
 }
@@ -779,6 +801,7 @@ fn observed_quotes_from_decoded_order(
     quotes: &[rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote],
     quote_token: Address,
     variant_map: &HashMap<Address, MarketVariant>,
+    token_decimals: &HashMap<Address, u8>,
     order_hash: alloy::primitives::B256,
 ) -> Result<Vec<ObservedQuote>, ApiError> {
     let zero = Float::zero().map_err(float_error)?;
@@ -858,6 +881,49 @@ fn observed_quotes_from_decoded_order(
         };
         let input_address = input.token;
         let output_address = output.token;
+        let executable = match (
+            token_decimals.get(&input_address),
+            token_decimals.get(&output_address),
+        ) {
+            (Some(input_decimals), Some(output_decimals)) => {
+                match has_executable_atomic_amounts(
+                    data.max_output,
+                    data.ratio,
+                    *input_decimals,
+                    *output_decimals,
+                ) {
+                    Ok(executable) => executable,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            order_hash = %order_hash,
+                            input_token = %input_address,
+                            output_token = %output_address,
+                            "excluding market quote with invalid atomic amounts"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    order_hash = %order_hash,
+                    input_token = %input_address,
+                    output_token = %output_address,
+                    "excluding market quote because token decimals are unavailable"
+                );
+                false
+            }
+        };
+        if !executable {
+            tracing::debug!(
+                order_hash = %order_hash,
+                input_token = %input_address,
+                output_token = %output_address,
+                "excluding market quote that truncates to zero atomic units"
+            );
+            continue;
+        }
 
         let observation = if input_address == quote_token {
             match variant_map.get(&output_address) {
@@ -1020,7 +1086,9 @@ mod tests {
     use alloy::primitives::{address, Bytes, U256};
     use rain_orderbook_app_settings::network::NetworkCfg;
     use rain_orderbook_bindings::IRaindexV6::{EvaluableV4, IOV2};
-    use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
+    use rain_orderbook_common::raindex_client::order_quotes::{
+        RaindexOrderQuote, RaindexOrderQuoteValue,
+    };
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1046,6 +1114,30 @@ mod tests {
                 assets_per_share: "1".to_string(),
             },
         )])
+    }
+
+    fn token_decimals() -> HashMap<Address, u8> {
+        HashMap::from([(ASSET, 18), (QUOTE, 6)])
+    }
+
+    fn single_pair_order(input_token: Address, output_token: Address) -> OrderV4 {
+        OrderV4 {
+            owner: Address::ZERO,
+            nonce: U256::ZERO.into(),
+            evaluable: EvaluableV4 {
+                interpreter: Address::ZERO,
+                store: Address::ZERO,
+                bytecode: Bytes::new(),
+            },
+            validInputs: vec![IOV2 {
+                token: input_token,
+                vaultId: U256::ZERO.into(),
+            }],
+            validOutputs: vec![IOV2 {
+                token: output_token,
+                vaultId: U256::ZERO.into(),
+            }],
+        }
     }
 
     fn observation(side: MarketSide, price: &str) -> ObservedQuote {
@@ -1232,23 +1324,7 @@ mod tests {
 
     #[test]
     fn failed_relevant_order_quote_is_excluded_from_the_market_book() {
-        let order = OrderV4 {
-            owner: Address::ZERO,
-            nonce: U256::ZERO.into(),
-            evaluable: EvaluableV4 {
-                interpreter: Address::ZERO,
-                store: Address::ZERO,
-                bytecode: Bytes::new(),
-            },
-            validInputs: vec![IOV2 {
-                token: QUOTE,
-                vaultId: U256::ZERO.into(),
-            }],
-            validOutputs: vec![IOV2 {
-                token: ASSET,
-                vaultId: U256::ZERO.into(),
-            }],
-        };
+        let order = single_pair_order(QUOTE, ASSET);
         let failed_quote: RaindexOrderQuote = serde_json::from_value(json!({
             "pair": {
                 "pairName": "USDC/wtTEST",
@@ -1274,6 +1350,7 @@ mod tests {
             &[failed_quote],
             QUOTE,
             &variant_map,
+            &token_decimals(),
             alloy::primitives::B256::ZERO,
         )
         .expect("failed quote is excluded");
@@ -1283,23 +1360,7 @@ mod tests {
 
     #[test]
     fn successful_relevant_order_quote_without_data_fails_the_market_sample() {
-        let order = OrderV4 {
-            owner: Address::ZERO,
-            nonce: U256::ZERO.into(),
-            evaluable: EvaluableV4 {
-                interpreter: Address::ZERO,
-                store: Address::ZERO,
-                bytecode: Bytes::new(),
-            },
-            validInputs: vec![IOV2 {
-                token: QUOTE,
-                vaultId: U256::ZERO.into(),
-            }],
-            validOutputs: vec![IOV2 {
-                token: ASSET,
-                vaultId: U256::ZERO.into(),
-            }],
-        };
+        let order = single_pair_order(QUOTE, ASSET);
         let incomplete_quote: RaindexOrderQuote = serde_json::from_value(json!({
             "pair": {
                 "pairName": "USDC/wtTEST",
@@ -1325,6 +1386,7 @@ mod tests {
             &[incomplete_quote],
             QUOTE,
             &variant_map,
+            &token_decimals(),
             alloy::primitives::B256::ZERO,
         );
 
@@ -1333,6 +1395,154 @@ mod tests {
             Err(ApiError::Internal(message))
                 if message == "failed to quote complete market price book"
         ));
+    }
+
+    #[test]
+    fn excludes_production_wtmstr_dust_quote_from_market_book() {
+        let order = single_pair_order(crate::test_helpers::WT_MSTR, crate::test_helpers::USDC);
+        let quote = crate::test_helpers::production_wtmstr_dust_quote();
+        let variant_map = HashMap::from([(
+            crate::test_helpers::WT_MSTR,
+            MarketVariant {
+                canonical_address: crate::test_helpers::WT_MSTR,
+                price_multiplier: Float::parse("1".to_string()).expect("valid multiplier"),
+            },
+        )]);
+        let mut usdc = registry_token(8453, crate::test_helpers::USDC, "USDC", false);
+        usdc.decimals = Some(6);
+        let discovery = discover_price_markets(
+            vec![
+                registry_token(8453, crate::test_helpers::WT_MSTR, "wtMSTR", true),
+                usdc,
+            ],
+            &[8453],
+        );
+        let token_decimals = market_token_decimals(&discovery.markets[0]);
+
+        let observations = observed_quotes_from_decoded_order(
+            &order,
+            &[quote],
+            crate::test_helpers::USDC,
+            &variant_map,
+            &token_decimals,
+            crate::test_helpers::WT_MSTR_DUST_ORDER_HASH,
+        )
+        .expect("dust quote is excluded");
+
+        assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn invalid_atomic_quote_does_not_hide_valid_market_observation() {
+        let order = OrderV4 {
+            owner: Address::ZERO,
+            nonce: U256::ZERO.into(),
+            evaluable: EvaluableV4 {
+                interpreter: Address::ZERO,
+                store: Address::ZERO,
+                bytecode: Bytes::new(),
+            },
+            validInputs: vec![IOV2 {
+                token: crate::test_helpers::USDC,
+                vaultId: U256::ZERO.into(),
+            }],
+            validOutputs: vec![
+                IOV2 {
+                    token: crate::test_helpers::WT_MSTR,
+                    vaultId: U256::ZERO.into(),
+                },
+                IOV2 {
+                    token: ASSET_TWO,
+                    vaultId: U256::ZERO.into(),
+                },
+            ],
+        };
+        let invalid_quote = crate::test_helpers::wtmstr_quote("1e100", "1", "1", "1");
+        let mut valid_quote = crate::test_helpers::wtmstr_quote("1", "1", "1", "1");
+        valid_quote.pair.output_index = 1;
+        let one = Float::parse("1".to_string()).expect("valid multiplier");
+        let variant_map = HashMap::from([
+            (
+                crate::test_helpers::WT_MSTR,
+                MarketVariant {
+                    canonical_address: crate::test_helpers::WT_MSTR,
+                    price_multiplier: one,
+                },
+            ),
+            (
+                ASSET_TWO,
+                MarketVariant {
+                    canonical_address: ASSET_TWO,
+                    price_multiplier: one,
+                },
+            ),
+        ]);
+        let token_decimals = HashMap::from([
+            (crate::test_helpers::USDC, 6),
+            (crate::test_helpers::WT_MSTR, 18),
+            (ASSET_TWO, 18),
+        ]);
+
+        let observations = observed_quotes_from_decoded_order(
+            &order,
+            &[invalid_quote, valid_quote],
+            crate::test_helpers::USDC,
+            &variant_map,
+            &token_decimals,
+            alloy::primitives::B256::ZERO,
+        )
+        .expect("invalid quote is excluded locally");
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].asset_address, ASSET_TWO);
+    }
+
+    #[test]
+    fn missing_market_token_decimals_exclude_quote() {
+        let order = single_pair_order(QUOTE, ASSET);
+        let one = Float::parse("1".to_string()).expect("valid quote value");
+        let quote = RaindexOrderQuote {
+            pair: serde_json::from_value(json!({
+                "pairName": "USDC/wtTEST",
+                "inputIndex": 0,
+                "outputIndex": 0
+            }))
+            .expect("valid pair"),
+            block_number: 0,
+            data: Some(RaindexOrderQuoteValue {
+                max_output: one,
+                formatted_max_output: "1".to_string(),
+                max_input: one,
+                formatted_max_input: "1".to_string(),
+                ratio: one,
+                formatted_ratio: "1".to_string(),
+                inverse_ratio: one,
+                formatted_inverse_ratio: "1".to_string(),
+                formatted_max_output_as_percent_of_vault: None,
+            }),
+            success: true,
+            error: None,
+            signed_context: Vec::new(),
+        };
+        let variant_map = HashMap::from([(
+            ASSET,
+            MarketVariant {
+                canonical_address: ASSET,
+                price_multiplier: one,
+            },
+        )]);
+
+        let observations = observed_quotes_from_decoded_order(
+            &order,
+            &[quote],
+            QUOTE,
+            &variant_map,
+            &HashMap::from([(ASSET, 18)]),
+            alloy::primitives::B256::ZERO,
+        )
+        .expect("missing decimals exclude the quote");
+
+        assert!(observations.is_empty());
     }
 
     #[test]

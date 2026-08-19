@@ -1,11 +1,63 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{address, b256, Address, B256, U256};
 use base64::Engine;
 use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::{EvaluableV4, OrderV4, IOV2};
+use rain_orderbook_common::raindex_client::order_quotes::{
+    RaindexOrderQuote, RaindexOrderQuoteValue,
+};
 use rain_orderbook_common::raindex_client::orders::RaindexOrder;
 use rain_orderbook_common::take_orders::TakeOrderCandidate;
 use rocket::local::asynchronous::Client;
 use serde_json::json;
+
+pub(crate) const WT_MSTR: Address = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
+pub(crate) const USDC: Address = address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+pub(crate) const WT_MSTR_DUST_ORDER_HASH: B256 =
+    b256!("23015e87f07fb96cdf41dfb49861f8bc637b0a03f3c7f96ae3070e3845217315");
+
+pub(crate) fn wtmstr_quote(
+    max_output: &str,
+    max_input: &str,
+    ratio: &str,
+    inverse_ratio: &str,
+) -> RaindexOrderQuote {
+    let max_output = Float::parse(max_output.to_string()).expect("valid max output");
+    let max_input = Float::parse(max_input.to_string()).expect("valid max input");
+    let ratio = Float::parse(ratio.to_string()).expect("valid ratio");
+    let inverse_ratio = Float::parse(inverse_ratio.to_string()).expect("valid inverse ratio");
+    RaindexOrderQuote {
+        pair: serde_json::from_value(json!({
+            "pairName": "wtMSTR/USDC",
+            "inputIndex": 0,
+            "outputIndex": 0
+        }))
+        .expect("valid pair"),
+        block_number: 0,
+        data: Some(RaindexOrderQuoteValue {
+            max_output,
+            formatted_max_output: max_output.format().expect("format max output"),
+            max_input,
+            formatted_max_input: max_input.format().expect("format max input"),
+            ratio,
+            formatted_ratio: ratio.format().expect("format ratio"),
+            inverse_ratio,
+            formatted_inverse_ratio: inverse_ratio.format().expect("format inverse ratio"),
+            formatted_max_output_as_percent_of_vault: None,
+        }),
+        success: true,
+        error: None,
+        signed_context: Vec::new(),
+    }
+}
+
+pub(crate) fn production_wtmstr_dust_quote() -> RaindexOrderQuote {
+    wtmstr_quote(
+        "3.838009207986009475041066889213119489421507552037575367421589999999e-7",
+        "2.879551880308175910783617647879036439517250840743254112829098810088e-9",
+        "0.007502722698831713208597944445410618026068357798898643535155918523172",
+        "133.28494736393696697573612599399148735052322980189575719227947789035",
+    )
+}
 
 pub(crate) async fn client() -> Client {
     TestClientBuilder::new().build().await

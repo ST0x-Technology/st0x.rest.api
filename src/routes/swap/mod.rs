@@ -4,6 +4,7 @@ mod quote;
 mod slippage;
 
 use crate::analytics::{Analytics, AnalyticsEvent, ApiVersion, SwapFailure};
+use crate::atomic_liquidity::has_executable_atomic_amounts;
 use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorCode};
@@ -32,6 +33,7 @@ use rain_orderbook_common::take_orders::{NoopInjector, TakeOrderCandidate, TakeO
 use rocket::Route;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::OnceLock;
 
 struct SwapAnalyticsContext {
     input_token: Address,
@@ -163,6 +165,123 @@ fn quote_matches_pair(
     input.token == input_token && output.token == output_token
 }
 
+fn configured_token_decimals(
+    tokens: &HashMap<Address, Option<u8>>,
+    token: Address,
+) -> Result<u8, ApiError> {
+    match tokens.get(&token) {
+        Some(Some(decimals)) => Ok(*decimals),
+        Some(None) => {
+            tracing::error!(%token, "configured swap token is missing decimals");
+            Err(ApiError::Internal(
+                "the token registry is missing required decimals".into(),
+            ))
+        }
+        None => Err(ApiError::coded(
+            ApiErrorCode::SwapUnsupportedToken,
+            "one or both swap tokens are unsupported",
+        )),
+    }
+}
+
+fn build_swap_candidates_from_quotes(
+    orders: &[RaindexOrder],
+    quotes: Vec<Vec<RaindexOrderQuote>>,
+    input_token: Address,
+    output_token: Address,
+    input_decimals: u8,
+    output_decimals: u8,
+) -> Result<SwapCandidateBuild, ApiError> {
+    if quotes.len() != orders.len() {
+        tracing::error!(
+            order_count = orders.len(),
+            quote_set_count = quotes.len(),
+            "order candidate quote count mismatch"
+        );
+        return Err(ApiError::coded(
+            ApiErrorCode::SwapQuoteFailed,
+            "the swap quote could not be generated",
+        ));
+    }
+
+    let mut result = SwapCandidateBuild::default();
+    let mut non_executable_atomic_count = 0usize;
+    for (order, order_quotes) in orders.iter().zip(quotes) {
+        let order_v4: rain_orderbook_bindings::IRaindexV6::OrderV4 =
+            order.try_into().map_err(|e| {
+                tracing::error!(error = %e, "failed to inspect order quotes");
+                ApiError::coded(
+                    ApiErrorCode::SwapQuoteFailed,
+                    "the swap quote could not be generated",
+                )
+            })?;
+        for quote in &order_quotes {
+            if !quote_matches_pair(&order_v4, quote, input_token, output_token) {
+                continue;
+            }
+
+            if !quote.success || quote.data.is_none() {
+                result
+                    .failures
+                    .record(classify_quote_failure(quote.error.as_deref()));
+                continue;
+            }
+
+            if let Some(candidate) = build_candidate_from_quote(order, quote).map_err(|e| {
+                tracing::error!(error = %e, "failed to build order candidate");
+                ApiError::coded(
+                    ApiErrorCode::SwapQuoteFailed,
+                    "the swap quote could not be generated",
+                )
+            })? {
+                let executable = match has_executable_atomic_amounts(
+                    candidate.max_output,
+                    candidate.ratio,
+                    input_decimals,
+                    output_decimals,
+                ) {
+                    Ok(executable) => executable,
+                    Err(error) => {
+                        non_executable_atomic_count += 1;
+                        tracing::warn!(
+                            %error,
+                            order_hash = %order.order_hash(),
+                            input_token = %input_token,
+                            output_token = %output_token,
+                            "excluding swap candidate with invalid atomic amounts"
+                        );
+                        continue;
+                    }
+                };
+                if !executable {
+                    non_executable_atomic_count += 1;
+                    tracing::debug!(
+                        order_hash = %order.order_hash(),
+                        input_token = %input_token,
+                        output_token = %output_token,
+                        "excluding swap candidate that truncates to zero atomic units"
+                    );
+                    continue;
+                }
+                result.candidates.push(candidate);
+            }
+        }
+    }
+
+    tracing::info!(
+        order_count = orders.len(),
+        candidate_count = result.candidates.len(),
+        oracle_unavailable_count = result.failures.oracle_unavailable,
+        quote_failure_count = result.failures.quote_failed,
+        non_executable_atomic_count,
+        input_token = %input_token,
+        output_token = %output_token,
+        "built REST swap candidates"
+    );
+
+    Ok(result)
+}
+
 #[async_trait]
 pub(crate) trait SwapDataSource: Send + Sync {
     async fn validate_supported_tokens(
@@ -202,6 +321,43 @@ pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
     pub pool: &'a DbPool,
+    configured_tokens: OnceLock<HashMap<Address, Option<u8>>>,
+}
+
+impl<'a> RaindexSwapDataSource<'a> {
+    pub(crate) fn new(
+        client: &'a RaindexClient,
+        caches: &'a RouteResponseCaches,
+        pool: &'a DbPool,
+    ) -> Self {
+        Self {
+            client,
+            caches,
+            pool,
+            configured_tokens: OnceLock::new(),
+        }
+    }
+
+    fn configured_tokens(&self) -> Result<&HashMap<Address, Option<u8>>, ApiError> {
+        if let Some(tokens) = self.configured_tokens.get() {
+            return Ok(tokens);
+        }
+
+        let tokens = self.client.get_all_tokens().map_err(|error| {
+            tracing::error!(%error, "failed to retrieve curated tokens");
+            ApiError::Internal("failed to read the token registry".into())
+        })?;
+        let tokens = tokens
+            .into_values()
+            .filter(|token| token.network.chain_id == crate::CHAIN_ID)
+            .map(|token| (token.address, token.decimals))
+            .collect();
+        let _ = self.configured_tokens.set(tokens);
+        self.configured_tokens.get().ok_or_else(|| {
+            tracing::error!("failed to cache configured swap tokens");
+            ApiError::Internal("failed to read the token registry".into())
+        })
+    }
 }
 
 fn swap_chain_ids() -> ChainIds {
@@ -236,19 +392,13 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         input_token: Address,
         output_token: Address,
     ) -> Result<(), ApiError> {
-        let tokens = self.client.get_all_tokens().map_err(|e| {
-            tracing::error!(error = %e, "failed to retrieve curated tokens");
-            ApiError::Internal("failed to read the token registry".into())
-        })?;
-
-        let input_supported = tokens
-            .values()
-            .any(|token| token.network.chain_id == crate::CHAIN_ID && token.address == input_token);
-        let output_supported = tokens.values().any(|token| {
-            token.network.chain_id == crate::CHAIN_ID && token.address == output_token
-        });
+        let tokens = self.configured_tokens()?;
+        let input_supported = tokens.contains_key(&input_token);
+        let output_supported = tokens.contains_key(&output_token);
 
         if input_supported && output_supported {
+            configured_token_decimals(tokens, input_token)?;
+            configured_token_decimals(tokens, output_token)?;
             tracing::info!(input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
             return Ok(());
         }
@@ -300,6 +450,9 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         output_token: Address,
         counterparty: Address,
     ) -> Result<SwapCandidateBuild, ApiError> {
+        let configured_tokens = self.configured_tokens()?;
+        let input_decimals = configured_token_decimals(configured_tokens, input_token)?;
+        let output_decimals = configured_token_decimals(configured_tokens, output_token)?;
         let fetch = || async {
             let quotes = get_order_quotes_batch_with_injector(
                 orders,
@@ -316,65 +469,14 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                     "the swap quote could not be generated",
                 )
             })?;
-            if quotes.len() != orders.len() {
-                tracing::error!(
-                    order_count = orders.len(),
-                    quote_set_count = quotes.len(),
-                    "order candidate quote count mismatch"
-                );
-                return Err(ApiError::coded(
-                    ApiErrorCode::SwapQuoteFailed,
-                    "the swap quote could not be generated",
-                ));
-            }
-
-            let mut result = SwapCandidateBuild::default();
-            for (order, order_quotes) in orders.iter().zip(quotes) {
-                let order_v4: rain_orderbook_bindings::IRaindexV6::OrderV4 =
-                    order.try_into().map_err(|e| {
-                        tracing::error!(error = %e, "failed to inspect order quotes");
-                        ApiError::coded(
-                            ApiErrorCode::SwapQuoteFailed,
-                            "the swap quote could not be generated",
-                        )
-                    })?;
-                for quote in &order_quotes {
-                    if !quote_matches_pair(&order_v4, quote, input_token, output_token) {
-                        continue;
-                    }
-
-                    if !quote.success || quote.data.is_none() {
-                        result
-                            .failures
-                            .record(classify_quote_failure(quote.error.as_deref()));
-                        continue;
-                    }
-
-                    if let Some(candidate) =
-                        build_candidate_from_quote(order, quote).map_err(|e| {
-                            tracing::error!(error = %e, "failed to build order candidate");
-                            ApiError::coded(
-                                ApiErrorCode::SwapQuoteFailed,
-                                "the swap quote could not be generated",
-                            )
-                        })?
-                    {
-                        result.candidates.push(candidate);
-                    }
-                }
-            }
-
-            tracing::info!(
-                order_count = orders.len(),
-                candidate_count = result.candidates.len(),
-                oracle_unavailable_count = result.failures.oracle_unavailable,
-                quote_failure_count = result.failures.quote_failed,
-                input_token = %input_token,
-                output_token = %output_token,
-                "built REST swap candidates"
-            );
-
-            Ok(result)
+            build_swap_candidates_from_quotes(
+                orders,
+                quotes,
+                input_token,
+                output_token,
+                input_decimals,
+                output_decimals,
+            )
         };
 
         if !self.caches.is_enabled() || counterparty != Address::ZERO {
@@ -578,13 +680,16 @@ pub fn routes_v2() -> Vec<Route> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_quote_failure, ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
+        build_swap_candidates_from_quotes, classify_quote_failure, configured_token_decimals,
+        ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
         swap_calldata_response_from_take_orders_info, swap_candidates_cache_key, swap_chain_ids,
         SwapQuoteFailure,
     };
     use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
-    use alloy::primitives::address;
+    use alloy::primitives::{address, Address, Bytes, U256};
+    use alloy::sol_types::SolValue;
+    use rain_orderbook_bindings::IRaindexV6::{EvaluableV4, OrderV4, IOV2};
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rain_orderbook_common::raindex_client::take_orders::TakeOrdersInfo;
     use rain_orderbook_common::raindex_client::RaindexError;
@@ -597,6 +702,34 @@ mod tests {
         value["chainId"] = json!(chain_id);
         value["orderHash"] = json!(order_hash);
         serde_json::from_value(value).expect("deserialize mock order")
+    }
+
+    fn single_pair_order(
+        input_token: Address,
+        output_token: Address,
+        order_hash: &str,
+    ) -> RaindexOrder {
+        let decoded_order = OrderV4 {
+            owner: Address::ZERO,
+            nonce: U256::ZERO.into(),
+            evaluable: EvaluableV4 {
+                interpreter: Address::ZERO,
+                store: Address::ZERO,
+                bytecode: Bytes::new(),
+            },
+            validInputs: vec![IOV2 {
+                token: input_token,
+                vaultId: U256::ZERO.into(),
+            }],
+            validOutputs: vec![IOV2 {
+                token: output_token,
+                vaultId: U256::ZERO.into(),
+            }],
+        };
+        let mut value = crate::test_helpers::order_json();
+        value["orderBytes"] = json!(alloy::hex::encode_prefixed(decoded_order.abi_encode()));
+        value["orderHash"] = json!(order_hash);
+        serde_json::from_value(value).expect("deserialize single-pair order")
     }
 
     #[test]
@@ -659,6 +792,76 @@ mod tests {
     #[test]
     fn test_swap_orders_are_scoped_to_calldata_chain() {
         assert_eq!(swap_chain_ids().0, vec![crate::CHAIN_ID]);
+    }
+
+    #[test]
+    fn test_missing_configured_token_decimals_fail_closed() {
+        let token = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
+        let tokens = std::collections::HashMap::from([(token, None)]);
+
+        assert!(matches!(
+            configured_token_decimals(&tokens, token),
+            Err(ApiError::Internal(message))
+                if message == "the token registry is missing required decimals"
+        ));
+    }
+
+    #[test]
+    fn test_rest_candidate_builder_excludes_production_wtmstr_dust_order() {
+        let order = single_pair_order(
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            &crate::test_helpers::WT_MSTR_DUST_ORDER_HASH.to_string(),
+        );
+        let quote = crate::test_helpers::production_wtmstr_dust_quote();
+
+        let result = build_swap_candidates_from_quotes(
+            &[order],
+            vec![vec![quote]],
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            18,
+            6,
+        )
+        .expect("candidate build succeeds");
+
+        assert!(result.candidates.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_atomic_candidate_does_not_hide_valid_liquidity() {
+        let invalid_order = single_pair_order(
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            "0x1000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let valid_order = single_pair_order(
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            "0x2000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let invalid_quote = crate::test_helpers::wtmstr_quote("1e100", "1", "1", "1");
+        let valid_quote = crate::test_helpers::wtmstr_quote("1", "1", "1", "1");
+
+        let result = build_swap_candidates_from_quotes(
+            &[invalid_order, valid_order],
+            vec![vec![invalid_quote], vec![valid_quote]],
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            18,
+            6,
+        )
+        .expect("invalid candidate is excluded locally");
+
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(
+            result.candidates[0]
+                .max_output
+                .format()
+                .expect("format valid output"),
+            "1"
+        );
     }
 
     #[test]

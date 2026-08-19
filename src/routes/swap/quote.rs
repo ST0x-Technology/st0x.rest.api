@@ -68,11 +68,8 @@ pub async fn post_swap_quote(
         let req = request.into_inner();
         tracing::info!(body = ?req, "request received");
         let raindex = shared_raindex.read().await;
-        let ds = RaindexSwapDataSource {
-            client: raindex.client(),
-            caches: &app_state.response_caches,
-            pool: pool.inner(),
-        };
+        let ds =
+            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
         let response = handle_swap_quote(&ds, &key, analytics.inner(), req).await?;
 
         Ok(Json(response))
@@ -122,11 +119,8 @@ pub async fn post_swap_quote_v2(
             "request received"
         );
         let raindex = shared_raindex.read().await;
-        let ds = RaindexSwapDataSource {
-            client: raindex.client(),
-            caches: &app_state.response_caches,
-            pool: pool.inner(),
-        };
+        let ds =
+            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
         let response = handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await?;
 
         Ok(Json(response))

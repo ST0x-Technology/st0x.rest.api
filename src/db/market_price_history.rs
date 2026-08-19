@@ -1,5 +1,5 @@
 use super::DbPool;
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::{QueryBuilder, Sqlite, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewMarketPriceSnapshot {
@@ -25,15 +25,96 @@ pub(crate) struct MarketPriceSnapshot {
     pub observed_at: i64,
 }
 
+#[cfg(test)]
 pub(crate) async fn insert_market_price_snapshots(
     pool: &DbPool,
+    snapshots: &[NewMarketPriceSnapshot],
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows_affected = insert_market_price_snapshots_in_transaction(&mut tx, snapshots).await?;
+    tx.commit().await?;
+    Ok(rows_affected)
+}
+
+pub(crate) async fn replace_market_price_sample(
+    pool: &DbPool,
+    observed_at: i64,
+    snapshots: &[NewMarketPriceSnapshot],
+) -> Result<(u64, u64), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let deleted = sqlx::query("DELETE FROM market_price_snapshots WHERE observed_at = ?")
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let inserted = insert_market_price_snapshots_in_transaction(&mut tx, snapshots).await?;
+    sqlx::query(
+        "INSERT INTO market_price_sampler_state (singleton, last_completed_sample_at) \
+         VALUES (1, ?) \
+         ON CONFLICT(singleton) DO UPDATE SET \
+             last_completed_sample_at = MAX(last_completed_sample_at, excluded.last_completed_sample_at)",
+    )
+    .bind(observed_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((deleted, inserted))
+}
+
+#[cfg(test)]
+pub(crate) async fn load_last_completed_market_price_sample(
+    pool: &DbPool,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT last_completed_sample_at \
+         FROM market_price_sampler_state \
+         WHERE singleton = 1",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub(crate) async fn list_current_market_prices(
+    pool: &DbPool,
+    chain_id: i64,
+    quote_token_address: &str,
+    retained_start: i64,
+    observed_at: i64,
+) -> Result<Vec<MarketPriceSnapshot>, sqlx::Error> {
+    sqlx::query_as::<_, MarketPriceSnapshot>(
+        "SELECT chain_id, asset_token_address, quote_token_address, best_bid, best_ask, midpoint, assets_per_share, observed_at \
+         FROM ( \
+             SELECT chain_id, asset_token_address, quote_token_address, best_bid, best_ask, midpoint, assets_per_share, observed_at, \
+                    ROW_NUMBER() OVER (PARTITION BY asset_token_address ORDER BY observed_at DESC) AS row_number \
+             FROM market_price_snapshots \
+             WHERE chain_id = ? AND quote_token_address = ? \
+               AND observed_at >= MAX(?, COALESCE(( \
+                   SELECT last_completed_sample_at \
+                   FROM market_price_sampler_state \
+                   WHERE singleton = 1 \
+               ), ?)) \
+               AND observed_at <= ? \
+         ) ranked \
+         WHERE row_number = 1 \
+         ORDER BY asset_token_address",
+    )
+    .bind(chain_id)
+    .bind(quote_token_address)
+    .bind(retained_start)
+    .bind(retained_start)
+    .bind(observed_at)
+    .fetch_all(pool)
+    .await
+}
+
+async fn insert_market_price_snapshots_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
     snapshots: &[NewMarketPriceSnapshot],
 ) -> Result<u64, sqlx::Error> {
     if snapshots.is_empty() {
         return Ok(0);
     }
 
-    let mut tx = pool.begin().await?;
     let mut query = QueryBuilder::<Sqlite>::new(
         "INSERT OR IGNORE INTO market_price_snapshots \
          (chain_id, asset_token_address, quote_token_address, best_bid, best_ask, midpoint, assets_per_share, observed_at) ",
@@ -48,9 +129,11 @@ pub(crate) async fn insert_market_price_snapshots(
             .push_bind(&snapshot.assets_per_share)
             .push_bind(snapshot.observed_at);
     });
-    let rows_affected = query.build().execute(&mut *tx).await?.rows_affected();
-    tx.commit().await?;
-    Ok(rows_affected)
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map(|result| result.rows_affected())
 }
 
 pub(crate) async fn delete_market_price_snapshots_before(
@@ -250,5 +333,46 @@ mod tests {
             .await
             .expect("get remaining snapshots");
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_persists_latest_completed_sample_even_when_empty() {
+        let pool = test_pool().await;
+
+        replace_market_price_sample(&pool, 160, &[])
+            .await
+            .expect("persist empty completed sample");
+        replace_market_price_sample(&pool, 100, &[])
+            .await
+            .expect("ignore older completed sample");
+
+        assert_eq!(
+            load_last_completed_market_price_sample(&pool)
+                .await
+                .expect("load completed sample"),
+            Some(160)
+        );
+    }
+
+    #[tokio::test]
+    async fn current_query_applies_completed_sample_boundary_from_same_database() {
+        let pool = test_pool().await;
+        insert_market_price_snapshots(&pool, &[snapshot("0xasset", "133", 100)])
+            .await
+            .expect("insert stale snapshot");
+        replace_market_price_sample(&pool, 160, &[])
+            .await
+            .expect("persist empty completed sample");
+
+        let current = list_current_market_prices(&pool, 8453, "0xquote", 0, 200)
+            .await
+            .expect("list current prices");
+        let historical = list_market_prices_at_or_before(&pool, 8453, "0xquote", 0, 100)
+            .await
+            .expect("list historical prices");
+
+        assert!(current.is_empty());
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].midpoint, "133");
     }
 }
