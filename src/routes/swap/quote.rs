@@ -1,6 +1,7 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, no_liquidity_error, snapshot_swap_context,
-    RaindexSwapDataSource, SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
+    capture_swap_outcome, ensure_distinct_tokens, exchange_log::SwapExchangeLog,
+    no_liquidity_error, snapshot_swap_context, RaindexSwapDataSource, SwapAnalyticsContext,
+    SwapCandidateBuild, SwapDataSource,
 };
 use crate::analytics::{
     swap_quote_failed_event, swap_quoted_event, swap_quoted_v2_event, Analytics, ApiVersion,
@@ -64,15 +65,25 @@ pub async fn post_swap_quote(
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
+    let request_id = span.request_id().to_string();
     async move {
         let req = request.into_inner();
-        tracing::info!(body = ?req, "request received");
+        let exchange = SwapExchangeLog::new(
+            &request_id,
+            "/v1/swap/quote",
+            "v1",
+            "quote",
+            &key,
+            req.input_token,
+            req.output_token,
+            &req,
+        );
         let raindex = shared_raindex.read().await;
         let ds =
             RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let response = handle_swap_quote(&ds, &key, analytics.inner(), req).await?;
-
-        Ok(Json(response))
+        let result = handle_swap_quote(&ds, &key, analytics.inner(), req).await;
+        exchange.record(&result);
+        result.map(Json)
     }
     .instrument(span.0)
     .await
@@ -110,20 +121,25 @@ pub async fn post_swap_quote_v2(
     span: TracingSpan,
     request: Json<SwapQuoteV2Request>,
 ) -> Result<Json<SwapQuoteV2Response>, ApiError> {
+    let request_id = span.request_id().to_string();
     async move {
         let req = request.into_inner();
-        tracing::info!(
-            mode = ?req.mode,
-            denomination = ?req.denomination,
-            has_taker = req.taker.is_some(),
-            "request received"
+        let exchange = SwapExchangeLog::new(
+            &request_id,
+            "/v2/swap/quote",
+            "v2",
+            "quote",
+            &key,
+            req.input_token,
+            req.output_token,
+            &req,
         );
         let raindex = shared_raindex.read().await;
         let ds =
             RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let response = handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await?;
-
-        Ok(Json(response))
+        let result = handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await;
+        exchange.record(&result);
+        result.map(Json)
     }
     .instrument(span.0)
     .await

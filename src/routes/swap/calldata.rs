@@ -1,6 +1,7 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, no_liquidity_error, snapshot_swap_context,
-    RaindexSwapDataSource, SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
+    capture_swap_outcome, ensure_distinct_tokens, exchange_log::SwapExchangeLog,
+    no_liquidity_error, snapshot_swap_context, RaindexSwapDataSource, SwapAnalyticsContext,
+    SwapCandidateBuild, SwapDataSource,
 };
 use crate::analytics::{
     swap_calldata_failed_event, swap_calldata_generated_event, Analytics, ApiVersion,
@@ -65,14 +66,24 @@ pub async fn post_swap_calldata(
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
+    let request_id = span.request_id().to_string();
     async move {
         let req = request.into_inner();
-        tracing::info!(body = ?req, "request received");
+        let exchange = SwapExchangeLog::new(
+            &request_id,
+            "/v1/swap/calldata",
+            "v1",
+            "calldata",
+            &key,
+            req.input_token,
+            req.output_token,
+            &req,
+        );
         let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
         let ds =
             RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let response = handle_swap_calldata(
+        let result = handle_swap_calldata(
             &ds,
             &key,
             analytics.inner(),
@@ -80,9 +91,9 @@ pub async fn post_swap_calldata(
             &attribution,
             req,
         )
-        .await?;
-
-        Ok(Json(response))
+        .await;
+        exchange.record(&result);
+        result.map(Json)
     }
     .instrument(span.0)
     .await
@@ -120,18 +131,24 @@ pub async fn post_swap_calldata_v2(
     span: TracingSpan,
     request: Json<SwapCalldataV2Request>,
 ) -> Result<Json<SwapCalldataV2Response>, ApiError> {
+    let request_id = span.request_id().to_string();
     async move {
         let req = request.into_inner();
-        tracing::info!(
-            mode = ?req.mode,
-            denomination = ?req.denomination,
-            "request received"
+        let exchange = SwapExchangeLog::new(
+            &request_id,
+            "/v2/swap/calldata",
+            "v2",
+            "calldata",
+            &key,
+            req.input_token,
+            req.output_token,
+            &req,
         );
         let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
         let raindex = shared_raindex.read().await;
         let ds =
             RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let response = handle_swap_calldata_v2(
+        let result = handle_swap_calldata_v2(
             &ds,
             &key,
             analytics.inner(),
@@ -139,9 +156,9 @@ pub async fn post_swap_calldata_v2(
             &attribution,
             req,
         )
-        .await?;
-
-        Ok(Json(response))
+        .await;
+        exchange.record(&result);
+        result.map(Json)
     }
     .instrument(span.0)
     .await

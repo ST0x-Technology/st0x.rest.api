@@ -12,7 +12,13 @@ struct RequestMeta {
 }
 
 pub struct RequestLogger;
-pub struct TracingSpan(pub tracing::Span);
+pub struct TracingSpan(pub tracing::Span, String);
+
+impl TracingSpan {
+    pub fn request_id(&self) -> &str {
+        &self.1
+    }
+}
 
 const REQUEST_ID_HEADER: &str = "X-Request-Id";
 
@@ -54,7 +60,7 @@ impl<'r> FromRequest<'r> for TracingSpan {
     type Error = ();
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        Outcome::Success(TracingSpan(request_span_for(req)))
+        Outcome::Success(TracingSpan(request_span_for(req), request_id_for(req)))
     }
 }
 

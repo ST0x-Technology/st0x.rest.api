@@ -1,5 +1,6 @@
 mod calldata;
 mod denomination;
+mod exchange_log;
 mod quote;
 mod slippage;
 

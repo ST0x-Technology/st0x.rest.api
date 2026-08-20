@@ -162,6 +162,18 @@ impl ApiError {
     }
 }
 
+impl ApiErrorResponse {
+    pub(crate) fn from_error(request_id: String, error: &ApiError) -> Self {
+        Self {
+            request_id,
+            error: ApiErrorDetail {
+                code: error.code(),
+                message: error.public_message(),
+            },
+        }
+    }
+}
+
 impl<'r> Responder<'r, 'static> for ApiError {
     fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
         let (code, message) = (self.code(), self.public_message());
@@ -193,10 +205,7 @@ impl<'r> Responder<'r, 'static> for ApiError {
         });
 
         let request_id = request_id_for(req);
-        let body = ApiErrorResponse {
-            request_id,
-            error: ApiErrorDetail { code, message },
-        };
+        let body = ApiErrorResponse::from_error(request_id, &self);
         let json_response = match Json(body).respond_to(req) {
             Ok(r) => r,
             Err(s) => {
