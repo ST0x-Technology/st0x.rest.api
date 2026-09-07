@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 pub(crate) const DEFAULT_PAGE_SIZE: u32 = 20;
-pub(crate) const MAX_PAGE_SIZE: u16 = 50;
+pub(crate) const MAX_PAGE_SIZE: u16 = 100;
 const MAX_CHAIN_BATCH_CONCURRENCY: usize = 4;
 const MAX_INDIVIDUAL_QUOTE_CONCURRENCY: usize = 8;
 

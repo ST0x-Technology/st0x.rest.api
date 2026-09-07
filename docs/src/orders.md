@@ -162,7 +162,7 @@ curl "https://api.st0x.io/v1/orders/owner/0xOwnerAddress?state=active&page=1&pag
 | -------------- | ------------------------------ | --------- | --------------------------------------------------------------------------------------------------------- |
 | `state`        | `active`, `inactive`, or `all` | `active`  | Filter by current order state                                                                             |
 | `page`         | number                         | 1         | Page number                                                                                               |
-| `pageSize`     | number                         | 20        | Results per page                                                                                          |
+| `pageSize`     | number                         | 20        | Results per page (max 100; larger values are clamped)                                                     |
 | `denomination` | `wrapped` or `unwrapped`       | `wrapped` | Return wrapped token amounts as-is, or normalize wrapped token balances and IO ratios to unwrapped values |
 
 Use `denomination=unwrapped` to view order balances and IO ratios normalized to
@@ -235,7 +235,7 @@ curl "https://api.st0x.io/v1/orders/token/0xTokenAddress?state=all&side=output&p
 | `state`    | `active`, `inactive`, or `all` | `active` | Filter by current order state        |
 | `side`     | `input` or `output`            | all      | Match token as an input/output token |
 | `page`     | number                         | 1        | Page number                          |
-| `pageSize` | number                         | 20       | Results per page                     |
+| `pageSize` | number                         | 20       | Results per page (max 100, clamped)  |
 
 The response shape is the same as list orders by owner.
 
@@ -276,7 +276,7 @@ curl -X POST https://api.st0x.io/v1/orders/query \
 | `state`            | `active`, `inactive`, or `all` | `active`  | Same state semantics as the existing order list routes                            |
 | `side`             | `input` or `output`            | all sides | Match the canonical token set on the selected side                                |
 | `page`             | number                         | 1         | 1 through 1000                                                                    |
-| `pageSize`         | number                         | 20        | 1 through 50                                                                      |
+| `pageSize`         | number                         | 20        | 1 through 100                                                                     |
 | `denomination`     | `wrapped` or `unwrapped`       | `wrapped` | Same amount and IO-ratio denomination semantics as the existing order list routes |
 
 The response is `OrdersListResponse`, the same stable REST-owned shape used by
