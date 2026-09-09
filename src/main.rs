@@ -21,6 +21,7 @@ mod metrics;
 mod raindex;
 mod registry_artifact;
 mod routes;
+mod swap_capacity;
 mod telemetry;
 mod types;
 mod wrap_ratio;
@@ -202,6 +203,7 @@ pub(crate) struct RocketDependencies {
     app_state: app_state::ApplicationState,
     analytics: analytics::Analytics,
     market_price_state: market_price::MarketPriceState,
+    swap_capacity: swap_capacity::SwapCapacity,
 }
 
 pub(crate) fn rocket(
@@ -216,6 +218,7 @@ pub(crate) fn rocket(
         app_state,
         analytics,
         market_price_state,
+        swap_capacity,
     } = dependencies;
     let cors = configure_cors()?;
 
@@ -230,6 +233,7 @@ pub(crate) fn rocket(
         .manage(app_state)
         .manage(analytics)
         .manage(market_price_state)
+        .manage(swap_capacity)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
         .mount("/v1/prices", routes::prices::routes())
@@ -413,12 +417,15 @@ async fn main() {
     tracing::info!(
         global_rpm = cfg.rate_limit_global_rpm,
         per_key_rpm = cfg.rate_limit_per_key_rpm,
+        swap_max_concurrent_global = cfg.swap_max_concurrent_global,
+        swap_max_concurrent_per_key = cfg.swap_max_concurrent_per_key,
+        swap_request_timeout_seconds = cfg.swap_request_timeout_seconds,
         database_max_connections = cfg.database_max_connections,
         usage_log_max_concurrency = cfg.usage_log_max_concurrency,
         response_cache_max_entries = cfg.response_cache_max_entries,
         response_cache_max_trade_rows,
         response_cache_ttl_seconds = cfg.response_cache_ttl_seconds,
-        "rate limiter configured"
+        "runtime limits configured"
     );
 
     match command {
@@ -470,6 +477,11 @@ async fn main() {
             let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
+            let swap_capacity = swap_capacity::SwapCapacity::new(
+                cfg.swap_max_concurrent_global,
+                cfg.swap_max_concurrent_per_key,
+                std::time::Duration::from_secs(cfg.swap_request_timeout_seconds),
+            );
             let market_price_config = match market_price::MarketPriceConfig::try_from(&cfg) {
                 Ok(config) => config,
                 Err(error) => {
@@ -544,6 +556,7 @@ async fn main() {
                     app_state,
                     analytics,
                     market_price_state,
+                    swap_capacity,
                 },
                 cfg.docs_dir,
                 cfg.usage_log_max_concurrency,
@@ -649,6 +662,10 @@ mod tests {
             "Required swap oracle unavailable"
         );
         assert_eq!(
+            swap_quote_v2_path["responses"]["504"]["description"],
+            "Swap request timed out"
+        );
+        assert_eq!(
             swap_quote_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/SwapQuoteV2RequestBody"
         );
@@ -672,6 +689,10 @@ mod tests {
                 .is_some_and(|description| description.contains("input-token-per-output-token"))
         );
         assert_eq!(swap_calldata_v2_path["tags"][0], "Swap");
+        assert_eq!(
+            swap_calldata_v2_path["responses"]["504"]["description"],
+            "Swap request timed out"
+        );
         assert_eq!(
             swap_calldata_v2_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/SwapCalldataV2RequestBody"
@@ -818,6 +839,9 @@ mod tests {
             allow_registry_fallback,
             rate_limit_global_rpm: 600,
             rate_limit_per_key_rpm: 60,
+            swap_max_concurrent_global: 8,
+            swap_max_concurrent_per_key: 4,
+            swap_request_timeout_seconds: 30,
             docs_dir: "./docs/book".to_string(),
             local_db_path: local_db_path.to_string_lossy().into_owned(),
             price_sampler_enabled: false,

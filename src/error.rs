@@ -23,6 +23,7 @@ pub enum ApiErrorCode {
     SwapNoLiquidity,
     SwapOracleUnavailable,
     SwapQuoteFailed,
+    SwapTimeout,
     SwapPreflightFailed,
     SwapCalldataFailed,
     OrdersQueryFailed,
@@ -46,6 +47,7 @@ impl ApiErrorCode {
             Self::SwapNoLiquidity => "SWAP_NO_LIQUIDITY",
             Self::SwapOracleUnavailable => "SWAP_ORACLE_UNAVAILABLE",
             Self::SwapQuoteFailed => "SWAP_QUOTE_FAILED",
+            Self::SwapTimeout => "SWAP_TIMEOUT",
             Self::SwapPreflightFailed => "SWAP_PREFLIGHT_FAILED",
             Self::SwapCalldataFailed => "SWAP_CALLDATA_FAILED",
             Self::OrdersQueryFailed => "ORDERS_QUERY_FAILED",
@@ -68,6 +70,7 @@ impl ApiErrorCode {
             Self::NotYetIndexed => Status::Accepted,
             Self::OrdersQueryFailed | Self::TradesQueryFailed => Status::BadGateway,
             Self::SwapOracleUnavailable | Self::UpstreamUnavailable => Status::ServiceUnavailable,
+            Self::SwapTimeout => Status::GatewayTimeout,
             Self::InternalError | Self::SwapQuoteFailed | Self::SwapCalldataFailed => {
                 Status::InternalServerError
             }
@@ -355,6 +358,7 @@ mod tests {
         let cases = [
             (ApiErrorCode::BadRequest, "\"BAD_REQUEST\""),
             (ApiErrorCode::SwapQuoteFailed, "\"SWAP_QUOTE_FAILED\""),
+            (ApiErrorCode::SwapTimeout, "\"SWAP_TIMEOUT\""),
             (ApiErrorCode::SwapSameToken, "\"SWAP_SAME_TOKEN\""),
             (
                 ApiErrorCode::UpstreamUnavailable,
@@ -379,6 +383,7 @@ mod tests {
                 Status::ServiceUnavailable,
             ),
             (ApiErrorCode::SwapQuoteFailed, Status::InternalServerError),
+            (ApiErrorCode::SwapTimeout, Status::GatewayTimeout),
             (
                 ApiErrorCode::SwapCalldataFailed,
                 Status::InternalServerError,

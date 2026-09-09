@@ -15,6 +15,7 @@ use crate::routes::swap::denomination::{
     denormalize_calldata_price_cap, normalize_calldata_price_cap,
     normalize_calldata_request_amount, normalize_quote_amounts, CalldataAmountNormalization,
 };
+use crate::swap_capacity::SwapCapacity;
 use crate::types::swap::{
     SwapQuoteRequest, SwapQuoteResponse, SwapQuoteV2Request, SwapQuoteV2RequestBody,
     SwapQuoteV2Response,
@@ -51,6 +52,7 @@ const FULL_FILL_RELATIVE_TOLERANCE: Float = Float::from_raw(fixed_bytes!(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
         (status = 503, description = "Required swap oracle unavailable", body = ApiErrorResponse),
+        (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
@@ -62,6 +64,7 @@ pub async fn post_swap_quote(
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
     analytics: &State<Analytics>,
+    capacity: &State<SwapCapacity>,
     span: TracingSpan,
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
@@ -78,10 +81,17 @@ pub async fn post_swap_quote(
             req.output_token,
             &req,
         );
-        let raindex = shared_raindex.read().await;
-        let ds =
-            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let result = handle_swap_quote(&ds, &key, analytics.inner(), req).await;
+        let result = capacity
+            .run(key.id, async {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexSwapDataSource::new(
+                    raindex.client(),
+                    &app_state.response_caches,
+                    pool.inner(),
+                );
+                handle_swap_quote(&ds, &key, analytics.inner(), req).await
+            })
+            .await;
         exchange.record(&result);
         result.map(Json)
     }
@@ -107,6 +117,7 @@ pub async fn post_swap_quote(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
         (status = 503, description = "Required swap oracle unavailable", body = ApiErrorResponse),
+        (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
 )]
 #[post("/quote", data = "<request>")]
@@ -118,6 +129,7 @@ pub async fn post_swap_quote_v2(
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
     analytics: &State<Analytics>,
+    capacity: &State<SwapCapacity>,
     span: TracingSpan,
     request: Json<SwapQuoteV2Request>,
 ) -> Result<Json<SwapQuoteV2Response>, ApiError> {
@@ -134,10 +146,17 @@ pub async fn post_swap_quote_v2(
             req.output_token,
             &req,
         );
-        let raindex = shared_raindex.read().await;
-        let ds =
-            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let result = handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await;
+        let result = capacity
+            .run(key.id, async {
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexSwapDataSource::new(
+                    raindex.client(),
+                    &app_state.response_caches,
+                    pool.inner(),
+                );
+                handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await
+            })
+            .await;
         exchange.record(&result);
         result.map(Json)
     }

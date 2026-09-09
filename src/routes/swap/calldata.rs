@@ -17,6 +17,7 @@ use crate::routes::swap::denomination::{
     normalize_calldata_request_amount, normalize_calldata_request_values,
     normalize_calldata_response, CalldataAmountNormalization, CalldataRequestNormalization,
 };
+use crate::swap_capacity::SwapCapacity;
 use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request, SwapCalldataV2RequestBody,
     SwapCalldataV2Response,
@@ -52,6 +53,7 @@ const ORACLE_REFRESH_CONCURRENCY_LIMIT: usize = 8;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
         (status = 503, description = "Required upstream or swap oracle unavailable", body = ApiErrorResponse),
+        (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
@@ -63,6 +65,7 @@ pub async fn post_swap_calldata(
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
     analytics: &State<Analytics>,
+    capacity: &State<SwapCapacity>,
     span: TracingSpan,
     request: Json<SwapCalldataRequest>,
 ) -> Result<Json<SwapCalldataResponse>, ApiError> {
@@ -79,19 +82,26 @@ pub async fn post_swap_calldata(
             req.output_token,
             &req,
         );
-        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
-        let raindex = shared_raindex.read().await;
-        let ds =
-            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let result = handle_swap_calldata(
-            &ds,
-            &key,
-            analytics.inner(),
-            &app_state.attribution.signer,
-            &attribution,
-            req,
-        )
-        .await;
+        let result = capacity
+            .run(key.id, async {
+                let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexSwapDataSource::new(
+                    raindex.client(),
+                    &app_state.response_caches,
+                    pool.inner(),
+                );
+                handle_swap_calldata(
+                    &ds,
+                    &key,
+                    analytics.inner(),
+                    &app_state.attribution.signer,
+                    &attribution,
+                    req,
+                )
+                .await
+            })
+            .await;
         exchange.record(&result);
         result.map(Json)
     }
@@ -117,6 +127,7 @@ pub async fn post_swap_calldata(
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
         (status = 503, description = "Required upstream or swap oracle unavailable", body = ApiErrorResponse),
+        (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
 )]
 #[post("/calldata", data = "<request>")]
@@ -128,6 +139,7 @@ pub async fn post_swap_calldata_v2(
     app_state: &State<ApplicationState>,
     pool: &State<DbPool>,
     analytics: &State<Analytics>,
+    capacity: &State<SwapCapacity>,
     span: TracingSpan,
     request: Json<SwapCalldataV2Request>,
 ) -> Result<Json<SwapCalldataV2Response>, ApiError> {
@@ -144,19 +156,26 @@ pub async fn post_swap_calldata_v2(
             req.output_token,
             &req,
         );
-        let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
-        let raindex = shared_raindex.read().await;
-        let ds =
-            RaindexSwapDataSource::new(raindex.client(), &app_state.response_caches, pool.inner());
-        let result = handle_swap_calldata_v2(
-            &ds,
-            &key,
-            analytics.inner(),
-            &app_state.attribution.signer,
-            &attribution,
-            req,
-        )
-        .await;
+        let result = capacity
+            .run(key.id, async {
+                let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
+                let raindex = shared_raindex.read().await;
+                let ds = RaindexSwapDataSource::new(
+                    raindex.client(),
+                    &app_state.response_caches,
+                    pool.inner(),
+                );
+                handle_swap_calldata_v2(
+                    &ds,
+                    &key,
+                    analytics.inner(),
+                    &app_state.attribution.signer,
+                    &attribution,
+                    req,
+                )
+                .await
+            })
+            .await;
         exchange.record(&result);
         result.map(Json)
     }

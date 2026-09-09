@@ -175,6 +175,11 @@ impl TestClientBuilder {
                 app_state,
                 analytics,
                 market_price_state,
+                swap_capacity: crate::swap_capacity::SwapCapacity::new(
+                    100,
+                    100,
+                    std::time::Duration::from_secs(30),
+                ),
             },
             docs_dir,
             2,
