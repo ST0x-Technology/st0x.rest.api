@@ -5180,20 +5180,21 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "rain-erc"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c1743f958ef5d54d361f3b7e2ff9109adfe0549934c46fac729f8d69ec09677"
+version = "0.1.2"
+source = "git+https://github.com/rainlanguage/rain.erc?rev=755b0bf5cad18a2cc43a57be52298b6dadd96751#755b0bf5cad18a2cc43a57be52298b6dadd96751"
 dependencies = [
  "alloy",
  "getrandom 0.2.16",
  "getrandom 0.3.3",
+ "serde",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "rain-erc"
-version = "0.1.2"
-source = "git+https://github.com/rainlanguage/rain.erc?rev=755b0bf5cad18a2cc43a57be52298b6dadd96751#755b0bf5cad18a2cc43a57be52298b6dadd96751"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dde8f670648bca26ec1fc4565a7f32631c040204137aee953b8444c6d0d7ff2"
 dependencies = [
  "alloy",
  "getrandom 0.2.16",
@@ -5311,7 +5312,7 @@ dependencies = [
  "inflate",
  "itertools 0.10.5",
  "once_cell",
- "rain-erc 0.1.1",
+ "rain-erc 0.1.5",
  "rain-metaboard-subgraph",
  "rain-metadata-bindings",
  "regex",
@@ -5394,6 +5395,7 @@ dependencies = [
  "itertools 0.14.0",
  "once_cell",
  "proptest",
+ "rain-erc 0.1.5",
  "rain-error-decoding",
  "rain-math-float",
  "rain-metaboard-subgraph",
@@ -8607,7 +8609,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
