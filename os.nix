@@ -35,6 +35,10 @@ let
       };
 
       environment = {
+        # The API performs allocation-heavy quote work across several worker
+        # threads. Bound glibc's per-thread arenas so freed request memory can
+        # be reused without leaving one large retained arena per thread.
+        MALLOC_ARENA_MAX = "2";
         RUST_LOG =
           "st0x_rest_api=info,raindex_common=info,raindex_quote=info,rocket=warn,warn";
       } // lib.optionalAttrs (env ? posthogHost) {
