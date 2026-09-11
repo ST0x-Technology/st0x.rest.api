@@ -3,10 +3,10 @@
 # app's Prometheus `/metrics` on `:8001`, and the app pushes OTLP logs/traces to
 # `rain-management-observability:9428` (VictoriaLogs) / `:10428` (VictoriaTraces).
 #
-# Unlike the liquidity bot we do NOT serve anything over the tailnet — the public
-# API keeps its nginx + Let's Encrypt vhost on `api.st0x.io`. So there is no
-# tailscale HTTPS cert provisioning here; this file only joins the tailnet and
-# opens the WireGuard path.
+# Unlike the liquidity bot we serve no application traffic over the tailnet: the
+# public API keeps its nginx + Let's Encrypt vhost on `api.st0x.io`. So there is
+# no tailscale HTTPS cert provisioning here; this file joins the tailnet, opens
+# the WireGuard path, and enables Tailscale SSH for operators.
 #
 # The node joins with a per-environment, agenix-encrypted `tag:st0x-rest-api`
 # auth key minted on the rain tailnet (used only on first enrollment; afterwards
@@ -29,7 +29,16 @@ in
   services.tailscale = {
     enable = true;
     authKeyFile = "/run/agenix/tailscale-authkey-${environment}";
-    extraUpFlags = [ "--hostname=${tailnetHostname}" ];
+    extraUpFlags = [
+      "--hostname=${tailnetHostname}"
+      # Tailscale SSH. Who may connect is decided entirely by the rain tailnet
+      # ACL, not by authorized_keys: rain.devops grants group:devops root in
+      # check mode, so every session needs a fresh browser approval and rain can
+      # revoke it without touching this repo. Added because on 2026-09-08 this
+      # box stopped shipping OTLP logs to the rain observability stack and stayed
+      # silent for two days, and nobody on the devops side could look at it.
+      "--ssh"
+    ];
   };
 
   networking.firewall = {
