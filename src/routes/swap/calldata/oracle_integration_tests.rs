@@ -28,6 +28,7 @@ struct MockSwapServices {
     subgraph_order: Arc<RwLock<Option<Value>>>,
     oracle_available: Arc<AtomicBool>,
     oracle_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    oracle_paths: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockSwapServices {
@@ -42,12 +43,14 @@ impl MockSwapServices {
         let subgraph_order = Arc::new(RwLock::new(None));
         let oracle_available = Arc::new(AtomicBool::new(true));
         let oracle_bodies = Arc::new(Mutex::new(Vec::new()));
+        let oracle_paths = Arc::new(Mutex::new(Vec::new()));
         let oracle_responses = Arc::new(Mutex::new(oracle_responses));
         let oracle_call_index = Arc::new(AtomicUsize::new(0));
 
         let orders = Arc::clone(&subgraph_order);
         let available = Arc::clone(&oracle_available);
         let bodies = Arc::clone(&oracle_bodies);
+        let paths = Arc::clone(&oracle_paths);
         let responses = Arc::clone(&oracle_responses);
         let call_index = Arc::clone(&oracle_call_index);
         tokio::spawn(async move {
@@ -58,14 +61,19 @@ impl MockSwapServices {
                 let orders = Arc::clone(&orders);
                 let available = Arc::clone(&available);
                 let bodies = Arc::clone(&bodies);
+                let paths = Arc::clone(&paths);
                 let responses = Arc::clone(&responses);
                 let call_index = Arc::clone(&call_index);
                 tokio::spawn(async move {
                     let Some((path, body)) = read_request(&mut socket).await else {
                         return;
                     };
-                    let (status, response) = match path.as_str() {
+                    let route_path = path
+                        .split_once('?')
+                        .map_or(path.as_str(), |(route_path, _)| route_path);
+                    let (status, response) = match route_path {
                         "/oracle" if available.load(Ordering::SeqCst) => {
+                            paths.lock().unwrap().push(path);
                             bodies.lock().unwrap().push(body);
                             let idx = call_index.fetch_add(1, Ordering::SeqCst);
                             let responses = responses.lock().unwrap();
@@ -74,6 +82,7 @@ impl MockSwapServices {
                             ("200 OK", response)
                         }
                         "/oracle" => {
+                            paths.lock().unwrap().push(path);
                             bodies.lock().unwrap().push(body);
                             (
                                 "503 Service Unavailable",
@@ -97,6 +106,7 @@ impl MockSwapServices {
             subgraph_order,
             oracle_available,
             oracle_bodies,
+            oracle_paths,
         }
     }
 
@@ -484,6 +494,15 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     assert!(
         services.oracle_bodies.lock().unwrap().len() >= 2,
         "calldata should refetch signed context after quote/preflight"
+    );
+    assert!(
+        services
+            .oracle_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/oracle?allowFailure=true"),
+        "quote batching should opt into per-item oracle failures"
     );
 
     let attributed_context = &decoded.config.orders[0].signedContext[1];
