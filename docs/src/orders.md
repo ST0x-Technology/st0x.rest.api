@@ -208,6 +208,11 @@ curl "https://api.st0x.io/v1/orders/owner/0xOwnerAddress?state=active&page=1&pag
 `maxOutput` is the quote-derived executable output amount for the listed order.
 It is `null` when quote data is unavailable.
 
+When live quote calculation fails for an active order, the order remains in the
+page with `ioRatio` set to `"-"` and `maxOutput` set to `null`. Consumers can
+omit these non-executable orders from orderbook views without losing the rest of
+the page.
+
 `orderType` is one of `limit`, `dca`, `dynamic-spread`, or `custom`.
 
 When `state=inactive`, orders are returned without live quote data: `ioRatio` is
@@ -286,9 +291,10 @@ Raindex contract tie-breakers.
 
 Canonical address sets share the short-lived response cache regardless of input
 order, duplicate entries, or address case. Concurrent identical cold requests
-share one computation. The endpoint only caches complete responses: an indexed
-query, denomination conversion, or live quote failure fails the whole request
-and is not cached.
+share one computation. The endpoint only caches responses whose active orders
+all have complete live quotes. A per-order live quote failure uses the fallback
+fields described above and the response is not cached; indexed-query and
+denomination-conversion failures still fail the whole request.
 
 ## List Orders by Transaction
 

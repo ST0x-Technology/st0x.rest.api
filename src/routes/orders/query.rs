@@ -6,7 +6,7 @@ use super::{
 use crate::app_state::ApplicationState;
 use crate::auth::AuthenticatedKey;
 use crate::db::DbPool;
-use crate::error::{ApiError, ApiErrorCode, ApiErrorResponse};
+use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::batch_query::{parse_canonical_addresses, validate_configured_chain};
 use crate::types::common::Denomination;
@@ -50,7 +50,7 @@ struct ValidatedOrdersQuery {
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 422, description = "Request body could not be deserialized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
-        (status = 502, description = "Order source or live quote query failed", body = ApiErrorResponse),
+        (status = 502, description = "Order source query failed", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
@@ -129,9 +129,20 @@ pub(crate) async fn process_orders_query(
     );
     caches
         .orders_query
-        .get_or_try_insert(cache_key, || compute_orders_query(ds, &query))
+        .get_or_try_insert_if(
+            cache_key,
+            || compute_orders_query(ds, &query),
+            response_has_complete_active_quotes,
+        )
         .await
         .map_err(|error| error.as_ref().clone())
+}
+
+fn response_has_complete_active_quotes(response: &OrdersListResponse) -> bool {
+    response
+        .orders
+        .iter()
+        .all(|order| !order.active || (order.io_ratio != "-" && order.max_output.is_some()))
 }
 
 fn validate_orders_query(request: OrdersQueryRequest) -> Result<ValidatedOrdersQuery, ApiError> {
@@ -304,17 +315,12 @@ async fn compute_orders_query(
         })
         .count();
     if failed_quote_count > 0 {
-        tracing::error!(
+        tracing::warn!(
             chain_id = query.chain_id,
             batch_size = query.token_addresses.len(),
             failed_quote_count,
-            code = %ApiErrorCode::OrdersQueryFailed,
-            "batch order live quote query failed"
+            "batch order live quote query was incomplete; returning uncached fallback quote fields"
         );
-        return Err(ApiError::coded(
-            ApiErrorCode::OrdersQueryFailed,
-            "the live order quotes could not be computed",
-        ));
     }
     let wrap_ratios = current_wrap_ratios_for_orders(ds, query.denomination, &orders).await?;
     build_orders_list_response(
@@ -548,7 +554,7 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn incomplete_quote_returns_coded_error_and_is_not_cached() {
+    async fn incomplete_quote_returns_fallback_and_is_not_cached() {
         let order = order(
             "0x0000000000000000000000000000000000000000000000000000000000000002",
             2,
@@ -559,25 +565,21 @@ mod tests {
         };
         let caches = RouteResponseCaches::new(100, Duration::from_secs(60));
         for _ in 0..2 {
-            let result = process_orders_query(
+            let response = process_orders_query(
                 &ds,
                 &caches,
                 request(vec!["0x4200000000000000000000000000000000000006".into()]),
             )
-            .await;
-            assert!(matches!(
-                result,
-                Err(ApiError::Coded {
-                    code: ApiErrorCode::OrdersQueryFailed,
-                    ..
-                })
-            ));
+            .await
+            .unwrap();
+            assert_eq!(response.orders[0].io_ratio, "-");
+            assert_eq!(response.orders[0].max_output, None);
         }
         assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
     }
 
     #[rocket::async_test]
-    async fn quote_query_error_returns_coded_error() {
+    async fn quote_query_error_returns_fallback() {
         let order = order(
             "0x0000000000000000000000000000000000000000000000000000000000000002",
             2,
@@ -588,19 +590,15 @@ mod tests {
         };
         let caches = RouteResponseCaches::new(0, Duration::ZERO);
 
-        let result = process_orders_query(
+        let response = process_orders_query(
             &ds,
             &caches,
             request(vec!["0x4200000000000000000000000000000000000006".into()]),
         )
-        .await;
-        assert!(matches!(
-            result,
-            Err(ApiError::Coded {
-                code: ApiErrorCode::OrdersQueryFailed,
-                ..
-            })
-        ));
+        .await
+        .unwrap();
+        assert_eq!(response.orders[0].io_ratio, "-");
+        assert_eq!(response.orders[0].max_output, None);
     }
 
     #[rocket::async_test]
@@ -629,29 +627,21 @@ mod tests {
             });
         }
         while let Some(result) = tasks.join_next().await {
-            assert!(matches!(
-                result.unwrap(),
-                Err(ApiError::Coded {
-                    code: ApiErrorCode::OrdersQueryFailed,
-                    ..
-                })
-            ));
+            let response = result.unwrap().unwrap();
+            assert_eq!(response.orders[0].io_ratio, "-");
+            assert_eq!(response.orders[0].max_output, None);
         }
         assert_eq!(ds.calls.load(Ordering::SeqCst), 1);
 
-        let result = process_orders_query(
+        let response = process_orders_query(
             ds.as_ref(),
             caches.as_ref(),
             request(vec!["0x4200000000000000000000000000000000000006".into()]),
         )
-        .await;
-        assert!(matches!(
-            result,
-            Err(ApiError::Coded {
-                code: ApiErrorCode::OrdersQueryFailed,
-                ..
-            })
-        ));
+        .await
+        .unwrap();
+        assert_eq!(response.orders[0].io_ratio, "-");
+        assert_eq!(response.orders[0].max_output, None);
         assert_eq!(ds.calls.load(Ordering::SeqCst), 2);
     }
 
