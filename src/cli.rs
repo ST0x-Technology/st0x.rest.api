@@ -46,6 +46,10 @@ pub enum KeysCommand {
     SetRateLimit { key_id: String, rpm: u64 },
     #[command(about = "Clear an API key's requests-per-minute override")]
     ClearRateLimit { key_id: String },
+    #[command(about = "Set a concurrent-swap override for an API key")]
+    SetSwapConcurrency { key_id: String, max_concurrent: u64 },
+    #[command(about = "Clear an API key's concurrent-swap override")]
+    ClearSwapConcurrency { key_id: String },
     #[command(about = "Revoke an API key (set inactive)")]
     Revoke { key_id: String },
     #[command(about = "Delete an API key permanently")]
@@ -65,6 +69,7 @@ pub fn print_usage() {
 pub async fn handle_keys_command(
     command: KeysCommand,
     pool: DbPool,
+    swap_max_concurrent_global: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         KeysCommand::Create {
@@ -75,6 +80,13 @@ pub async fn handle_keys_command(
         KeysCommand::List => list_keys(&pool).await,
         KeysCommand::SetRateLimit { key_id, rpm } => set_rate_limit(&pool, &key_id, rpm).await,
         KeysCommand::ClearRateLimit { key_id } => clear_rate_limit(&pool, &key_id).await,
+        KeysCommand::SetSwapConcurrency {
+            key_id,
+            max_concurrent,
+        } => set_swap_concurrency(&pool, &key_id, max_concurrent, swap_max_concurrent_global).await,
+        KeysCommand::ClearSwapConcurrency { key_id } => {
+            clear_swap_concurrency(&pool, &key_id).await
+        }
         KeysCommand::Revoke { key_id } => revoke_key(&pool, &key_id).await,
         KeysCommand::Delete { key_id } => delete_key(&pool, &key_id).await,
     }
@@ -142,7 +154,7 @@ async fn create_key(
 
 async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
     let rows = sqlx::query_as::<_, auth::ApiKeyRow>(
-        "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, created_at, updated_at \
+        "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, swap_max_concurrent, created_at, updated_at \
          FROM api_keys ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -156,14 +168,22 @@ async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "{:<38} {:<20} {:<30} {:<8} {:<8} {:<12} {:<20} {:<20}",
-        "KEY_ID", "LABEL", "OWNER", "ACTIVE", "ADMIN", "RATE_RPM", "CREATED_AT", "UPDATED_AT"
+        "{:<38} {:<20} {:<30} {:<8} {:<8} {:<12} {:<12} {:<20} {:<20}",
+        "KEY_ID",
+        "LABEL",
+        "OWNER",
+        "ACTIVE",
+        "ADMIN",
+        "RATE_RPM",
+        "SWAP_MAX",
+        "CREATED_AT",
+        "UPDATED_AT"
     );
-    println!("{}", "-".repeat(157));
+    println!("{}", "-".repeat(170));
 
     for row in &rows {
         println!(
-            "{:<38} {:<20} {:<30} {:<8} {:<8} {:<12} {:<20} {:<20}",
+            "{:<38} {:<20} {:<30} {:<8} {:<8} {:<12} {:<12} {:<20} {:<20}",
             row.key_id,
             row.label,
             row.owner,
@@ -171,6 +191,8 @@ async fn list_keys(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
             row.is_admin,
             row.rate_limit_rpm
                 .map_or_else(|| "default".to_string(), |rpm| rpm.to_string()),
+            row.swap_max_concurrent
+                .map_or_else(|| "default".to_string(), |limit| limit.to_string()),
             row.created_at,
             row.updated_at
         );
@@ -218,6 +240,60 @@ async fn clear_rate_limit(pool: &DbPool, key_id: &str) -> Result<(), Box<dyn std
 
     tracing::info!(key_id, "API key rate limit cleared");
     println!("API key {key_id} rate limit reset to the configured default");
+    Ok(())
+}
+
+async fn set_swap_concurrency(
+    pool: &DbPool,
+    key_id: &str,
+    max_concurrent: u64,
+    global_limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if max_concurrent == 0 {
+        return Err("swap concurrency limit must be greater than zero".into());
+    }
+    let max_concurrent_usize =
+        usize::try_from(max_concurrent).map_err(|_| "swap concurrency limit is too large")?;
+    if max_concurrent_usize > global_limit {
+        return Err(format!(
+            "swap concurrency limit {max_concurrent} exceeds the configured global limit {global_limit}"
+        )
+        .into());
+    }
+    let max_concurrent =
+        i64::try_from(max_concurrent).map_err(|_| "swap concurrency limit is too large")?;
+    let result = sqlx::query("UPDATE api_keys SET swap_max_concurrent = ? WHERE key_id = ?")
+        .bind(max_concurrent)
+        .bind(key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("failed to set API key swap concurrency: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("API key {key_id} not found").into());
+    }
+
+    tracing::info!(key_id, max_concurrent, "API key swap concurrency set");
+    println!("API key {key_id} swap concurrency set to {max_concurrent}");
+    Ok(())
+}
+
+async fn clear_swap_concurrency(
+    pool: &DbPool,
+    key_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = sqlx::query("UPDATE api_keys SET swap_max_concurrent = NULL WHERE key_id = ?")
+        .bind(key_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("failed to clear API key swap concurrency: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("API key {key_id} not found").into());
+    }
+
+    tracing::info!(key_id, "API key swap concurrency cleared");
+    println!("API key {key_id} swap concurrency reset to the configured default");
     Ok(())
 }
 
@@ -276,6 +352,15 @@ async fn delete_key(pool: &DbPool, key_id: &str) -> Result<(), Box<dyn std::erro
 mod tests {
     use super::*;
     use argon2::PasswordHash;
+
+    const GLOBAL_SWAP_LIMIT: usize = 12;
+
+    async fn handle_keys_command(
+        command: KeysCommand,
+        pool: DbPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::handle_keys_command(command, pool, GLOBAL_SWAP_LIMIT).await
+    }
 
     async fn test_pool() -> DbPool {
         let id = uuid::Uuid::new_v4();
@@ -338,7 +423,7 @@ mod tests {
         .expect("create key");
 
         let row = sqlx::query_as::<_, auth::ApiKeyRow>(
-            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, created_at, updated_at \
+            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, swap_max_concurrent, created_at, updated_at \
              FROM api_keys",
         )
         .fetch_one(&pool)
@@ -350,6 +435,7 @@ mod tests {
         assert!(row.active);
         assert!(!row.is_admin);
         assert_eq!(row.rate_limit_rpm, None);
+        assert_eq!(row.swap_max_concurrent, None);
         assert!(PasswordHash::new(&row.secret_hash).is_ok());
         let snapshotted_key_id: String =
             sqlx::query_scalar("SELECT api_key_id FROM attribution_api_keys")
@@ -449,6 +535,73 @@ mod tests {
 
         assert!(set_result.is_err());
         assert!(clear_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_set_and_clear_swap_concurrency() {
+        let pool = test_pool().await;
+        let key_id = seed_key(&pool).await;
+
+        handle_keys_command(
+            KeysCommand::SetSwapConcurrency {
+                key_id: key_id.clone(),
+                max_concurrent: 8,
+            },
+            pool.clone(),
+        )
+        .await
+        .expect("set swap concurrency");
+
+        let limit: Option<i64> =
+            sqlx::query_scalar("SELECT swap_max_concurrent FROM api_keys WHERE key_id = ?")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch swap concurrency");
+        assert_eq!(limit, Some(8));
+
+        handle_keys_command(
+            KeysCommand::ClearSwapConcurrency {
+                key_id: key_id.clone(),
+            },
+            pool.clone(),
+        )
+        .await
+        .expect("clear swap concurrency");
+
+        let limit: Option<i64> =
+            sqlx::query_scalar("SELECT swap_max_concurrent FROM api_keys WHERE key_id = ?")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch cleared swap concurrency");
+        assert_eq!(limit, None);
+    }
+
+    #[tokio::test]
+    async fn test_swap_concurrency_rejects_zero_and_above_global_limit() {
+        let pool = test_pool().await;
+        let key_id = seed_key(&pool).await;
+
+        let zero = handle_keys_command(
+            KeysCommand::SetSwapConcurrency {
+                key_id: key_id.clone(),
+                max_concurrent: 0,
+            },
+            pool.clone(),
+        )
+        .await;
+        let above_global = handle_keys_command(
+            KeysCommand::SetSwapConcurrency {
+                key_id,
+                max_concurrent: 13,
+            },
+            pool,
+        )
+        .await;
+
+        assert!(zero.is_err());
+        assert!(above_global.is_err());
     }
 
     #[tokio::test]

@@ -595,7 +595,9 @@ async fn main() {
             }
         }
         cli::Command::Keys { command, .. } => {
-            if let Err(e) = cli::handle_keys_command(command, pool).await {
+            if let Err(e) =
+                cli::handle_keys_command(command, pool, cfg.swap_max_concurrent_global).await
+            {
                 tracing::error!(error = %e, "keys command failed");
                 drop(log_guard);
                 std::process::exit(1);
@@ -839,7 +841,7 @@ mod tests {
             allow_registry_fallback,
             rate_limit_global_rpm: 600,
             rate_limit_per_key_rpm: 60,
-            swap_max_concurrent_global: 8,
+            swap_max_concurrent_global: 12,
             swap_max_concurrent_per_key: 4,
             swap_request_timeout_seconds: 30,
             docs_dir: "./docs/book".to_string(),

@@ -49,6 +49,34 @@ fn describe() {
         metrics::Unit::Seconds,
         "HTTP request handling latency in seconds, by method and endpoint"
     );
+    metrics::describe_counter!(
+        "rest_api_swap_capacity_rejections_total",
+        "Swap requests rejected by the global or per-key concurrency limit"
+    );
+    metrics::describe_counter!(
+        "rest_api_swap_timeouts_total",
+        "Swap requests cancelled after exceeding the configured timeout"
+    );
+}
+
+fn record_swap_capacity_rejection(scope: &'static str) {
+    metrics::counter!(
+        "rest_api_swap_capacity_rejections_total",
+        "scope" => scope
+    )
+    .increment(1);
+}
+
+pub(crate) fn record_per_key_swap_capacity_rejection() {
+    record_swap_capacity_rejection("per_key");
+}
+
+pub(crate) fn record_global_swap_capacity_rejection() {
+    record_swap_capacity_rejection("global");
+}
+
+pub(crate) fn record_swap_timeout() {
+    metrics::counter!("rest_api_swap_timeouts_total").increment(1);
 }
 
 /// Record one completed HTTP request. Called from the response fairing.

@@ -83,7 +83,7 @@ pub async fn post_swap_calldata(
             &req,
         );
         let result = capacity
-            .run(key.id, async {
+            .run(key.id, key.swap_max_concurrent, async {
                 let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexSwapDataSource::new(
@@ -157,7 +157,7 @@ pub async fn post_swap_calldata_v2(
             &req,
         );
         let result = capacity
-            .run(key.id, async {
+            .run(key.id, key.swap_max_concurrent, async {
                 let attribution = app_state.attribution.for_api_key(&key.key_id, req.taker);
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexSwapDataSource::new(
@@ -894,6 +894,7 @@ mod tests {
             label: "Test client".to_string(),
             owner: "test-owner".to_string(),
             is_admin: false,
+            swap_max_concurrent: None,
         }
     }
 

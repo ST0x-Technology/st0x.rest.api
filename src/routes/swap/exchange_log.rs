@@ -121,6 +121,7 @@ mod tests {
             label: "ST0x Website".to_string(),
             owner: "st0x".to_string(),
             is_admin: false,
+            swap_max_concurrent: None,
         }
     }
 

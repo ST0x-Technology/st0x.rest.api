@@ -71,8 +71,8 @@ The secret is hashed with Argon2 before storage. There is no way to recover it.
 nix develop -c cargo run keys list
 ```
 
-Shows all keys with their ID, label, owner, active status, rate-limit override,
-and timestamps.
+Shows all keys with their ID, label, owner, active status, rate-limit and swap
+concurrency overrides, and timestamps.
 
 #### Override a key's rate limit
 
@@ -86,6 +86,20 @@ to return the key to the configured default:
 
 ```sh
 nix develop -c cargo run -- keys --config config/prod.toml clear-rate-limit <KEY_ID>
+```
+
+#### Override a key's concurrent swap limit
+
+```sh
+nix develop -c cargo run -- keys --config config/prod.toml set-swap-concurrency <KEY_ID> 8
+```
+
+Sets the maximum concurrent swap requests for one API key. The value must not
+exceed `swap_max_concurrent_global`. Keys without an override use
+`swap_max_concurrent_per_key`. Clear the override to restore the default:
+
+```sh
+nix develop -c cargo run -- keys --config config/prod.toml clear-swap-concurrency <KEY_ID>
 ```
 
 #### Revoke a key

@@ -22,6 +22,7 @@ pub struct ApiKeyRow {
     pub active: bool,
     pub is_admin: bool,
     pub rate_limit_rpm: Option<i64>,
+    pub swap_max_concurrent: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -47,6 +48,7 @@ pub struct AuthenticatedKey {
     pub label: String,
     pub owner: String,
     pub is_admin: bool,
+    pub swap_max_concurrent: Option<usize>,
 }
 
 impl AuthenticatedKey {
@@ -113,7 +115,7 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
         };
 
         let row: Option<ApiKeyRow> = match sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, created_at, updated_at \
+            "SELECT id, key_id, secret_hash, label, owner, active, is_admin, rate_limit_rpm, swap_max_concurrent, created_at, updated_at \
              FROM api_keys WHERE key_id = ? AND active = 1",
         )
         .bind(key_id)
@@ -204,6 +206,23 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
             },
             None => None,
         };
+        let swap_max_concurrent = match row.swap_max_concurrent {
+            Some(limit) => match usize::try_from(limit) {
+                Ok(limit) if limit > 0 => Some(limit),
+                _ => {
+                    tracing::error!(
+                        key_id = %row.key_id,
+                        swap_max_concurrent = limit,
+                        "invalid per-key swap concurrency limit in database"
+                    );
+                    return Outcome::Error((
+                        Status::InternalServerError,
+                        ApiError::Internal("authentication check failed".into()),
+                    ));
+                }
+            },
+            None => None,
+        };
 
         match rl.check_per_key(row.id, rate_limit_rpm) {
             Ok((true, info)) => {
@@ -239,6 +258,7 @@ impl<'r> FromRequest<'r> for AuthenticatedKey {
             label: row.label,
             owner: row.owner,
             is_admin: row.is_admin,
+            swap_max_concurrent,
         })
     }
 }

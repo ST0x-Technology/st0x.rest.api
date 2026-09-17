@@ -76,6 +76,11 @@ impl Config {
         if self.swap_max_concurrent_per_key == 0 {
             return Err("swap_max_concurrent_per_key must be greater than zero".into());
         }
+        if self.swap_max_concurrent_per_key > self.swap_max_concurrent_global {
+            return Err(
+                "swap_max_concurrent_per_key must not exceed swap_max_concurrent_global".into(),
+            );
+        }
         if self.swap_request_timeout_seconds == 0 {
             return Err("swap_request_timeout_seconds must be greater than zero".into());
         }
@@ -112,6 +117,13 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err("swap_request_timeout_seconds must be greater than zero".into())
+        );
+
+        let mut config = valid_config();
+        config.swap_max_concurrent_per_key = config.swap_max_concurrent_global + 1;
+        assert_eq!(
+            config.validate(),
+            Err("swap_max_concurrent_per_key must not exceed swap_max_concurrent_global".into())
         );
     }
 }

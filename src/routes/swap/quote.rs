@@ -82,7 +82,7 @@ pub async fn post_swap_quote(
             &req,
         );
         let result = capacity
-            .run(key.id, async {
+            .run(key.id, key.swap_max_concurrent, async {
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexSwapDataSource::new(
                     raindex.client(),
@@ -147,7 +147,7 @@ pub async fn post_swap_quote_v2(
             &req,
         );
         let result = capacity
-            .run(key.id, async {
+            .run(key.id, key.swap_max_concurrent, async {
                 let raindex = shared_raindex.read().await;
                 let ds = RaindexSwapDataSource::new(
                     raindex.client(),
@@ -639,6 +639,7 @@ mod tests {
             label: "Test client".to_string(),
             owner: "test-owner".to_string(),
             is_admin: false,
+            swap_max_concurrent: None,
         }
     }
 
