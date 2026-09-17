@@ -1,7 +1,7 @@
 use crate::auth::AuthenticatedKey;
 use crate::db::market_price_history::{
-    list_current_market_prices, list_market_price_history, list_market_prices_at_or_before,
-    MarketPriceSnapshot,
+    list_current_and_previous_market_prices, list_market_price_history,
+    list_market_prices_at_or_before, MarketPriceSnapshot,
 };
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
@@ -229,30 +229,16 @@ async fn price_responses_for_market(
             Vec::new(),
         )
     } else {
-        tokio::try_join!(
-            async {
-                list_current_market_prices(
-                    &state.pool,
-                    i64::from(market.chain_id),
-                    &quote_address,
-                    retained_start,
-                    query_time,
-                )
-                .await
-                .map_err(database_error)
-            },
-            async {
-                list_market_prices_at_or_before(
-                    &state.pool,
-                    i64::from(market.chain_id),
-                    &quote_address,
-                    retained_start,
-                    now.saturating_sub(CHANGE_WINDOW_SECONDS),
-                )
-                .await
-                .map_err(database_error)
-            }
-        )?
+        list_current_and_previous_market_prices(
+            &state.pool,
+            i64::from(market.chain_id),
+            &quote_address,
+            retained_start,
+            query_time,
+            now.saturating_sub(CHANGE_WINDOW_SECONDS),
+        )
+        .await
+        .map_err(database_error)?
     };
     let rows_by_asset = rows
         .into_iter()
@@ -942,12 +928,13 @@ using-tokens-from:
     }
 
     #[rocket::async_test]
-    async fn completed_empty_sample_hides_retained_bad_price_after_restart() {
+    async fn completed_empty_sample_serves_retained_price_after_restart() {
         let directory = tempfile::tempdir().expect("create temporary database directory");
         let database_url = format!("sqlite://{}", directory.path().join("prices.db").display());
         let client = price_client_with_database_url(Some(database_url.clone())).await;
         let now = unix_now().expect("current time");
-        seed_price(&client, now - 60, "97").await;
+        let retained_at = now - 3_600;
+        seed_price(&client, retained_at, "97").await;
         seed_price(&client, now, "133.2849473639369669757361259939914873505").await;
         let state = client
             .rocket()
@@ -963,11 +950,11 @@ using-tokens-from:
         let response = authorized_get(&client, "/v1/prices?chainId=8453").await;
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value = response.into_json().await.expect("price response");
-        assert_eq!(body["data"][0]["source"], "unavailable");
-        assert!(body["data"][0]["midpoint"].is_null());
-        assert!(body["data"][0]["observedAt"].is_null());
+        assert_eq!(body["data"][0]["source"], "cached");
+        assert_eq!(body["data"][0]["midpoint"], "97");
+        assert_eq!(body["data"][0]["observedAt"], retained_at);
 
-        let historical_path = format!("/v1/prices?chainId=8453&at={}", now - 60);
+        let historical_path = format!("/v1/prices?chainId=8453&at={retained_at}");
         let historical = authorized_get(&client, &historical_path).await;
         assert_eq!(historical.status(), Status::Ok);
         let historical_body: serde_json::Value =

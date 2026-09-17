@@ -25,6 +25,51 @@ pub(crate) struct MarketPriceSnapshot {
     pub observed_at: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct CurrentAndPreviousMarketPriceSnapshot {
+    chain_id: i64,
+    asset_token_address: String,
+    quote_token_address: String,
+    best_bid: String,
+    best_ask: String,
+    midpoint: String,
+    assets_per_share: String,
+    observed_at: i64,
+    is_current: bool,
+    is_previous: bool,
+}
+
+impl CurrentAndPreviousMarketPriceSnapshot {
+    fn into_parts(self) -> (MarketPriceSnapshot, bool, bool) {
+        let Self {
+            chain_id,
+            asset_token_address,
+            quote_token_address,
+            best_bid,
+            best_ask,
+            midpoint,
+            assets_per_share,
+            observed_at,
+            is_current,
+            is_previous,
+        } = self;
+        (
+            MarketPriceSnapshot {
+                chain_id,
+                asset_token_address,
+                quote_token_address,
+                best_bid,
+                best_ask,
+                midpoint,
+                assets_per_share,
+                observed_at,
+            },
+            is_current,
+            is_previous,
+        )
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn insert_market_price_snapshots(
     pool: &DbPool,
@@ -48,63 +93,56 @@ pub(crate) async fn replace_market_price_sample(
         .await?
         .rows_affected();
     let inserted = insert_market_price_snapshots_in_transaction(&mut tx, snapshots).await?;
-    sqlx::query(
-        "INSERT INTO market_price_sampler_state (singleton, last_completed_sample_at) \
-         VALUES (1, ?) \
-         ON CONFLICT(singleton) DO UPDATE SET \
-             last_completed_sample_at = MAX(last_completed_sample_at, excluded.last_completed_sample_at)",
-    )
-    .bind(observed_at)
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
     Ok((deleted, inserted))
 }
 
-#[cfg(test)]
-pub(crate) async fn load_last_completed_market_price_sample(
-    pool: &DbPool,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT last_completed_sample_at \
-         FROM market_price_sampler_state \
-         WHERE singleton = 1",
-    )
-    .fetch_optional(pool)
-    .await
-}
-
-pub(crate) async fn list_current_market_prices(
+pub(crate) async fn list_current_and_previous_market_prices(
     pool: &DbPool,
     chain_id: i64,
     quote_token_address: &str,
     retained_start: i64,
     observed_at: i64,
-) -> Result<Vec<MarketPriceSnapshot>, sqlx::Error> {
-    sqlx::query_as::<_, MarketPriceSnapshot>(
-        "SELECT chain_id, asset_token_address, quote_token_address, best_bid, best_ask, midpoint, assets_per_share, observed_at \
+    previous_at: i64,
+) -> Result<(Vec<MarketPriceSnapshot>, Vec<MarketPriceSnapshot>), sqlx::Error> {
+    let rows = sqlx::query_as::<_, CurrentAndPreviousMarketPriceSnapshot>(
+        "SELECT chain_id, asset_token_address, quote_token_address, best_bid, best_ask, midpoint, assets_per_share, observed_at, \
+                observed_at = current_observed_at AS is_current, \
+                observed_at = previous_observed_at AS is_previous \
          FROM ( \
              SELECT chain_id, asset_token_address, quote_token_address, best_bid, best_ask, midpoint, assets_per_share, observed_at, \
-                    ROW_NUMBER() OVER (PARTITION BY asset_token_address ORDER BY observed_at DESC) AS row_number \
+                    MAX(observed_at) OVER (PARTITION BY asset_token_address) AS current_observed_at, \
+                    MAX(CASE WHEN observed_at <= ? THEN observed_at END) OVER (PARTITION BY asset_token_address) AS previous_observed_at \
              FROM market_price_snapshots \
              WHERE chain_id = ? AND quote_token_address = ? \
-               AND observed_at >= MAX(?, COALESCE(( \
-                   SELECT last_completed_sample_at \
-                   FROM market_price_sampler_state \
-                   WHERE singleton = 1 \
-               ), ?)) \
-               AND observed_at <= ? \
+               AND observed_at >= ? AND observed_at <= ? \
          ) ranked \
-         WHERE row_number = 1 \
-         ORDER BY asset_token_address",
+         WHERE observed_at = current_observed_at OR observed_at = previous_observed_at \
+         ORDER BY asset_token_address, observed_at DESC",
     )
+    .bind(previous_at)
     .bind(chain_id)
     .bind(quote_token_address)
     .bind(retained_start)
-    .bind(retained_start)
     .bind(observed_at)
     .fetch_all(pool)
-    .await
+    .await?;
+
+    let mut current = Vec::new();
+    let mut previous = Vec::new();
+    for row in rows {
+        let (snapshot, is_current, is_previous) = row.into_parts();
+        match (is_current, is_previous) {
+            (true, true) => {
+                current.push(snapshot.clone());
+                previous.push(snapshot);
+            }
+            (true, false) => current.push(snapshot),
+            (false, true) => previous.push(snapshot),
+            (false, false) => {}
+        }
+    }
+    Ok((current, previous))
 }
 
 async fn insert_market_price_snapshots_in_transaction(
@@ -336,43 +374,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_persists_latest_completed_sample_even_when_empty() {
+    async fn latest_per_asset_survives_partial_and_empty_newer_samples() {
         let pool = test_pool().await;
-
-        replace_market_price_sample(&pool, 160, &[])
+        replace_market_price_sample(
+            &pool,
+            100,
+            &[
+                snapshot("0xasset-a", "10", 100),
+                snapshot("0xasset-b", "20", 100),
+            ],
+        )
+        .await
+        .expect("insert complete sample");
+        replace_market_price_sample(&pool, 160, &[snapshot("0xasset-a", "11", 160)])
             .await
-            .expect("persist empty completed sample");
-        replace_market_price_sample(&pool, 100, &[])
+            .expect("insert partial sample");
+        replace_market_price_sample(&pool, 180, &[])
             .await
-            .expect("ignore older completed sample");
+            .expect("persist empty sample");
 
-        assert_eq!(
-            load_last_completed_market_price_sample(&pool)
+        let (current, previous) =
+            list_current_and_previous_market_prices(&pool, 8453, "0xquote", 0, 200, 120)
                 .await
-                .expect("load completed sample"),
-            Some(160)
-        );
-    }
+                .expect("list current and previous prices");
 
-    #[tokio::test]
-    async fn current_query_applies_completed_sample_boundary_from_same_database() {
-        let pool = test_pool().await;
-        insert_market_price_snapshots(&pool, &[snapshot("0xasset", "133", 100)])
-            .await
-            .expect("insert stale snapshot");
-        replace_market_price_sample(&pool, 160, &[])
-            .await
-            .expect("persist empty completed sample");
-
-        let current = list_current_market_prices(&pool, 8453, "0xquote", 0, 200)
-            .await
-            .expect("list current prices");
-        let historical = list_market_prices_at_or_before(&pool, 8453, "0xquote", 0, 100)
-            .await
-            .expect("list historical prices");
-
-        assert!(current.is_empty());
-        assert_eq!(historical.len(), 1);
-        assert_eq!(historical[0].midpoint, "133");
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].asset_token_address, "0xasset-a");
+        assert_eq!(current[0].midpoint, "11");
+        assert_eq!(current[1].asset_token_address, "0xasset-b");
+        assert_eq!(current[1].midpoint, "20");
+        assert_eq!(previous.len(), 2);
+        assert_eq!(previous[0].midpoint, "10");
+        assert_eq!(previous[1].midpoint, "20");
     }
 }
