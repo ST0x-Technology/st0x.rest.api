@@ -1,7 +1,7 @@
 use super::{
     capture_swap_outcome, ensure_distinct_tokens, exchange_log::SwapExchangeLog,
-    no_liquidity_error, snapshot_swap_context, RaindexSwapDataSource, SwapAnalyticsContext,
-    SwapCandidateBuild, SwapDataSource,
+    no_liquidity_error, request_chain_id, snapshot_swap_context, RaindexSwapDataSource,
+    SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
 };
 use crate::analytics::{
     swap_quote_failed_event, swap_quoted_event, swap_quoted_v2_event, Analytics, ApiVersion,
@@ -69,8 +69,30 @@ pub async fn post_swap_quote(
     request: Json<SwapQuoteRequest>,
 ) -> Result<Json<SwapQuoteResponse>, ApiError> {
     let request_id = span.request_id().to_string();
+    let api_version = span.api_version();
     async move {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        req.chain_id = crate::routes::compatibility_swap_chain_id(api_version, req.chain_id)?;
+        let chain_id_result = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::resolve_required_raindex_chain_id(raindex.client(), req.chain_id)
+        };
+        if let Err(error) = &chain_id_result {
+            SwapExchangeLog::new(
+                &request_id,
+                "/v1/swap/quote",
+                "v1",
+                "quote",
+                &key,
+                req.input_token,
+                req.output_token,
+                &req,
+            )
+            .record_error(error);
+        }
+        let chain_id = chain_id_result?;
+        tracing::info!(chain_id, "resolved required Raindex chain");
+        req.chain_id = Some(chain_id);
         let exchange = SwapExchangeLog::new(
             &request_id,
             "/v1/swap/quote",
@@ -134,12 +156,39 @@ pub async fn post_swap_quote_v2(
     request: Json<SwapQuoteV2Request>,
 ) -> Result<Json<SwapQuoteV2Response>, ApiError> {
     let request_id = span.request_id().to_string();
+    let api_version = span.api_version();
+    let (route_path, version_label, analytics_api_version) = if api_version == Some(3) {
+        ("/v3/swap/quote", "v3", ApiVersion::V3)
+    } else {
+        ("/v2/swap/quote", "v2", ApiVersion::V2)
+    };
     async move {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        req.chain_id = crate::routes::compatibility_swap_chain_id(api_version, req.chain_id)?;
+        let chain_id_result = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::resolve_required_raindex_chain_id(raindex.client(), req.chain_id)
+        };
+        if let Err(error) = &chain_id_result {
+            SwapExchangeLog::new(
+                &request_id,
+                route_path,
+                version_label,
+                "quote",
+                &key,
+                req.input_token,
+                req.output_token,
+                &req,
+            )
+            .record_error(error);
+        }
+        let chain_id = chain_id_result?;
+        tracing::info!(chain_id, "resolved required Raindex chain");
+        req.chain_id = Some(chain_id);
         let exchange = SwapExchangeLog::new(
             &request_id,
-            "/v2/swap/quote",
-            "v2",
+            route_path,
+            version_label,
             "quote",
             &key,
             req.input_token,
@@ -154,7 +203,7 @@ pub async fn post_swap_quote_v2(
                     &app_state.response_caches,
                     pool.inner(),
                 );
-                handle_swap_quote_v2(&ds, &key, analytics.inner(), req).await
+                handle_swap_quote_v2(&ds, &key, analytics.inner(), analytics_api_version, req).await
             })
             .await;
         exchange.record(&result);
@@ -171,6 +220,7 @@ async fn handle_swap_quote(
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
     let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         requested_amount: req.output_amount.clone(),
@@ -202,14 +252,16 @@ async fn handle_swap_quote_v2(
     ds: &dyn SwapDataSource,
     key: &AuthenticatedKey,
     analytics: &Analytics,
+    api_version: ApiVersion,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
     let analytics_context = snapshot_swap_context(analytics, || SwapAnalyticsContext {
+        chain_id: req.chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         requested_amount: req.amount.clone(),
         denomination: serde_json::to_value(req.denomination).unwrap_or(serde_json::Value::Null),
-        api_version: ApiVersion::V2,
+        api_version,
         mode: serde_json::to_value(req.mode).ok(),
         taker: None,
     });
@@ -228,14 +280,15 @@ async fn process_swap_quote(
     ds: &dyn SwapDataSource,
     req: SwapQuoteRequest,
 ) -> Result<SwapQuoteResponse, ApiError> {
+    let chain_id = request_chain_id(req.chain_id)?;
     ensure_distinct_tokens(req.input_token, req.output_token)?;
 
-    ds.validate_supported_tokens(req.input_token, req.output_token)
+    ds.validate_supported_tokens_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     let orders = ds
-        .get_orders_for_pair(req.input_token, req.output_token)
+        .get_orders_for_pair_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
 
@@ -286,6 +339,7 @@ async fn process_swap_quote(
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
         ds,
+        chain_id,
         req.denomination,
         req.input_token,
         req.output_token,
@@ -316,6 +370,7 @@ async fn process_swap_quote(
     })?;
 
     Ok(SwapQuoteResponse {
+        chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         output_amount: req.output_amount,
@@ -330,10 +385,11 @@ async fn process_swap_quote_v2(
     ds: &dyn SwapDataSource,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
+    let chain_id = request_chain_id(req.chain_id)?;
     ensure_distinct_tokens(req.input_token, req.output_token)?;
     let price_limit = validate_quote_v2_price_limit(&req)?;
 
-    ds.validate_supported_tokens(req.input_token, req.output_token)
+    ds.validate_supported_tokens_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
@@ -341,6 +397,7 @@ async fn process_swap_quote_v2(
     let (amount, wrap_ratios) = normalize_calldata_request_amount(
         ds,
         CalldataAmountNormalization {
+            chain_id,
             denomination: req.denomination,
             input_token: req.input_token,
             output_token: req.output_token,
@@ -355,7 +412,7 @@ async fn process_swap_quote_v2(
         ParsedTakeOrdersMode::parse(mode, &amount).map_err(super::map_raindex_error)?;
 
     let orders = ds
-        .get_orders_for_pair(req.input_token, req.output_token)
+        .get_orders_for_pair_on_chain(chain_id, req.input_token, req.output_token)
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::OrdersQueryFailed))?;
     if orders.is_empty() {
@@ -477,6 +534,7 @@ async fn process_swap_quote_v2(
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
         ds,
+        chain_id,
         req.denomination,
         req.input_token,
         req.output_token,
@@ -506,6 +564,7 @@ async fn process_swap_quote_v2(
     };
 
     Ok(SwapQuoteV2Response {
+        chain_id,
         input_token: req.input_token,
         output_token: req.output_token,
         mode: req.mode,
@@ -645,6 +704,7 @@ mod tests {
 
     fn quote_request(output_amount: &str) -> SwapQuoteRequest {
         SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token: USDC,
             output_token: WETH,
             output_amount: output_amount.to_string(),
@@ -654,6 +714,7 @@ mod tests {
 
     fn quote_v2_request(mode: SwapCalldataMode, amount: &str) -> SwapQuoteV2Request {
         SwapQuoteV2Request {
+            chain_id: Some(8453),
             taker: None,
             input_token: USDC,
             output_token: WETH,
@@ -729,6 +790,7 @@ mod tests {
         output_amount: &str,
     ) -> SwapQuoteRequest {
         SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token,
             output_token,
             output_amount: output_amount.to_string(),
@@ -1104,6 +1166,7 @@ mod tests {
             &ds,
             &test_key(),
             &analytics,
+            ApiVersion::V2,
             quote_v2_request(SwapCalldataMode::BuyUpTo, "5"),
         )
         .await
@@ -1252,7 +1315,8 @@ mod tests {
 
         let mut request = quote_v2_request(SwapCalldataMode::BuyUpTo, "5");
         request.taker = Some(TAKER);
-        let result = handle_swap_quote_v2(&ds, &test_key(), &analytics, request).await;
+        let result =
+            handle_swap_quote_v2(&ds, &test_key(), &analytics, ApiVersion::V2, request).await;
         assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
 
         let event = recording
@@ -1620,5 +1684,22 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::UnprocessableEntity);
+    }
+
+    #[rocket::async_test]
+    async fn test_v3_swap_quote_requires_chain_id() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let response = client
+            .post("/v3/swap/quote")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new("Authorization", header))
+            .body(r#"{"inputToken":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","outputToken":"0x4200000000000000000000000000000000000006","mode":"spendExact","amount":"100","priceCap":"2500"}"#)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest);
+        let body = response.into_json::<ApiErrorResponse>().await.unwrap();
+        assert_eq!(body.error.message, "chainId is required");
     }
 }

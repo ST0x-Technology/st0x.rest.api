@@ -157,6 +157,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_token_and_block_are_distinct_across_chains() {
+        let pool = test_pool().await;
+        let base = snapshot("0xshare", "0xasset", "1.0", 100, "2026-06-04T10:00:00Z");
+        let mut polygon = base.clone();
+        polygon.chain_id = 137;
+
+        let inserted = insert_wrapped_exchange_rate_snapshots(&pool, &[base, polygon])
+            .await
+            .expect("insert cross-chain snapshots");
+        assert_eq!(inserted, 2);
+
+        assert_eq!(
+            count_wrapped_exchange_rate_snapshots_for_share(&pool, 8453, "0xshare")
+                .await
+                .expect("count Base snapshots"),
+            1
+        );
+        assert_eq!(
+            count_wrapped_exchange_rate_snapshots_for_share(&pool, 137, "0xshare")
+                .await
+                .expect("count Polygon snapshots"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn stores_all_snapshot_fields() {
         let pool = test_pool().await;
         let snapshots = vec![snapshot(
@@ -186,32 +212,6 @@ mod tests {
         assert_eq!(row.block_number, 120);
         assert_eq!(row.block_timestamp, Some(1120));
         assert_eq!(row.captured_at, "2026-06-04T10:02:00Z");
-    }
-
-    #[tokio::test]
-    async fn identical_token_and_block_are_distinct_across_chains() {
-        let pool = test_pool().await;
-        let base = snapshot("0xshare", "0xasset", "1.0", 100, "2026-06-04T10:00:00Z");
-        let mut ethereum = base.clone();
-        ethereum.chain_id = 1;
-
-        let inserted = insert_wrapped_exchange_rate_snapshots(&pool, &[base, ethereum])
-            .await
-            .expect("insert cross-chain snapshots");
-        assert_eq!(inserted, 2);
-
-        assert_eq!(
-            count_wrapped_exchange_rate_snapshots_for_share(&pool, 8453, "0xshare")
-                .await
-                .expect("count Base snapshots"),
-            1
-        );
-        assert_eq!(
-            count_wrapped_exchange_rate_snapshots_for_share(&pool, 1, "0xshare")
-                .await
-                .expect("count Ethereum snapshots"),
-            1
-        );
     }
 
     #[tokio::test]

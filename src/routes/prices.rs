@@ -133,7 +133,7 @@ pub struct MarketPriceHistoryResponse {
 
 #[utoipa::path(
     get,
-    path = "/v1/prices",
+    path = "/v2/prices",
     tag = "Prices",
     security(("basicAuth" = [])),
     params(PricesParams),
@@ -153,6 +153,7 @@ pub async fn get_prices(
     state: &State<MarketPriceState>,
     params: PricesParams,
 ) -> Result<Json<MarketPricesResponse>, ApiError> {
+    let chain_id = crate::routes::compatibility_chain_id(span.api_version(), params.chain_id);
     async move {
         let config = &state.config;
         tracing::info!(params = ?params, "request received");
@@ -164,7 +165,7 @@ pub async fn get_prices(
             ));
         }
 
-        let markets = configured_price_markets(&state.shared_raindex, params.chain_id).await?;
+        let markets = configured_price_markets(&state.shared_raindex, chain_id).await?;
         let retention_seconds = duration_seconds_i64(config.retention, "retention")?;
         let retained_start = now.saturating_sub(retention_seconds);
 
@@ -317,7 +318,7 @@ async fn price_responses_for_market(
 
 #[utoipa::path(
     get,
-    path = "/v1/prices/{address}/history",
+    path = "/v2/prices/{address}/history",
     tag = "Prices",
     security(("basicAuth" = [])),
     params(
@@ -343,6 +344,7 @@ pub async fn get_price_history(
     address: ValidatedAddress,
     params: PriceHistoryParams,
 ) -> Result<Json<MarketPriceHistoryResponse>, ApiError> {
+    let chain_id = crate::routes::compatibility_chain_id(span.api_version(), params.chain_id);
     async move {
         let config = &state.config;
         tracing::info!(address = %address.0, params = ?params, "request received");
@@ -379,7 +381,7 @@ pub async fn get_price_history(
         let interval_i64 = i64::try_from(interval)
             .map_err(|_| ApiError::BadRequest("interval is too large".into()))?;
 
-        let market = resolve_required_price_market(&state.shared_raindex, params.chain_id)
+        let market = resolve_required_price_market(&state.shared_raindex, chain_id)
             .await?
             .ok_or_else(|| ApiError::NotFound("ST0x token not found".into()))?;
         let token = find_market_token(&market.tokens, address.0)
@@ -650,6 +652,10 @@ fn float_error(error: rain_math_float::FloatError) -> ApiError {
 
 pub fn routes() -> Vec<Route> {
     rocket::routes![get_prices, get_price_history]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }
 
 #[cfg(test)]
@@ -1071,6 +1077,13 @@ using-tokens-from:
 
         let response = authorized_get(&client, "/v1/prices").await;
         assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = response.into_json().await.expect("V1 price response");
+        let data = body["data"].as_array().expect("price data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["chainId"], 8453);
+
+        let response = authorized_get(&client, "/v2/prices").await;
+        assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value = response.into_json().await.expect("price response");
         let data = body["data"].as_array().expect("price data");
         assert_eq!(data.len(), 2);
@@ -1083,7 +1096,7 @@ using-tokens-from:
     #[rocket::async_test]
     async fn history_requires_chain_when_registry_has_multiple_networks() {
         let client = multichain_price_client().await;
-        let path = format!("/v1/prices/{ASSET:#x}/history");
+        let path = format!("/v2/prices/{ASSET:#x}/history");
         let response = authorized_get(&client, &path).await;
         assert_eq!(response.status(), Status::BadRequest);
     }

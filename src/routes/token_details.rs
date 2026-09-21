@@ -1,7 +1,7 @@
 use super::{
     api_error_message, matches_token_proof_address, post_graphql, registry_tokens,
     resolve_sft_subgraph_url, select_st0x_token, validated_requested_chain_id, TimestampValue,
-    SFT_PAGE_SIZE,
+    TokenListParams, SFT_PAGE_SIZE,
 };
 use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
@@ -808,28 +808,44 @@ fn activity_limit(params: &TokenDetailsQueryParams) -> u32 {
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/details",
+    path = "/v2/tokens/details",
     tag = "Tokens",
     security(("basicAuth" = [])),
+    params(TokenListParams),
     responses(
         (status = 200, description = "ST0x token detail summaries with per-token errors", body = TokenDetailsListResponse),
+        (status = 400, description = "Unsupported chainId", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/details")]
+#[get("/details?<params..>")]
 pub async fn get_token_details(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
+    params: TokenListParams,
 ) -> Result<Json<TokenDetailsListResponse>, ApiError> {
+    let chain_id = crate::routes::compatibility_chain_id(span.api_version(), params.chain_id);
     async move {
         tracing::info!("request received");
 
+        let chain_ids = {
+            let raindex = shared_raindex.read().await;
+            crate::routes::optional_chain_ids_filter(raindex.raindex_yaml(), chain_id)?
+        };
         let tokens = registry_tokens(shared_raindex).await?;
-        let st0x_tokens: Vec<TokenCfg> = tokens.into_iter().filter(is_st0x_token).collect();
+        let st0x_tokens: Vec<TokenCfg> = tokens
+            .into_iter()
+            .filter(|token| {
+                is_st0x_token(token)
+                    && chain_ids
+                        .as_ref()
+                        .is_none_or(|chain_ids| chain_ids.contains(&token.network.chain_id))
+            })
+            .collect();
         tracing::info!(count = st0x_tokens.len(), "reading ST0x token details");
 
         let batch_items = {
@@ -966,7 +982,7 @@ pub async fn get_token_details(
 
 #[utoipa::path(
     get,
-    path = "/v1/tokens/{address}/details",
+    path = "/v2/tokens/{address}/details",
     tag = "Tokens",
     security(("basicAuth" = [])),
     params(
@@ -992,10 +1008,12 @@ pub async fn get_token_details_by_address(
     address: ValidatedAddress,
     params: TokenDetailsQueryParams,
 ) -> Result<Json<TokenDetailsResponse>, ApiError> {
+    let requested_chain_id =
+        crate::routes::compatibility_chain_id(span.api_version(), params.chain_id);
     async move {
         tracing::info!(address = %address.0, "request received");
 
-        let chain_id = validated_requested_chain_id(shared_raindex, params.chain_id).await?;
+        let chain_id = validated_requested_chain_id(shared_raindex, requested_chain_id).await?;
         let tokens = registry_tokens(shared_raindex).await?;
         let token = select_st0x_token(
             &tokens,

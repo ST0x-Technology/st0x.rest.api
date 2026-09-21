@@ -158,6 +158,40 @@ fn optional_chain_filter_supports_all_chains_and_validates_requested_chain() {
     ));
 }
 
+#[test]
+fn compatibility_chain_selection_preserves_v1_base_defaults() {
+    assert_eq!(super::compatibility_chain_id(Some(1), None), Some(8453));
+    assert_eq!(
+        super::compatibility_chain_id(Some(1), Some(4663)),
+        Some(4663)
+    );
+    assert_eq!(super::compatibility_chain_id(Some(2), None), None);
+}
+
+#[test]
+fn swap_versions_preserve_legacy_base_and_require_v3_chain() {
+    assert_eq!(
+        super::compatibility_swap_chain_id(Some(1), None).expect("v1 Base default"),
+        Some(8453)
+    );
+    assert_eq!(
+        super::compatibility_swap_chain_id(Some(2), None).expect("v2 Base default"),
+        Some(8453)
+    );
+    assert!(matches!(
+        super::compatibility_swap_chain_id(Some(2), Some(4663)),
+        Err(ApiError::BadRequest(message)) if message == "multi-network swaps require the v3 API"
+    ));
+    assert!(matches!(
+        super::compatibility_swap_chain_id(Some(3), None),
+        Err(ApiError::BadRequest(message)) if message == "chainId is required"
+    ));
+    assert_eq!(
+        super::compatibility_swap_chain_id(Some(3), Some(4663)).expect("v3 explicit chain"),
+        Some(4663)
+    );
+}
+
 #[rocket::async_test]
 async fn raindex_chain_selection_excludes_standalone_networks() {
     let client = rain_orderbook_common::raindex_client::RaindexClient::new(
@@ -176,11 +210,35 @@ async fn raindex_chain_selection_excludes_standalone_networks() {
         super::required_raindex_chain_ids(&client).expect("select all raindex chains"),
         vec![8453]
     );
+    assert_eq!(
+        super::resolve_raindex_chain_ids(&client, None)
+            .expect("default to all Raindex-backed chains"),
+        vec![8453]
+    );
+    assert_eq!(
+        super::resolve_raindex_chain_ids(&client, Some(vec![8453]))
+            .expect("select the Raindex-backed chain"),
+        vec![8453]
+    );
+    assert!(matches!(
+        super::resolve_raindex_chain_ids(&client, Some(vec![1])),
+        Err(ApiError::BadRequest(message)) if message == "unsupported chainId"
+    ));
+    assert_eq!(
+        super::resolve_required_raindex_chain_id(&client, None)
+            .expect("default the only Raindex-backed chain"),
+        8453
+    );
+    assert_eq!(
+        super::resolve_required_raindex_chain_id(&client, Some(8453))
+            .expect("select the Raindex-backed chain"),
+        8453
+    );
     let tokens = super::raindex_backed_tokens(&client).expect("select Raindex-backed tokens");
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].network.chain_id, 8453);
     assert!(matches!(
-        super::validate_raindex_chain_id(&client, 1),
+        super::resolve_required_raindex_chain_id(&client, Some(1)),
         Err(ApiError::BadRequest(message)) if message == "unsupported chainId"
     ));
     assert!(matches!(

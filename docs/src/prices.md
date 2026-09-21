@@ -13,10 +13,11 @@ valid sample remains available as a cached price. Samples older than seven days
 are deleted.
 
 Price markets are discovered from the active registry. For every configured
-network containing ST0x tokens, the token list must contain exactly one token
-whose symbol is `USDC`; its registry address is used as that network's quote
-token. No chain IDs or quote-token addresses are configured separately in the
-service.
+network containing ST0x tokens, the token list must identify exactly one quote
+token. A token with `extensions.marketQuote: true` takes precedence; otherwise,
+the API falls back to the token whose symbol is `USDC`. This allows networks to
+use a non-USDC quote token without configuring chain IDs or quote-token
+addresses separately in the service.
 
 The asset unit is the canonical wrapped ST0x share returned in `assetAddress`.
 Orders using the underlying asset are converted with the current share's
@@ -31,7 +32,7 @@ Authentication is required; see [Authentication](./authentication.md). Requests
 without valid credentials return `401 Unauthorized`.
 
 ```
-GET /v1/prices?chainId=8453
+GET /v2/prices?chainId=8453
 ```
 
 Returns every configured ST0x token on the requested network. If `chainId` is
@@ -77,7 +78,7 @@ This endpoint has the same [authentication](./authentication.md) requirement and
 may return `401 Unauthorized`.
 
 ```
-GET /v1/prices?chainId=8453&at=1784800000
+GET /v2/prices?chainId=8453&at=1784800000
 ```
 
 Returns the nearest retained observation at or before `at` for every token.
@@ -90,7 +91,7 @@ This endpoint has the same [authentication](./authentication.md) requirement and
 may return `401 Unauthorized`.
 
 ```
-GET /v1/prices/{address}/history
+GET /v2/prices/{address}/history
 ```
 
 `{address}` can use any casing and can be the current wrapped, unwrapped, or

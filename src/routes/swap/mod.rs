@@ -37,6 +37,7 @@ use std::future::Future;
 use std::sync::OnceLock;
 
 struct SwapAnalyticsContext {
+    chain_id: Option<u32>,
     input_token: Address,
     output_token: Address,
     requested_amount: String,
@@ -49,6 +50,7 @@ struct SwapAnalyticsContext {
 impl SwapAnalyticsContext {
     fn failure(&self) -> SwapFailure<'_> {
         SwapFailure {
+            chain_id: self.chain_id,
             input_token: self.input_token,
             output_token: self.output_token,
             requested_amount: &self.requested_amount,
@@ -167,10 +169,11 @@ fn quote_matches_pair(
 }
 
 fn configured_token_decimals(
-    tokens: &HashMap<Address, Option<u8>>,
+    tokens: &HashMap<(u32, Address), Option<u8>>,
+    chain_id: u32,
     token: Address,
 ) -> Result<u8, ApiError> {
-    match tokens.get(&token) {
+    match tokens.get(&(chain_id, token)) {
         Some(Some(decimals)) => Ok(*decimals),
         Some(None) => {
             tracing::error!(%token, "configured swap token is missing decimals");
@@ -291,11 +294,30 @@ pub(crate) trait SwapDataSource: Send + Sync {
         output_token: Address,
     ) -> Result<(), ApiError>;
 
+    async fn validate_supported_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<(), ApiError> {
+        self.validate_supported_tokens(input_token, output_token)
+            .await
+    }
+
     async fn get_orders_for_pair(
         &self,
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<RaindexOrder>, ApiError>;
+
+    async fn get_orders_for_pair_on_chain(
+        &self,
+        _chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<Vec<RaindexOrder>, ApiError> {
+        self.get_orders_for_pair(input_token, output_token).await
+    }
 
     async fn build_candidates_for_pair(
         &self,
@@ -310,11 +332,29 @@ pub(crate) trait SwapDataSource: Send + Sync {
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError>;
 
+    async fn get_calldata_on_chain(
+        &self,
+        chain_id: u32,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataResponse, ApiError> {
+        let mut response = self.get_calldata(request).await?;
+        response.chain_id = chain_id;
+        Ok(response)
+    }
+
     async fn get_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
+    }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        self.get_wrap_ratios_for_tokens(token_addresses).await
     }
 }
 
@@ -322,7 +362,7 @@ pub(crate) struct RaindexSwapDataSource<'a> {
     pub client: &'a RaindexClient,
     pub caches: &'a RouteResponseCaches,
     pub pool: &'a DbPool,
-    configured_tokens: OnceLock<HashMap<Address, Option<u8>>>,
+    configured_tokens: OnceLock<HashMap<(u32, Address), Option<u8>>>,
 }
 
 impl<'a> RaindexSwapDataSource<'a> {
@@ -339,19 +379,14 @@ impl<'a> RaindexSwapDataSource<'a> {
         }
     }
 
-    fn configured_tokens(&self) -> Result<&HashMap<Address, Option<u8>>, ApiError> {
+    fn configured_tokens(&self) -> Result<&HashMap<(u32, Address), Option<u8>>, ApiError> {
         if let Some(tokens) = self.configured_tokens.get() {
             return Ok(tokens);
         }
 
-        let tokens = self.client.get_all_tokens().map_err(|error| {
-            tracing::error!(%error, "failed to retrieve curated tokens");
-            ApiError::Internal("failed to read the token registry".into())
-        })?;
-        let tokens = tokens
-            .into_values()
-            .filter(|token| token.network.chain_id == crate::CHAIN_ID)
-            .map(|token| (token.address, token.decimals))
+        let tokens = raindex_backed_tokens(self.client)?
+            .into_iter()
+            .map(|token| ((token.network.chain_id, token.address), token.decimals))
             .collect();
         let _ = self.configured_tokens.set(tokens);
         self.configured_tokens.get().ok_or_else(|| {
@@ -359,10 +394,6 @@ impl<'a> RaindexSwapDataSource<'a> {
             ApiError::Internal("failed to read the token registry".into())
         })
     }
-}
-
-fn swap_chain_ids() -> ChainIds {
-    ChainIds(vec![crate::CHAIN_ID])
 }
 
 fn swap_candidates_cache_key(
@@ -394,12 +425,42 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         output_token: Address,
     ) -> Result<(), ApiError> {
         let tokens = self.configured_tokens()?;
-        let input_supported = tokens.contains_key(&input_token);
-        let output_supported = tokens.contains_key(&output_token);
+        let chain_ids = tokens
+            .keys()
+            .filter(|(_, token)| *token == input_token)
+            .map(|(chain_id, _)| *chain_id)
+            .filter(|chain_id| tokens.contains_key(&(*chain_id, output_token)))
+            .collect::<std::collections::HashSet<_>>();
+        if chain_ids.len() != 1 {
+            tracing::warn!(%input_token, %output_token, "swap token pair is missing or ambiguous across configured chains");
+            return Err(ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
+            ));
+        }
+        let chain_id = chain_ids.into_iter().next().ok_or_else(|| {
+            ApiError::coded(
+                ApiErrorCode::SwapUnsupportedToken,
+                "one or both swap tokens are unsupported",
+            )
+        })?;
+        self.validate_supported_tokens_on_chain(chain_id, input_token, output_token)
+            .await
+    }
+
+    async fn validate_supported_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<(), ApiError> {
+        let tokens = self.configured_tokens()?;
+        let input_supported = tokens.contains_key(&(chain_id, input_token));
+        let output_supported = tokens.contains_key(&(chain_id, output_token));
 
         if input_supported && output_supported {
-            configured_token_decimals(tokens, input_token)?;
-            configured_token_decimals(tokens, output_token)?;
+            configured_token_decimals(tokens, chain_id, input_token)?;
+            configured_token_decimals(tokens, chain_id, output_token)?;
             tracing::info!(input_token = %input_token, output_token = %output_token, "validated supported swap tokens");
             return Ok(());
         }
@@ -422,6 +483,29 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         input_token: Address,
         output_token: Address,
     ) -> Result<Vec<RaindexOrder>, ApiError> {
+        let chain_ids = self.client.get_unique_chain_ids().map_err(|error| {
+            tracing::error!(%error, "failed to read configured swap chains");
+            ApiError::Internal("failed to read configured networks".into())
+        })?;
+        let chain_id = match chain_ids.as_slice() {
+            [chain_id] => *chain_id,
+            [] => return Err(ApiError::Internal("no configured networks".into())),
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "chainId is required when multiple networks are configured".into(),
+                ));
+            }
+        };
+        self.get_orders_for_pair_on_chain(chain_id, input_token, output_token)
+            .await
+    }
+
+    async fn get_orders_for_pair_on_chain(
+        &self,
+        chain_id: u32,
+        input_token: Address,
+        output_token: Address,
+    ) -> Result<Vec<RaindexOrder>, ApiError> {
         let filters = GetOrdersFilters {
             active: Some(true),
             tokens: Some(GetOrdersTokenFilter {
@@ -432,7 +516,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
             ..Default::default()
         };
         self.client
-            .get_orders(Some(swap_chain_ids()), Some(filters), None, None)
+            .get_orders(Some(ChainIds(vec![chain_id])), Some(filters), None, None)
             .await
             .map(|r| r.orders().to_vec())
             .map_err(|e| {
@@ -452,8 +536,18 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         counterparty: Address,
     ) -> Result<SwapCandidateBuild, ApiError> {
         let configured_tokens = self.configured_tokens()?;
-        let input_decimals = configured_token_decimals(configured_tokens, input_token)?;
-        let output_decimals = configured_token_decimals(configured_tokens, output_token)?;
+        let chain_id = orders.first().map(RaindexOrder::chain_id).ok_or_else(|| {
+            tracing::error!("cannot build swap candidates without orders");
+            no_liquidity_error()
+        })?;
+        if orders.iter().any(|order| order.chain_id() != chain_id) {
+            tracing::error!("swap candidate orders span multiple chains");
+            return Err(ApiError::Internal(
+                "swap candidate orders span multiple chains".into(),
+            ));
+        }
+        let input_decimals = configured_token_decimals(configured_tokens, chain_id, input_token)?;
+        let output_decimals = configured_token_decimals(configured_tokens, chain_id, output_token)?;
         let fetch = || async {
             let quotes = get_order_quotes_batch_with_injector(
                 orders,
@@ -499,6 +593,15 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         &self,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError> {
+        let chain_id = request.chain_id;
+        self.get_calldata_on_chain(chain_id, request).await
+    }
+
+    async fn get_calldata_on_chain(
+        &self,
+        chain_id: u32,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataResponse, ApiError> {
         let result = self
             .client
             .get_take_orders_calldata(request)
@@ -508,6 +611,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         if let Some(approval_info) = result.approval_info() {
             let formatted_amount = approval_info.formatted_amount().to_string();
             Ok(SwapCalldataResponse {
+                chain_id,
                 to: approval_info.spender(),
                 data: alloy::primitives::Bytes::new(),
                 value: alloy::primitives::U256::ZERO,
@@ -522,7 +626,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 }],
             })
         } else if let Some(take_orders_info) = result.take_orders_info() {
-            swap_calldata_response_from_take_orders_info(&take_orders_info)
+            swap_calldata_response_from_take_orders_info(chain_id, &take_orders_info)
         } else {
             tracing::error!("calldata provider returned an unexpected result state");
             Err(ApiError::coded(
@@ -537,6 +641,41 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         let tokens = raindex_backed_tokens(self.client)?;
+        let chain_ids = tokens
+            .iter()
+            .filter(|token| token_addresses.contains(&token.address))
+            .map(|token| token.network.chain_id)
+            .collect::<std::collections::HashSet<_>>();
+        let chain_id = match chain_ids.len() {
+            0 => {
+                return Err(ApiError::BadRequest(
+                    "unable to resolve token network".into(),
+                ))
+            }
+            1 => chain_ids
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::BadRequest("unable to resolve token network".into()))?,
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "chainId is required when multiple networks are configured".into(),
+                ));
+            }
+        };
+        self.get_wrap_ratios_for_tokens_on_chain(chain_id, token_addresses)
+            .await
+    }
+
+    async fn get_wrap_ratios_for_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        crate::routes::validate_raindex_chain_id(self.client, chain_id)?;
+        let tokens: Vec<_> = raindex_backed_tokens(self.client)?
+            .into_iter()
+            .filter(|token| token.network.chain_id == chain_id)
+            .collect();
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
@@ -545,6 +684,7 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
 }
 
 fn swap_calldata_response_from_take_orders_info(
+    chain_id: u32,
     take_orders_info: &TakeOrdersInfo,
 ) -> Result<SwapCalldataResponse, ApiError> {
     let expected_sell = take_orders_info.expected_sell().format().map_err(|e| {
@@ -556,6 +696,7 @@ fn swap_calldata_response_from_take_orders_info(
     })?;
 
     Ok(SwapCalldataResponse {
+        chain_id,
         to: take_orders_info.raindex(),
         data: take_orders_info.calldata().clone(),
         value: alloy::primitives::U256::ZERO,
@@ -586,6 +727,10 @@ pub(crate) fn ensure_distinct_tokens(
         "swap request rejected: input and output token are identical"
     );
     Err(same_token_error())
+}
+
+pub(crate) fn request_chain_id(chain_id: Option<u32>) -> Result<u32, ApiError> {
+    chain_id.ok_or_else(|| ApiError::BadRequest("chainId is required".into()))
 }
 
 fn same_token_error() -> ApiError {
@@ -678,13 +823,16 @@ pub fn routes_v2() -> Vec<Route> {
     rocket::routes![quote::post_swap_quote_v2, calldata::post_swap_calldata_v2]
 }
 
+pub fn routes_v3() -> Vec<Route> {
+    routes_v2()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_swap_candidates_from_quotes, classify_quote_failure, configured_token_decimals,
         ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
-        swap_calldata_response_from_take_orders_info, swap_candidates_cache_key, swap_chain_ids,
-        SwapQuoteFailure,
+        swap_calldata_response_from_take_orders_info, swap_candidates_cache_key, SwapQuoteFailure,
     };
     use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
@@ -791,17 +939,12 @@ mod tests {
     }
 
     #[test]
-    fn test_swap_orders_are_scoped_to_calldata_chain() {
-        assert_eq!(swap_chain_ids().0, vec![crate::CHAIN_ID]);
-    }
-
-    #[test]
     fn test_missing_configured_token_decimals_fail_closed() {
         let token = address!("ff05e1bd696900dc6a52ca35ca61bb1024eda8e2");
-        let tokens = std::collections::HashMap::from([(token, None)]);
+        let tokens = std::collections::HashMap::from([((8453, token), None)]);
 
         assert!(matches!(
-            configured_token_decimals(&tokens, token),
+            configured_token_decimals(&tokens, 8453, token),
             Err(ApiError::Internal(message))
                 if message == "the token registry is missing required decimals"
         ));
@@ -888,7 +1031,7 @@ mod tests {
         }))
         .expect("deserialize SDK take-orders result");
 
-        let response = swap_calldata_response_from_take_orders_info(&take_orders_info)
+        let response = swap_calldata_response_from_take_orders_info(8453, &take_orders_info)
             .expect("map ready SDK result");
 
         assert_eq!(response.estimated_input, expected_sell);

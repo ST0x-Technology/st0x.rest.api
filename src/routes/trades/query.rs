@@ -83,7 +83,7 @@ impl ValidatedTradesQuery {
 
 #[utoipa::path(
     post,
-    path = "/v1/trades/query",
+    path = "/v2/trades/query",
     tag = "Trades",
     security(("basicAuth" = [])),
     request_body = TradesQueryRequest,
@@ -107,8 +107,9 @@ pub async fn post_trades_query(
     span: TracingSpan,
     request: Json<TradesQueryRequest>,
 ) -> Result<Json<TradesQueryResponse>, ApiError> {
+    let mut request = request.into_inner();
+    request.chain_id = crate::routes::compatibility_chain_id(span.api_version(), request.chain_id);
     async move {
-        let request = request.into_inner();
         tracing::info!(
             chain_id = request.chain_id,
             token_addresses_count = request.token_addresses.len(),

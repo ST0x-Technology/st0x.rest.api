@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::ops::{Div, Mul};
 
 pub(crate) struct CalldataRequestNormalization {
+    pub chain_id: u32,
     pub denomination: SwapDenomination,
     pub input_token: Address,
     pub output_token: Address,
@@ -20,6 +21,7 @@ pub(crate) struct CalldataRequestNormalization {
 }
 
 pub(crate) struct CalldataAmountNormalization {
+    pub chain_id: u32,
     pub denomination: SwapDenomination,
     pub input_token: Address,
     pub output_token: Address,
@@ -30,6 +32,7 @@ pub(crate) struct CalldataAmountNormalization {
 
 pub(crate) async fn normalize_quote_amounts(
     ds: &dyn SwapDataSource,
+    chain_id: u32,
     denomination: SwapDenomination,
     input_token: Address,
     output_token: Address,
@@ -41,7 +44,7 @@ pub(crate) async fn normalize_quote_amounts(
         SwapDenomination::Unwrapped => {
             tracing::info!("normalizing swap quote response to unwrapped denomination");
             let ratios = ds
-                .get_wrap_ratios_for_tokens(&[input_token, output_token])
+                .get_wrap_ratios_for_tokens_on_chain(chain_id, &[input_token, output_token])
                 .await?;
 
             let converted_input =
@@ -66,6 +69,7 @@ pub(crate) async fn normalize_calldata_request_values(
     let (amount, ratios) = normalize_calldata_request_amount(
         ds,
         CalldataAmountNormalization {
+            chain_id: req.chain_id,
             denomination,
             input_token,
             output_token,
@@ -96,7 +100,7 @@ pub(crate) async fn normalize_calldata_request_amount(
 
     tracing::info!("normalizing swap calldata request to wrapped denomination");
     let ratios = ds
-        .get_wrap_ratios_for_tokens(&[req.input_token, req.output_token])
+        .get_wrap_ratios_for_tokens_on_chain(req.chain_id, &[req.input_token, req.output_token])
         .await?;
     let input_is_wrapped = ratios.contains_key(&req.input_token);
     let output_is_wrapped = ratios.contains_key(&req.output_token);

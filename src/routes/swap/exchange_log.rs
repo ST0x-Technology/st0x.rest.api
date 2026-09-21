@@ -50,6 +50,14 @@ impl SwapExchangeLog {
     }
 
     pub(super) fn record<T: Serialize>(&self, result: &Result<T, ApiError>) {
+        self.record_borrowed(result.as_ref());
+    }
+
+    pub(super) fn record_error(&self, error: &ApiError) {
+        self.record_borrowed::<()>(Err(error));
+    }
+
+    fn record_borrowed<T: Serialize>(&self, result: Result<&T, &ApiError>) {
         let (outcome, status_code, response) = match result {
             Ok(response) => ("success", 200, serialize_payload("response", response)),
             Err(error) => {
@@ -129,12 +137,14 @@ mod tests {
     #[traced_test]
     fn records_complete_quote_request_and_response() {
         let request = SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token: INPUT_TOKEN,
             output_token: OUTPUT_TOKEN,
             output_amount: "0.5".to_string(),
             denomination: SwapDenomination::Wrapped,
         };
         let response = SwapQuoteResponse {
+            chain_id: 8453,
             input_token: INPUT_TOKEN,
             output_token: OUTPUT_TOKEN,
             output_amount: "0.5".to_string(),
@@ -169,6 +179,7 @@ mod tests {
     #[traced_test]
     fn records_complete_calldata_response() {
         let request = SwapCalldataRequest {
+            chain_id: Some(8453),
             taker: TAKER,
             input_token: INPUT_TOKEN,
             output_token: OUTPUT_TOKEN,
@@ -177,6 +188,7 @@ mod tests {
             denomination: SwapDenomination::Wrapped,
         };
         let response = SwapCalldataResponse {
+            chain_id: 8453,
             to: OUTPUT_TOKEN,
             data: bytes!("abcdef"),
             value: U256::ZERO,
@@ -207,6 +219,7 @@ mod tests {
     #[traced_test]
     fn records_the_exact_public_error_response() {
         let request = SwapQuoteRequest {
+            chain_id: Some(8453),
             input_token: INPUT_TOKEN,
             output_token: OUTPUT_TOKEN,
             output_amount: "0.5".to_string(),
@@ -223,10 +236,11 @@ mod tests {
             &request,
         );
 
-        exchange.record::<SwapQuoteResponse>(&Err(ApiError::coded(
+        let error = ApiError::coded(
             ApiErrorCode::SwapNoLiquidity,
             "no executable liquidity found",
-        )));
+        );
+        exchange.record_error(&error);
 
         assert!(logs_contain("request-error"));
         assert!(logs_contain("SWAP_NO_LIQUIDITY"));

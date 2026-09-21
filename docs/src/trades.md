@@ -5,7 +5,7 @@ Track trade execution for your orders.
 ## Trades by Address
 
 ```
-GET /v1/trades/{address}
+GET /v2/trades/{address}
 ```
 
 Paginated list of trades associated with a wallet address.
@@ -13,17 +13,18 @@ Paginated list of trades associated with a wallet address.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/trades/0xYourAddress?page=1&pageSize=20" \
+curl "https://api.st0x.io/v2/trades/0xYourAddress?chainId=8453&page=1&pageSize=20" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter      | Type                     | Default   | Description                                                                                                                  |
-| -------------- | ------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `page`         | number                   | 1         | Page number                                                                                                                  |
-| `pageSize`     | number                   | 20        | Results per page                                                                                                             |
-| `startTime`    | number                   | -         | Filter: only trades after this Unix timestamp                                                                                |
-| `endTime`      | number                   | -         | Filter: only trades before this Unix timestamp                                                                               |
-| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize observed wrapped token amounts and IO ratios to their unwrapped asset value |
+| Parameter      | Type                     | Default      | Description                                                                                                                  |
+| -------------- | ------------------------ | ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`      | number                   | all networks | Optional network filter                                                                                                      |
+| `page`         | number                   | 1            | Page number                                                                                                                  |
+| `pageSize`     | number                   | 20           | Results per page                                                                                                             |
+| `startTime`    | number                   | -            | Filter: only trades after this Unix timestamp                                                                                |
+| `endTime`      | number                   | -            | Filter: only trades before this Unix timestamp                                                                               |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped`    | Return wrapped token amounts as-is, or normalize observed wrapped token amounts and IO ratios to their unwrapped asset value |
 
 When `denomination=unwrapped`, amount and IO ratio fields are normalized from
 the wrapped token value using the current wrapped exchange rate. This is a
@@ -38,6 +39,7 @@ wrapped-denomination values from endpoints that were called without
 {
   "trades": [
     {
+      "chainId": 8453,
       "txHash": "0x...",
       "inputAmount": "2000.0",
       "outputAmount": "0.8",
@@ -63,14 +65,14 @@ wrapped-denomination values from endpoints that were called without
 To get trades within a specific window:
 
 ```bash
-curl "https://api.st0x.io/v1/trades/0xYourAddress?startTime=1708000000&endTime=1708100000" \
+curl "https://api.st0x.io/v2/trades/0xYourAddress?chainId=8453&startTime=1708000000&endTime=1708100000" \
   -H "Authorization: Basic <credentials>"
 ```
 
 ## Trades by Transaction
 
 ```
-GET /v1/trades/tx/{tx_hash}
+GET /v2/trades/tx/{tx_hash}
 ```
 
 Detailed breakdown of all trades within a specific transaction, including
@@ -79,24 +81,27 @@ per-trade request/result and aggregate totals.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/trades/tx/0xTxHash...?denomination=unwrapped" \
+curl "https://api.st0x.io/v2/trades/tx/0xTxHash...?chainId=8453&denomination=unwrapped" \
   -H "Authorization: Basic <credentials>"
 ```
 
-| Parameter      | Type                     | Default   | Description                                                                                                                           |
-| -------------- | ------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `denomination` | `wrapped` or `unwrapped` | `wrapped` | Return wrapped token amounts as-is, or normalize observed wrapped token amounts, IO ratios, and totals to their unwrapped asset value |
+| Parameter      | Type                     | Default            | Description                                                                                                                           |
+| -------------- | ------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`      | number                   | configured network | Required when multiple networks are configured                                                                                        |
+| `denomination` | `wrapped` or `unwrapped` | `wrapped`          | Return wrapped token amounts as-is, or normalize observed wrapped token amounts, IO ratios, and totals to their unwrapped asset value |
 
 ### Response
 
 ```json
 {
+  "chainId": 8453,
   "txHash": "0xTxHash...",
   "blockNumber": 12345678,
   "timestamp": 1708010000,
   "sender": "0xSolverAddress",
   "trades": [
     {
+      "chainId": 8453,
       "orderHash": "0xabc123...",
       "orderOwner": "0xOwnerAddress",
       "request": {
@@ -130,18 +135,18 @@ exchange-rate history is incorporated into the trade response path.
 The same denomination behavior is supported by the other trade endpoints:
 
 ```text
-GET /v1/trades/token/{address}?denomination=unwrapped
-GET /v1/trades/taker/{address}?denomination=unwrapped
-POST /v1/trades/query
+GET /v2/trades/token/{address}?chainId=8453&denomination=unwrapped
+GET /v2/trades/taker/{address}?chainId=8453&denomination=unwrapped
+POST /v2/trades/query
 ```
 
-For `POST /v1/trades/query`, include `"denomination": "unwrapped"` in the JSON
+For `POST /v2/trades/query`, include `"denomination": "unwrapped"` in the JSON
 body with `orderHashes`, `startTime`, and `endTime`.
 
 ## Batch Trade Query
 
 ```
-POST /v1/trades/query
+POST /v2/trades/query
 ```
 
 The route has two explicitly typed modes within one backward-compatible

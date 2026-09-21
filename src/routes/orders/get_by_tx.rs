@@ -2,7 +2,7 @@ use crate::auth::AuthenticatedKey;
 use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::types::common::ValidatedFixedBytes;
-use crate::types::orders::OrdersByTxResponse;
+use crate::types::orders::{OrdersByTxParams, OrdersByTxResponse};
 use rocket::serde::json::Json;
 use rocket::State;
 use tracing::Instrument;
@@ -14,6 +14,7 @@ use tracing::Instrument;
     security(("basicAuth" = [])),
     params(
         ("tx_hash" = String, Path, description = "Transaction hash"),
+        OrdersByTxParams,
     ),
     responses(
         (status = 200, description = "Orders from transaction", body = OrdersByTxResponse),
@@ -24,17 +25,23 @@ use tracing::Instrument;
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     )
 )]
-#[get("/tx/<tx_hash>")]
+#[get("/tx/<tx_hash>?<params..>")]
 pub async fn get_orders_by_tx(
     _global: GlobalRateLimit,
     _key: AuthenticatedKey,
     shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
     span: TracingSpan,
     tx_hash: ValidatedFixedBytes,
+    params: OrdersByTxParams,
 ) -> Result<Json<OrdersByTxResponse>, ApiError> {
+    let requested_chain_id =
+        crate::routes::compatibility_chain_id(span.api_version(), params.chain_id);
     async move {
         tracing::info!(tx_hash = ?tx_hash, "request received");
-        let _raindex = shared_raindex.read().await;
+        let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_raindex_chain_id(raindex.client(), requested_chain_id)?;
+        tracing::info!(chain_id, "resolved required Raindex chain");
         todo!()
     }
     .instrument(span.0)

@@ -26,8 +26,6 @@ mod telemetry;
 mod types;
 mod wrap_ratio;
 
-pub(crate) const CHAIN_ID: u32 = 8453;
-
 #[cfg(test)]
 mod test_helpers;
 
@@ -37,6 +35,7 @@ use rocket_cors::{AllowedHeaders, AllowedMethods, AllowedOrigins, CorsOptions};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::Ref;
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -50,6 +49,119 @@ impl Modify for SecurityAddon {
                 "Use your API key as the username and API secret as the password.".to_string(),
             );
             components.add_security_scheme("basicAuth", SecurityScheme::Http(scheme));
+        }
+    }
+}
+
+struct V1CompatibilityAddon;
+struct V3SwapAddon;
+
+const V1_COMPATIBILITY_PATHS: [(&str, &str); 21] = [
+    ("/v2/tokens", "/v1/tokens"),
+    ("/v2/tokens/wrap-ratio", "/v1/tokens/wrap-ratio"),
+    (
+        "/v2/tokens/wrap-ratio/{address}",
+        "/v1/tokens/wrap-ratio/{address}",
+    ),
+    (
+        "/v2/tokens/wrap-ratio/{address}/history",
+        "/v1/tokens/wrap-ratio/{address}/history",
+    ),
+    ("/v2/tokens/details", "/v1/tokens/details"),
+    (
+        "/v2/tokens/{address}/details",
+        "/v1/tokens/{address}/details",
+    ),
+    ("/v2/tokens/{address}/proofs", "/v1/tokens/{address}/proofs"),
+    ("/v2/prices", "/v1/prices"),
+    (
+        "/v2/prices/{address}/history",
+        "/v1/prices/{address}/history",
+    ),
+    ("/v2/order/{order_hash}", "/v1/order/{order_hash}"),
+    ("/v2/order/cancel", "/v1/order/cancel"),
+    ("/v2/orders/owner/{address}", "/v1/orders/owner/{address}"),
+    ("/v2/orders/token/{address}", "/v1/orders/token/{address}"),
+    ("/v2/orders/query", "/v1/orders/query"),
+    ("/v2/vaults", "/v1/vaults"),
+    ("/v2/vaults/totals", "/v1/vaults/totals"),
+    ("/v2/trades/tx/{tx_hash}", "/v1/trades/tx/{tx_hash}"),
+    ("/v2/trades/token/{address}", "/v1/trades/token/{address}"),
+    ("/v2/trades/taker/{address}", "/v1/trades/taker/{address}"),
+    ("/v2/trades/{address}", "/v1/trades/{address}"),
+    ("/v2/trades/query", "/v1/trades/query"),
+];
+
+impl Modify for V1CompatibilityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for (v2_path, v1_path) in V1_COMPATIBILITY_PATHS {
+            let Some(mut path_item) = openapi.paths.paths.get(v2_path).cloned() else {
+                tracing::error!(
+                    v2_path,
+                    v1_path,
+                    "OpenAPI V1 compatibility source path missing"
+                );
+                continue;
+            };
+
+            for operation in [
+                &mut path_item.get,
+                &mut path_item.put,
+                &mut path_item.post,
+                &mut path_item.delete,
+                &mut path_item.options,
+                &mut path_item.head,
+                &mut path_item.patch,
+                &mut path_item.trace,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                operation.operation_id = operation
+                    .operation_id
+                    .as_ref()
+                    .map(|operation_id| format!("{operation_id}_v1"));
+            }
+
+            openapi.paths.paths.insert(v1_path.to_string(), path_item);
+        }
+    }
+}
+
+impl Modify for V3SwapAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for (v2_path, v3_path, request_schema) in [
+            ("/v2/swap/quote", "/v3/swap/quote", "SwapQuoteV3RequestBody"),
+            (
+                "/v2/swap/calldata",
+                "/v3/swap/calldata",
+                "SwapCalldataV3RequestBody",
+            ),
+        ] {
+            let Some(mut path_item) = openapi.paths.paths.get(v2_path).cloned() else {
+                tracing::error!(v2_path, v3_path, "OpenAPI V3 swap source path missing");
+                continue;
+            };
+            if let Some(operation) = path_item.post.as_mut() {
+                operation.operation_id = operation
+                    .operation_id
+                    .as_ref()
+                    .map(|operation_id| format!("{operation_id}_v3"));
+                let compatibility_note =
+                    "chainId is required. Requests without it are rejected; no network is inferred.";
+                operation.description = Some(match operation.description.take() {
+                    Some(description) => format!("{description}\n\n{compatibility_note}"),
+                    None => compatibility_note.to_string(),
+                });
+                if let Some(content) = operation
+                    .request_body
+                    .as_mut()
+                    .and_then(|body| body.content.get_mut("application/json"))
+                {
+                    content.schema = Some(Ref::from_schema_name(request_schema).into());
+                }
+            }
+            openapi.paths.paths.insert(v3_path.to_string(), path_item);
         }
     }
 }
@@ -149,8 +261,11 @@ enum StartupRegistryError {
         routes::registry::get_registry,
         routes::registry::get_registry_history,
     ),
-    components(),
-    modifiers(&SecurityAddon),
+    components(schemas(
+        types::swap::SwapQuoteV3RequestBody,
+        types::swap::SwapCalldataV3RequestBody,
+    )),
+    modifiers(&SecurityAddon, &V1CompatibilityAddon, &V3SwapAddon),
     tags(
         (name = "Health", description = "Health check endpoints"),
         (name = "Tokens", description = "Token information endpoints"),
@@ -236,13 +351,20 @@ pub(crate) fn rocket(
         .manage(swap_capacity)
         .mount("/", routes::health::routes())
         .mount("/v1/tokens", routes::tokens::routes())
+        .mount("/v2/tokens", routes::tokens::routes_v2())
         .mount("/v1/prices", routes::prices::routes())
+        .mount("/v2/prices", routes::prices::routes_v2())
         .mount("/v1/swap", routes::swap::routes())
         .mount("/v2/swap", routes::swap::routes_v2())
+        .mount("/v3/swap", routes::swap::routes_v3())
         .mount("/v1/order", routes::order::routes())
+        .mount("/v2/order", routes::order::routes_v2())
         .mount("/v1/orders", routes::orders::routes())
+        .mount("/v2/orders", routes::orders::routes_v2())
         .mount("/v1/vaults", routes::vaults::routes())
+        .mount("/v2/vaults", routes::vaults::routes_v2())
         .mount("/v1/trades", routes::trades::routes())
+        .mount("/v2/trades", routes::trades::routes_v2())
         .mount("/", routes::registry::routes())
         .mount("/admin", routes::admin::routes())
         .mount("/admin/attribution", routes::attribution_admin::routes())
@@ -474,6 +596,21 @@ async fn main() {
                     }
                 };
 
+            let attribution_chain_ids =
+                match routes::configured_chain_ids(raindex_config.raindex_yaml()) {
+                    Ok(chain_ids) if !chain_ids.is_empty() => chain_ids,
+                    Ok(_) => {
+                        tracing::error!("registry has no configured networks");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to resolve configured networks");
+                        drop(log_guard);
+                        std::process::exit(1);
+                    }
+                };
+
             let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
@@ -579,6 +716,7 @@ async fn main() {
                 rocket = rocket.attach(attribution_reporting::AttributionWorker::new(
                     attribution_pool,
                     std::path::PathBuf::from(&cfg.local_db_path),
+                    attribution_chain_ids,
                     attribution_signer_address,
                     start_block,
                     std::time::Duration::from_secs(cfg.attribution_sync_interval_seconds.max(1)),
@@ -625,14 +763,27 @@ mod tests {
     }
 
     #[test]
+    fn test_v2_routes_exclude_unimplemented_v1_handlers() {
+        let order_routes = crate::routes::order::routes_v2();
+        assert!(order_routes
+            .iter()
+            .all(|route| route.uri.path() != "/dca" && route.uri.path() != "/solver"));
+
+        let orders_routes = crate::routes::orders::routes_v2();
+        assert!(orders_routes
+            .iter()
+            .all(|route| route.uri.path() != "/tx/<tx_hash>"));
+    }
+
+    #[test]
     fn test_openapi_includes_token_proofs_schema() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
-        let proofs_path = &openapi["paths"]["/v1/tokens/{address}/proofs"]["get"];
         let swap_quote_v1_path = &openapi["paths"]["/v1/swap/quote"]["post"];
+        let proofs_path = &openapi["paths"]["/v2/tokens/{address}/proofs"]["get"];
         let swap_quote_v2_path = &openapi["paths"]["/v2/swap/quote"]["post"];
         let swap_calldata_v2_path = &openapi["paths"]["/v2/swap/calldata"]["post"];
-        let orders_query_path = &openapi["paths"]["/v1/orders/query"]["post"];
-        let trades_query_path = &openapi["paths"]["/v1/trades/query"]["post"];
+        let orders_query_path = &openapi["paths"]["/v2/orders/query"]["post"];
+        let trades_query_path = &openapi["paths"]["/v2/trades/query"]["post"];
 
         assert_eq!(proofs_path["tags"][0], "Tokens");
         assert_eq!(
@@ -765,9 +916,94 @@ mod tests {
     }
 
     #[test]
+    fn test_openapi_includes_v1_compatibility_paths() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+
+        for (v2_path, v1_path) in super::V1_COMPATIBILITY_PATHS {
+            assert!(
+                openapi["paths"][v2_path].is_object(),
+                "missing V2 compatibility source path {v2_path}"
+            );
+            for method in ["get", "post", "put", "delete", "patch"] {
+                let Some(v2_operation) = openapi["paths"][v2_path][method].as_object() else {
+                    continue;
+                };
+                let v1_operation = openapi["paths"][v1_path][method]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("missing {method} operation for {v1_path}"));
+
+                let mut expected_v1 = v2_operation.clone();
+                if let Some(operation_id) = v2_operation
+                    .get("operationId")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    expected_v1.insert(
+                        "operationId".to_string(),
+                        serde_json::Value::String(format!("{operation_id}_v1")),
+                    );
+                }
+                assert_eq!(*v1_operation, expected_v1, "OpenAPI mismatch for {v1_path}");
+            }
+        }
+
+        for (v1_path, v2_path) in [
+            ("/v1/order/dca", "/v2/order/dca"),
+            ("/v1/order/solver", "/v2/order/solver"),
+            ("/v1/orders/tx/{tx_hash}", "/v2/orders/tx/{tx_hash}"),
+        ] {
+            assert!(openapi["paths"][v1_path].is_object());
+            assert!(openapi["paths"][v2_path].is_null());
+        }
+    }
+
+    #[test]
+    fn test_openapi_includes_strict_v3_swap_paths() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+
+        for (path, schema_name) in [
+            ("/v3/swap/quote", "SwapQuoteV3RequestBody"),
+            ("/v3/swap/calldata", "SwapCalldataV3RequestBody"),
+        ] {
+            let operation = &openapi["paths"][path]["post"];
+            assert!(operation.is_object(), "missing V3 swap path {path}");
+            assert!(operation["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("chainId is required")));
+            assert!(operation["operationId"]
+                .as_str()
+                .is_some_and(|operation_id| operation_id.ends_with("_v3")));
+            assert_eq!(
+                operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema_name}")
+            );
+
+            let required = openapi["components"]["schemas"][schema_name]["allOf"][1]["required"]
+                .as_array()
+                .expect("V3 request schema has required fields");
+            assert!(required.iter().any(|field| field == "chainId"));
+        }
+    }
+
+    #[test]
+    fn test_openapi_documents_multichain_list_validation_errors() {
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
+
+        for path in [
+            "/v2/tokens/wrap-ratio",
+            "/v2/tokens/details",
+            "/v2/vaults/totals",
+        ] {
+            assert_eq!(
+                openapi["paths"][path]["get"]["responses"]["400"]["description"],
+                "Unsupported chainId"
+            );
+        }
+    }
+
+    #[test]
     fn test_openapi_documents_token_details_activity_limit() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
-        let details_path = &openapi["paths"]["/v1/tokens/{address}/details"]["get"];
+        let details_path = &openapi["paths"]["/v2/tokens/{address}/details"]["get"];
         let parameters = details_path["parameters"]
             .as_array()
             .expect("parameters is an array");
@@ -775,6 +1011,9 @@ mod tests {
         assert!(parameters
             .iter()
             .any(|parameter| parameter["name"] == "activityLimit"));
+        assert!(parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "chainId"));
         assert!(!parameters
             .iter()
             .any(|parameter| parameter["name"] == "activity_limit"));
