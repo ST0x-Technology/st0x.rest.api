@@ -36,6 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_ORDER_PAGES: u16 = 1_000;
 const MAX_PRICE_MARKET_CONCURRENCY: usize = 4;
 const USDC_SYMBOL: &str = "USDC";
+const MARKET_QUOTE_EXTENSION: &str = "marketQuote";
 
 #[derive(Debug, Clone)]
 pub(crate) struct MarketPriceConfig {
@@ -499,24 +500,40 @@ fn discover_price_markets(
             .filter(|token| token.network.chain_id == chain_id)
             .cloned()
             .collect::<Vec<_>>();
-        let quote_tokens = tokens
+        let configured_quote_tokens = tokens
             .iter()
             .filter(|token| {
                 token.network.chain_id == chain_id
                     && token
-                        .symbol
-                        .as_deref()
-                        .is_some_and(|symbol| symbol.eq_ignore_ascii_case(USDC_SYMBOL))
+                        .extensions
+                        .as_ref()
+                        .and_then(|extensions| extensions.get(MARKET_QUOTE_EXTENSION))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
             })
             .collect::<Vec<_>>();
+        let quote_tokens = if configured_quote_tokens.is_empty() {
+            tokens
+                .iter()
+                .filter(|token| {
+                    token.network.chain_id == chain_id
+                        && token
+                            .symbol
+                            .as_deref()
+                            .is_some_and(|symbol| symbol.eq_ignore_ascii_case(USDC_SYMBOL))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            configured_quote_tokens
+        };
         let quote_token_address = match quote_tokens.as_slice() {
             [token] => token.address,
             [] => {
-                tracing::error!(chain_id, "registry has no USDC quote token");
+                tracing::error!(chain_id, "registry has no market quote token");
                 errors.push((
                     chain_id,
                     ApiError::Internal(format!(
-                        "USDC quote token is not configured for chain {chain_id}"
+                        "market quote token is not configured for chain {chain_id}"
                     )),
                 ));
                 continue;
@@ -525,12 +542,12 @@ fn discover_price_markets(
                 tracing::error!(
                     chain_id,
                     quote_token_count = quote_tokens.len(),
-                    "registry has ambiguous USDC quote tokens"
+                    "registry has ambiguous market quote tokens"
                 );
                 errors.push((
                     chain_id,
                     ApiError::Internal(format!(
-                        "USDC quote token is ambiguous for chain {chain_id}"
+                        "market quote token is ambiguous for chain {chain_id}"
                     )),
                 ));
                 continue;
@@ -1560,5 +1577,44 @@ mod tests {
         assert_eq!(discovery.markets[0].chain_id, 8453);
         assert_eq!(discovery.errors.len(), 1);
         assert_eq!(discovery.errors[0].0, 10);
+    }
+
+    #[test]
+    fn uses_registry_market_quote_token_when_it_is_not_usdc() {
+        let mut quote = registry_token(4663, QUOTE, "USDG", false);
+        quote.extensions = Some(HashMap::from([(
+            MARKET_QUOTE_EXTENSION.to_string(),
+            json!(true),
+        )]));
+
+        let discovery = discover_price_markets(
+            vec![registry_token(4663, ASSET, "wtTEST", true), quote],
+            &[4663],
+        );
+
+        assert!(discovery.errors.is_empty());
+        assert_eq!(discovery.markets.len(), 1);
+        assert_eq!(discovery.markets[0].quote_token_address, QUOTE);
+    }
+
+    #[test]
+    fn configured_market_quote_takes_precedence_over_usdc_fallback() {
+        let mut configured_quote = registry_token(4663, QUOTE, "USDG", false);
+        configured_quote.extensions = Some(HashMap::from([(
+            MARKET_QUOTE_EXTENSION.to_string(),
+            json!(true),
+        )]));
+
+        let discovery = discover_price_markets(
+            vec![
+                registry_token(4663, ASSET, "wtTEST", true),
+                configured_quote,
+                registry_token(4663, ASSET_TWO, "USDC", false),
+            ],
+            &[4663],
+        );
+
+        assert!(discovery.errors.is_empty());
+        assert_eq!(discovery.markets[0].quote_token_address, QUOTE);
     }
 }

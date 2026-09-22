@@ -10,7 +10,8 @@ The `Authorization` header uses the standard Basic scheme:
 Authorization: Basic <base64(key_id:secret)>
 ```
 
-Where `key_id:secret` is your API key ID and secret separated by a colon, Base64-encoded.
+Where `key_id:secret` is your API key ID and secret separated by a colon,
+Base64-encoded.
 
 ## Example
 
@@ -22,21 +23,22 @@ echo -n "abc123:mysecret" | base64
 # Output: YWJjMTIzOm15c2VjcmV0
 
 # Use in a request
-curl https://api.st0x.io/v1/tokens \
+curl "https://api.st0x.io/v2/tokens?chainId=8453" \
   -H "Authorization: Basic YWJjMTIzOm15c2VjcmV0"
 ```
 
-Most HTTP client libraries handle Basic Auth natively. For example, with curl's `-u` flag:
+Most HTTP client libraries handle Basic Auth natively. For example, with curl's
+`-u` flag:
 
 ```bash
-curl -u "abc123:mysecret" https://api.st0x.io/v1/tokens
+curl -u "abc123:mysecret" "https://api.st0x.io/v2/tokens?chainId=8453"
 ```
 
 ## Error Responses
 
-| Status | Code | When |
-|--------|------|------|
-| 401 | `UNAUTHORIZED` | Missing or invalid credentials |
+| Status | Code           | When                           |
+| ------ | -------------- | ------------------------------ |
+| 401    | `UNAUTHORIZED` | Missing or invalid credentials |
 
 ```json
 {

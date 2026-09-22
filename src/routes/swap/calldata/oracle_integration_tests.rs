@@ -471,6 +471,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     let attribution = attribution_state.for_api_key("customer-key", owner);
     let data_source = RaindexSwapDataSource::new(&client, &caches, &pool);
     let request = SwapCalldataRequest {
+        chain_id: Some(8453),
         taker: owner,
         input_token: input_address,
         output_token: output_address,
@@ -534,6 +535,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
 
     let v2_attribution = attribution_state.for_api_key("customer-key", owner);
     let v2_request = SwapCalldataV2Request {
+        chain_id: Some(8453),
         taker: owner,
         input_token: input_address,
         output_token: output_address,

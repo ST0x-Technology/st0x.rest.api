@@ -28,10 +28,14 @@ pub async fn post_order_solver(
     span: TracingSpan,
     request: Json<DeploySolverOrderRequest>,
 ) -> Result<Json<DeployOrderResponse>, ApiError> {
-    let req = request.into_inner();
+    let mut req = request.into_inner();
+    req.chain_id = crate::routes::compatibility_chain_id(span.api_version(), req.chain_id);
     async move {
         tracing::info!(body = ?req, "request received");
-        let _raindex = shared_raindex.read().await;
+        let raindex = shared_raindex.read().await;
+        let chain_id =
+            crate::routes::resolve_required_raindex_chain_id(raindex.client(), req.chain_id)?;
+        tracing::info!(chain_id, "resolved required Raindex chain");
         todo!()
     }
     .instrument(span.0)

@@ -5,17 +5,18 @@ Discover available tokens before making swaps or deploying orders.
 ## List Tokens
 
 ```
-GET /v1/tokens
+GET /v2/tokens
 ```
 
-Returns all tokens from every network in the active registry. Use
-`network.chainId` together with `address` as the token identity; the same
+Returns tokens from the networks configured in the active registry. Pass
+`chainId` to select one network; omit it to list every configured network. Use
+`network.chainId` together with `address` as the token identity because the same
 address can exist on more than one network.
 
 ### Request
 
 ```bash
-curl https://api.st0x.io/v1/tokens \
+curl "https://api.st0x.io/v2/tokens?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 
@@ -84,15 +85,16 @@ Use the `address` field when specifying tokens in swap and order requests.
 ## Wrapped Token Ratios
 
 ```
-GET /v1/tokens/wrap-ratio
-GET /v1/tokens/wrap-ratio/{address}
-GET /v1/tokens/wrap-ratio/{address}/history
+GET /v2/tokens/wrap-ratio
+GET /v2/tokens/wrap-ratio/{address}
+GET /v2/tokens/wrap-ratio/{address}/history
 ```
 
 Returns ERC4626 wrapped-token ratios for registry tokens where
 `extensions.category` is `ST0x`. For the single-token endpoint, `{address}` must
 be the wrapped token / ERC4626 vault address. Symbol lookup is not supported.
-Pass `chainId` when that address exists on multiple registry networks.
+The batch endpoint accepts optional `chainId`; address and history endpoints
+require it when the address exists on multiple registry networks.
 
 ### Batch Response
 
@@ -174,15 +176,17 @@ Query parameters:
 ## Token Details
 
 ```
-GET /v1/tokens/details
-GET /v1/tokens/{address}/details
+GET /v2/tokens/details
+GET /v2/tokens/{address}/details
 ```
 
 Returns ST0x token supply, holder, transfer, and bridging activity data from the
 configured SFT subgraph. `{address}` can be the current wrapped token address,
 the token's `extensions.unwrappedAddress`, or its `extensions.legacyAddress`
 when one is present. The response always normalizes `address` to the current
-wrapped token address from the registry.
+wrapped token address from the registry. The list accepts optional `chainId`;
+the address endpoint requires it when the address exists on multiple registry
+networks.
 
 The batch endpoint returns successful rows in `data` and per-token failures in
 `errors`. One failed token does not fail the whole response. Every row includes
@@ -278,13 +282,13 @@ The batch endpoint returns successful rows in `data` and per-token failures in
 | `activity`       | object | Recent deposit and withdraw rows only; transfer rows are not returned |
 
 Aggregate counts and volumes come from the configured SFT subgraph and are
-cached for 5 minutes. The batch `/v1/tokens/details` response is also cached for
+cached for 5 minutes. The batch `/v2/tokens/details` response is also cached for
 5 minutes for landing/sidebar usage. Full holder lists are not returned.
 
 ## Token Proofs
 
 ```
-GET /v1/tokens/{address}/proofs
+GET /v2/tokens/{address}/proofs
 ```
 
 Returns the raw proof data for a supported ST0x token. `{address}` can be the
@@ -300,7 +304,7 @@ Rain metadata prefixes, decode CBOR, or parse schema hashes.
 ### Request
 
 ```bash
-curl "https://api.st0x.io/v1/tokens/0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2/proofs?chainId=8453" \
+curl "https://api.st0x.io/v2/tokens/0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2/proofs?chainId=8453" \
   -H "Authorization: Basic <credentials>"
 ```
 

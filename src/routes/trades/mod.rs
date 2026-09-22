@@ -5,7 +5,7 @@ pub(crate) mod get_by_tx;
 pub(crate) mod query;
 
 use crate::error::{ApiError, ApiErrorCode};
-use crate::routes::{raindex_backed_tokens, required_raindex_chain_ids};
+use crate::routes::{raindex_backed_tokens, required_raindex_chain_ids, resolve_raindex_chain_ids};
 use crate::types::common::{Denomination, TokenRef};
 use crate::types::trades::{
     TradeByAddress, TradesByAddressResponse, TradesPagination, TradesPaginationParams,
@@ -24,13 +24,21 @@ use rain_orderbook_common::raindex_client::types::{ChainIds, PaginationParams, T
 use rain_orderbook_common::raindex_client::{RaindexClient, RaindexError};
 use rocket::serde::json::Json;
 use rocket::Route;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-pub(crate) type TradeWrapRatioMap = HashMap<(Address, u64), WrapRatioValue>;
+pub(crate) type TradeWrapRatioMap = HashMap<(u32, Address, u64), WrapRatioValue>;
 
 #[async_trait]
 pub(crate) trait TradesDataSource: Send + Sync {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError>;
+
+    async fn get_trades_by_tx_for_chains(
+        &self,
+        _chain_ids: Option<Vec<u32>>,
+        tx_hash: B256,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.get_trades_by_tx(tx_hash).await
+    }
 
     async fn get_trades_for_owner(
         &self,
@@ -38,6 +46,17 @@ pub(crate) trait TradesDataSource: Send + Sync {
         pagination: PaginationParams,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
+
+    async fn get_trades_for_owner_on_chains(
+        &self,
+        _chain_ids: Option<Vec<u32>>,
+        owner: Address,
+        pagination: PaginationParams,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.get_trades_for_owner(owner, pagination, time_filter)
+            .await
+    }
 
     async fn get_trades_for_token(
         &self,
@@ -47,6 +66,18 @@ pub(crate) trait TradesDataSource: Send + Sync {
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
 
+    async fn get_trades_for_token_on_chains(
+        &self,
+        _chain_ids: Option<Vec<u32>>,
+        token: Address,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.get_trades_for_token(token, page, page_size, time_filter)
+            .await
+    }
+
     async fn get_trades_for_taker(
         &self,
         taker: Address,
@@ -55,11 +86,32 @@ pub(crate) trait TradesDataSource: Send + Sync {
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError>;
 
+    async fn get_trades_for_taker_on_chains(
+        &self,
+        _chain_ids: Option<Vec<u32>>,
+        taker: Address,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        self.get_trades_for_taker(taker, page, page_size, time_filter)
+            .await
+    }
+
     async fn get_current_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         Ok(HashMap::new())
+    }
+
+    async fn get_current_wrap_ratios_for_tokens_on_chain(
+        &self,
+        _chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        self.get_current_wrap_ratios_for_tokens(token_addresses)
+            .await
     }
 }
 
@@ -89,7 +141,15 @@ pub(crate) struct RaindexTradesDataSource<'a> {
 #[async_trait]
 impl TradesDataSource for RaindexTradesDataSource<'_> {
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError> {
-        let chain_ids = required_raindex_chain_ids(self.client)?;
+        self.get_trades_by_tx_for_chains(None, tx_hash).await
+    }
+
+    async fn get_trades_by_tx_for_chains(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        tx_hash: B256,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = resolve_raindex_chain_ids(self.client, chain_ids)?;
         self.client
             .get_trades_for_transaction(Some(ChainIds(chain_ids)), None, tx_hash)
             .await
@@ -112,7 +172,18 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         pagination: PaginationParams,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
-        let chain_ids = required_raindex_chain_ids(self.client)?;
+        self.get_trades_for_owner_on_chains(None, owner, pagination, time_filter)
+            .await
+    }
+
+    async fn get_trades_for_owner_on_chains(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        owner: Address,
+        pagination: PaginationParams,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = resolve_raindex_chain_ids(self.client, chain_ids)?;
         let filters = GetTradesFilters {
             owners: vec![owner],
             time_filter: Some(time_filter),
@@ -140,7 +211,19 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         page_size: u16,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
-        let chain_ids = required_raindex_chain_ids(self.client)?;
+        self.get_trades_for_token_on_chains(None, token, page, page_size, time_filter)
+            .await
+    }
+
+    async fn get_trades_for_token_on_chains(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        token: Address,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = resolve_raindex_chain_ids(self.client, chain_ids)?;
         let filters = GetTradesFilters {
             tokens: Some(GetTradesTokenFilter {
                 inputs: Some(vec![token]),
@@ -171,7 +254,19 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         page_size: u16,
         time_filter: TimeFilter,
     ) -> Result<RaindexTradesListResult, ApiError> {
-        let chain_ids = required_raindex_chain_ids(self.client)?;
+        self.get_trades_for_taker_on_chains(None, taker, page, page_size, time_filter)
+            .await
+    }
+
+    async fn get_trades_for_taker_on_chains(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        taker: Address,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = resolve_raindex_chain_ids(self.client, chain_ids)?;
         let filters = GetTradesFilters {
             takers: vec![taker],
             time_filter: Some(time_filter),
@@ -197,6 +292,27 @@ impl TradesDataSource for RaindexTradesDataSource<'_> {
         token_addresses: &[Address],
     ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
         let tokens = raindex_backed_tokens(self.client)?;
+
+        let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
+        persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
+        Ok(wrap_ratio_values_from_responses(responses))
+    }
+
+    async fn get_current_wrap_ratios_for_tokens_on_chain(
+        &self,
+        chain_id: u32,
+        token_addresses: &[Address],
+    ) -> Result<HashMap<Address, WrapRatioValue>, ApiError> {
+        let tokens: Vec<_> = self
+            .client
+            .get_all_tokens()
+            .map_err(|error| {
+                tracing::error!(%error, "failed to retrieve curated tokens");
+                ApiError::Internal("failed to retrieve curated tokens".into())
+            })?
+            .into_values()
+            .filter(|token| token.network.chain_id == chain_id)
+            .collect();
 
         let responses = read_wrap_ratio_responses_for_addresses(&tokens, token_addresses).await?;
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
@@ -276,6 +392,7 @@ pub(super) fn map_trade_for_list(
     let block_number = trade_block_number(trade)?;
     let wrap_ratios = if denomination == Denomination::Unwrapped {
         wrap_ratio_map_for_trade(
+            trade.chain_id(),
             input_token_data.address(),
             output_token_data.address(),
             block_number,
@@ -304,6 +421,7 @@ pub(super) fn map_trade_for_list(
     };
 
     Ok(TradeByAddress {
+        chain_id: trade.chain_id(),
         tx_hash,
         input_amount,
         output_amount,
@@ -390,17 +508,27 @@ pub(super) async fn current_wrap_ratios_for_trades<'a>(
         return Ok(HashMap::new());
     }
 
-    let mut token_addresses = Vec::new();
+    let mut token_addresses_by_chain: BTreeMap<u32, Vec<Address>> = BTreeMap::new();
     for trade in &trades {
+        let token_addresses = token_addresses_by_chain
+            .entry(trade.chain_id())
+            .or_default();
         token_addresses.push(trade.input_vault_balance_change().token().address());
         token_addresses.push(trade.output_vault_balance_change().token().address());
     }
-    token_addresses.sort_unstable();
-    token_addresses.dedup();
-
-    let current_ratios = ds
-        .get_current_wrap_ratios_for_tokens(&token_addresses)
-        .await?;
+    let mut current_ratios = HashMap::new();
+    for (chain_id, mut token_addresses) in token_addresses_by_chain {
+        token_addresses.sort_unstable();
+        token_addresses.dedup();
+        let chain_ratios = ds
+            .get_current_wrap_ratios_for_tokens_on_chain(chain_id, &token_addresses)
+            .await?;
+        current_ratios.extend(
+            chain_ratios
+                .into_iter()
+                .map(|(address, ratio)| ((chain_id, address), ratio)),
+        );
+    }
     let mut ratios = HashMap::new();
 
     for trade in trades {
@@ -409,8 +537,8 @@ pub(super) async fn current_wrap_ratios_for_trades<'a>(
             trade.input_vault_balance_change().token().address(),
             trade.output_vault_balance_change().token().address(),
         ] {
-            if let Some(ratio) = current_ratios.get(&token) {
-                ratios.insert((token, block_number), ratio.clone());
+            if let Some(ratio) = current_ratios.get(&(trade.chain_id(), token)) {
+                ratios.insert((trade.chain_id(), token, block_number), ratio.clone());
             }
         }
     }
@@ -419,16 +547,17 @@ pub(super) async fn current_wrap_ratios_for_trades<'a>(
 }
 
 pub(super) fn wrap_ratio_map_for_trade(
+    chain_id: u32,
     input_token: Address,
     output_token: Address,
     block_number: u64,
     trade_wrap_ratios: &TradeWrapRatioMap,
 ) -> crate::denomination::WrapRatioMap {
     let mut ratios = HashMap::new();
-    if let Some(ratio) = trade_wrap_ratios.get(&(input_token, block_number)) {
+    if let Some(ratio) = trade_wrap_ratios.get(&(chain_id, input_token, block_number)) {
         ratios.insert(input_token, ratio.clone());
     }
-    if let Some(ratio) = trade_wrap_ratios.get(&(output_token, block_number)) {
+    if let Some(ratio) = trade_wrap_ratios.get(&(chain_id, output_token, block_number)) {
         ratios.insert(output_token, ratio.clone());
     }
     ratios
@@ -469,4 +598,8 @@ pub fn routes() -> Vec<Route> {
         get_by_taker::get_trades_by_taker,
         get_by_address::get_trades_by_address
     ]
+}
+
+pub fn routes_v2() -> Vec<Route> {
+    routes()
 }

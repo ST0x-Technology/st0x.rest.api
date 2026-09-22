@@ -8,6 +8,9 @@ use utoipa::{IntoParams, ToSchema};
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersPaginationParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "state")]
     pub state: Option<OrderState>,
     #[field(name = "page")]
@@ -54,6 +57,9 @@ pub enum OrderSummaryOrderType {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersByTokenParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
     #[field(name = "state")]
     pub state: Option<OrderState>,
     #[field(name = "side")]
@@ -67,6 +73,15 @@ pub struct OrdersByTokenParams {
     #[field(name = "denomination")]
     #[param(example = "wrapped")]
     pub denomination: Option<Denomination>,
+}
+
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct OrdersByTxParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    pub chain_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -181,6 +196,8 @@ pub struct OrderByTxEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OrdersByTxResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")]
     pub tx_hash: FixedBytes<32>,
     #[schema(example = 12345678)]

@@ -553,7 +553,7 @@ mod tests {
                 output_token, output_amount\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(i64::from(crate::CHAIN_ID))
+        .bind(8453_i64)
         .bind("0x1111111111111111111111111111111111111111")
         .bind(indexed_trade_id)
         .bind("0x48f6ed8a67769c007491262e72b78eb934a0a53bc0d67506081fc9a1c35c276f")

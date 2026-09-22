@@ -5,23 +5,24 @@ Swapping is a two-step process: get a **quote** to preview pricing, then get
 
 ## Step 1: Get a Quote
 
-For new integrations, use `POST /v2/swap/quote`. It uses the same mode,
-slippage, reference-price guard, and SDK simulation as V2 calldata, so the
+For new integrations, use `POST /v3/swap/quote`. It uses the same mode,
+slippage, reference-price guard, and SDK simulation as V3 calldata, so the
 displayed quote describes the route the API can execute.
 
-### Recommended: V2 Mode-Based Quote
+### Recommended: V3 Mode-Based Quote
 
 ```
-POST /v2/swap/quote
+POST /v3/swap/quote
 ```
 
 #### Request
 
 ```bash
-curl -X POST https://api.st0x.io/v2/swap/quote \
+curl -X POST https://api.st0x.io/v3/swap/quote \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -35,6 +36,7 @@ curl -X POST https://api.st0x.io/v2/swap/quote \
 
 | Field              | Required | Description                                                                                                                                                            |
 | ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`          | Yes      | Network chain ID. V3 never infers a network                                                                                                                            |
 | `taker`            | No       | Wallet that would execute the swap. Recommended because oracle-backed orders can use it when building signed context                                                   |
 | `inputToken`       | Yes      | Address of the token the taker will spend                                                                                                                              |
 | `outputToken`      | Yes      | Address of the token the taker will receive                                                                                                                            |
@@ -51,6 +53,7 @@ Provide exactly one of `priceCap` or `slippageBps`.
 
 ```json
 {
+  "chainId": 8453,
   "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "outputToken": "0x4200000000000000000000000000000000000006",
   "mode": "buyUpTo",
@@ -75,6 +78,11 @@ Provide exactly one of `priceCap` or `slippageBps`.
 
 The quote reflects current orderbook state. Prices may change between quoting
 and execution.
+
+### Compatibility: V2 Mode-Based Quote
+
+`POST /v2/swap/quote` retains the existing mode-based request shape for Base
+clients. Omitting `chainId` selects Base (`8453`). Use V3 for any other network.
 
 Oracle-backed orders can be temporarily unavailable for evaluation when their
 external context fetch fails. Quote endpoints then return HTTP 503 with
@@ -132,9 +140,10 @@ POST /v1/swap/quote
 ```
 
 V1 accepts `inputToken`, `outputToken`, `outputAmount`, and optional
-`denomination`. It only supports an output-targeted quote and does not apply a
-slippage limit. Existing integrations can continue using it; new mode-based
-integrations should use V2.
+`denomination`. V1 and V2 swaps remain Base-compatible: omitting `chainId`
+selects Base, while multi-network swaps use V3. V1 only supports an
+output-targeted quote and does not apply a slippage limit. Existing integrations
+can continue using V1 or V2; new multi-network integrations should use V3.
 
 Do not pass unwrapped-normalized quote values into other endpoints unless those
 endpoints explicitly support `denomination=unwrapped` and you call them that
@@ -143,23 +152,24 @@ still use wrapped/orderbook token addresses.
 
 ## Step 2: Get Calldata
 
-For new integrations, use `POST /v2/swap/calldata`. It supports both
+For new integrations, use `POST /v3/swap/calldata`. It supports both
 output-targeted swaps and spend-mode swaps. `POST /v1/swap/calldata` remains
 available for existing output-targeted clients.
 
-### Recommended: V2 Mode-Based Calldata
+### Recommended: V3 Mode-Based Calldata
 
 ```
-POST /v2/swap/calldata
+POST /v3/swap/calldata
 ```
 
 #### Request
 
 ```bash
-curl -X POST https://api.st0x.io/v2/swap/calldata \
+curl -X POST https://api.st0x.io/v3/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -173,6 +183,7 @@ curl -X POST https://api.st0x.io/v2/swap/calldata \
 
 | Field              | Type   | Description                                                                                                                                                                                      |
 | ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `chainId`          | number | Required network chain ID. V3 never infers a network                                                                                                                                             |
 | `taker`            | string | Wallet that will execute the swap and whose allowance is checked                                                                                                                                 |
 | `inputToken`       | string | Wrapped/orderbook token the taker will spend                                                                                                                                                     |
 | `outputToken`      | string | Wrapped/orderbook token the taker will receive                                                                                                                                                   |
@@ -192,9 +203,14 @@ Mode behavior:
 | `spendUpTo`  | Maximum input-token to spend | Spend up to `amount`; partial fills are allowed |
 
 The price-control fields have exactly the same meaning and orientation as in the
-V2 quote request described above. No orderbook walking or price-cap calculation
+V3 quote request described above. No orderbook walking or price-cap calculation
 is required in the client. For example, on USDC -> WETH, `"priceCap": "2600"`
 means the swap will not spend more than 2600 USDC per one WETH.
+
+### Compatibility: V2 Mode-Based Calldata
+
+`POST /v2/swap/calldata` retains the existing mode-based request shape for Base
+clients. Omitting `chainId` selects Base (`8453`). Use V3 for any other network.
 
 ### Legacy: V1 Output-Targeted Calldata
 
@@ -209,6 +225,7 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -220,6 +237,7 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
 
 | Field            | Type   | Description                                                                                                                                                                     |
 | ---------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`        | number | Network chain ID. May be omitted only while the API has exactly one configured network                                                                                          |
 | `taker`          | string | Your wallet address that will execute the transaction                                                                                                                           |
 | `inputToken`     | string | Wrapped/orderbook token address you are selling                                                                                                                                 |
 | `outputToken`    | string | Wrapped/orderbook token address you want to receive                                                                                                                             |
@@ -227,7 +245,7 @@ curl -X POST https://api.st0x.io/v1/swap/calldata \
 | `maximumIoRatio` | string | Maximum acceptable IO ratio in the selected `denomination`                                                                                                                      |
 | `denomination`   | string | Optional. `"wrapped"` (default) uses orderbook units. `"unwrapped"` interprets `outputAmount` and `maximumIoRatio` as unwrapped display values for wrapped ST0x/ERC4626 tokens. |
 
-V1 is equivalent to v2 with `"mode": "buyUpTo"`. It cannot express spend-based
+V1 is equivalent to V2 with `"mode": "buyUpTo"`. It cannot express spend-based
 intent.
 
 Set `maximumIoRatio` slightly above the `estimatedIoRatio` from the quote to
@@ -250,6 +268,7 @@ required transactions:
 
 ```json
 {
+  "chainId": 8453,
   "to": "0xOrderbookContractAddress",
   "data": "0x",
   "value": "0x0",
@@ -273,6 +292,7 @@ the swap calldata:
 
 ```json
 {
+  "chainId": 8453,
   "to": "0xOrderbookContractAddress",
   "data": "0xabcdef...",
   "value": "0x0",
@@ -285,6 +305,7 @@ the swap calldata:
 
 | Field              | Type   | Description                                                                                                                                                                                    |
 | ------------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chainId`          | number | Network chain ID used to build the transaction                                                                                                                                                 |
 | `to`               | string | Contract address to send the transaction to                                                                                                                                                    |
 | `data`             | string | Encoded transaction calldata — empty (`"0x"`) when approvals are needed                                                                                                                        |
 | `value`            | string | Native token value to send (usually `"0x0"`)                                                                                                                                                   |
@@ -322,10 +343,11 @@ transaction using `to`, `data`, and `value`.
 
 ```bash
 # 1. Get quote
-QUOTE=$(curl -s -X POST https://api.st0x.io/v2/swap/quote \
+QUOTE=$(curl -s -X POST https://api.st0x.io/v3/swap/quote \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -339,10 +361,11 @@ QUOTE=$(curl -s -X POST https://api.st0x.io/v2/swap/quote \
 echo "$QUOTE" | jq '{estimatedInput, estimatedOutput, estimatedIoRatio, fullyFilled, resolvedPriceCap}'
 
 # 2. Get fresh executable calldata with the same price controls
-CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
+CALLDATA=$(curl -s -X POST https://api.st0x.io/v3/swap/calldata \
   -H "Authorization: Basic <credentials>" \
   -H "Content-Type: application/json" \
   -d '{
+    "chainId": 8453,
     "taker": "0xYourWalletAddress",
     "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "outputToken": "0x4200000000000000000000000000000000000006",
@@ -366,10 +389,11 @@ if [ "$APPROVALS" != "[]" ]; then
 
   # Now call the calldata endpoint again — this time approvals are in place
   # and the response will contain the swap calldata in "data"
-  CALLDATA=$(curl -s -X POST https://api.st0x.io/v2/swap/calldata \
+  CALLDATA=$(curl -s -X POST https://api.st0x.io/v3/swap/calldata \
     -H "Authorization: Basic <credentials>" \
     -H "Content-Type: application/json" \
     -d '{
+      "chainId": 8453,
       "taker": "0xYourWalletAddress",
       "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       "outputToken": "0x4200000000000000000000000000000000000006",

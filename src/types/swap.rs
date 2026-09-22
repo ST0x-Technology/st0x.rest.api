@@ -14,6 +14,8 @@ pub enum SwapDenomination {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -28,6 +30,8 @@ pub struct SwapQuoteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
     #[schema(value_type = String, example = "0x4200000000000000000000000000000000000006")]
@@ -47,6 +51,8 @@ pub struct SwapQuoteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteV2Request {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     /// Wallet that would execute the swap. Optional for a read-only quote, but
     /// recommended because oracle-backed orders can depend on the taker when
     /// building their signed context.
@@ -102,9 +108,22 @@ pub enum SwapQuoteV2RequestBody {
     Slippage(SwapQuoteV2SlippageRequest),
 }
 
+/// OpenAPI-only V3 request shape. V3 keeps the V2 mode-based request contract
+/// but requires callers to select a network explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapQuoteV3RequestBody {
+    #[serde(flatten)]
+    pub request: SwapQuoteV2RequestBody,
+    #[schema(example = 8453)]
+    pub chain_id: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteV2RequestCommon {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     /// Wallet that would execute the swap. Recommended for oracle-backed
     /// orders, whose signed context can depend on the taker.
     #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
@@ -158,6 +177,8 @@ pub struct SwapQuoteV2SlippageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapQuoteV2Response {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     /// Token the taker spends.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -195,6 +216,8 @@ pub struct SwapQuoteV2Response {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataRequest {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
@@ -225,6 +248,8 @@ pub enum SwapCalldataMode {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataV2Request {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     /// Wallet that will execute the swap and whose allowance is checked.
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
@@ -274,9 +299,22 @@ pub enum SwapCalldataV2RequestBody {
     Slippage(SwapCalldataV2SlippageRequest),
 }
 
+/// OpenAPI-only V3 request shape. V3 keeps the V2 mode-based request contract
+/// but requires callers to select a network explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapCalldataV3RequestBody {
+    #[serde(flatten)]
+    pub request: SwapCalldataV2RequestBody,
+    #[schema(example = 8453)]
+    pub chain_id: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataV2RequestCommon {
+    #[schema(example = 8453)]
+    pub chain_id: Option<u32>,
     /// Wallet that will execute the swap and whose allowance is checked.
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
@@ -329,6 +367,8 @@ pub struct SwapCalldataV2SlippageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapCalldataResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
     #[schema(value_type = String, example = "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57")]
     pub to: Address,
     #[schema(value_type = String, example = "0xabcdef...")]

@@ -17,6 +17,37 @@ use rain_orderbook_app_settings::yaml::{raindex::RaindexYaml, FieldErrorKind, Ya
 use rain_orderbook_common::raindex_client::vaults::{RaindexVault, RaindexVaultType};
 use rain_orderbook_common::raindex_client::RaindexClient;
 
+pub(crate) const LEGACY_CHAIN_ID: u32 = 8453;
+
+pub(crate) fn compatibility_chain_id(
+    api_version: Option<u8>,
+    requested_chain_id: Option<u32>,
+) -> Option<u32> {
+    if api_version == Some(1) {
+        requested_chain_id.or(Some(LEGACY_CHAIN_ID))
+    } else {
+        requested_chain_id
+    }
+}
+
+pub(crate) fn compatibility_swap_chain_id(
+    api_version: Option<u8>,
+    requested_chain_id: Option<u32>,
+) -> Result<Option<u32>, ApiError> {
+    if matches!(api_version, Some(1 | 2)) {
+        match requested_chain_id {
+            Some(chain_id) if chain_id != LEGACY_CHAIN_ID => Err(ApiError::BadRequest(
+                "multi-network swaps require the v3 API".into(),
+            )),
+            _ => Ok(Some(LEGACY_CHAIN_ID)),
+        }
+    } else {
+        requested_chain_id
+            .map(Some)
+            .ok_or_else(|| ApiError::BadRequest("chainId is required".into()))
+    }
+}
+
 pub(crate) fn configured_raindex_chain_ids(client: &RaindexClient) -> Result<Vec<u32>, ApiError> {
     let mut chain_ids = client
         .get_all_raindexes()
@@ -42,6 +73,30 @@ pub(crate) fn required_raindex_chain_ids(client: &RaindexClient) -> Result<Vec<u
     }
 }
 
+pub(crate) fn resolve_raindex_chain_ids(
+    client: &RaindexClient,
+    requested_chain_ids: Option<Vec<u32>>,
+) -> Result<Vec<u32>, ApiError> {
+    let configured_chain_ids = required_raindex_chain_ids(client)?;
+    match requested_chain_ids {
+        Some(chain_ids)
+            if chain_ids
+                .iter()
+                .all(|chain_id| configured_chain_ids.contains(chain_id)) =>
+        {
+            Ok(chain_ids)
+        }
+        Some(chain_ids) => {
+            tracing::warn!(
+                ?chain_ids,
+                "one or more chainIds have no configured raindex"
+            );
+            Err(ApiError::BadRequest("unsupported chainId".into()))
+        }
+        None => Ok(configured_chain_ids),
+    }
+}
+
 pub(crate) fn raindex_backed_tokens(client: &RaindexClient) -> Result<Vec<TokenCfg>, ApiError> {
     let chain_ids = required_raindex_chain_ids(client)?;
     let tokens = client.get_all_tokens().map_err(|error| {
@@ -63,6 +118,23 @@ pub(crate) fn validate_raindex_chain_id(
     } else {
         tracing::warn!(chain_id, "chainId has no configured raindex");
         Err(ApiError::BadRequest("unsupported chainId".into()))
+    }
+}
+
+pub(crate) fn resolve_required_raindex_chain_id(
+    client: &RaindexClient,
+    requested_chain_id: Option<u32>,
+) -> Result<u32, ApiError> {
+    if let Some(chain_id) = requested_chain_id {
+        return validate_raindex_chain_id(client, chain_id);
+    }
+
+    let chain_ids = required_raindex_chain_ids(client)?;
+    match chain_ids.as_slice() {
+        [chain_id] => Ok(*chain_id),
+        _ => Err(ApiError::BadRequest(
+            "chainId is required when multiple networks have configured raindexes".into(),
+        )),
     }
 }
 
