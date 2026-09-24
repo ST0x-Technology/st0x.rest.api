@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_CONTENTION_RETRY_ATTEMPTS: u32 = 3;
+const SQLITE_CONTENTION_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub(crate) mod report;
 mod source;
 
@@ -125,15 +127,7 @@ async fn finish_worker_task(mut handle: JoinHandle<()>, timeout: Duration) {
 async fn run_sync_iteration(worker: &AttributionWorker) {
     match source::open_pool(&worker.raindex_db_path).await {
         Ok(source_pool) => {
-            let result = process_available_trades_for_chains(
-                &worker.app_pool,
-                &source_pool,
-                &worker.chain_ids,
-                worker.signer,
-                worker.start_block,
-                worker.batch_size,
-            )
-            .await;
+            let result = process_with_contention_retry(worker, &source_pool).await;
             source_pool.close().await;
             if let Err(error) = result {
                 tracing::error!(error = %error, "attribution sync failed");
@@ -149,12 +143,70 @@ async fn run_sync_iteration(worker: &AttributionWorker) {
     }
 }
 
+async fn process_with_contention_retry(
+    worker: &AttributionWorker,
+    source_pool: &SqlitePool,
+) -> Result<u64, AttributionReportingError> {
+    for attempt in 1..=SQLITE_CONTENTION_RETRY_ATTEMPTS {
+        let result = process_available_trades_for_chains(
+            &worker.app_pool,
+            source_pool,
+            &worker.chain_ids,
+            worker.signer,
+            worker.start_block,
+            worker.batch_size,
+        )
+        .await;
+        match result {
+            Err(error)
+                if error.is_sqlite_contention() && attempt < SQLITE_CONTENTION_RETRY_ATTEMPTS =>
+            {
+                let delay = SQLITE_CONTENTION_RETRY_DELAY * attempt;
+                tracing::warn!(
+                    %error,
+                    attempt,
+                    max_attempts = SQLITE_CONTENTION_RETRY_ATTEMPTS,
+                    delay_ms = delay.as_millis(),
+                    "attribution sync hit SQLite contention; retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("attribution retry loop always returns on its final attempt")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AttributionReportingError {
-    #[error("database query failed: {0}")]
-    Database(#[from] sqlx::Error),
+    #[error("application database query failed: {0}")]
+    AppDatabase(#[source] sqlx::Error),
+    #[error("Raindex database query failed: {0}")]
+    RaindexDatabase(#[source] sqlx::Error),
+    #[error("attribution processing failed: {0}")]
+    Protocol(&'static str),
     #[error("attribution start block does not fit in SQLite INTEGER")]
     StartBlockOverflow,
+}
+
+impl AttributionReportingError {
+    fn is_sqlite_contention(&self) -> bool {
+        let error = match self {
+            Self::AppDatabase(error) | Self::RaindexDatabase(error) => error,
+            Self::Protocol(_) | Self::StartBlockOverflow => return false,
+        };
+        is_sqlite_contention_error(error)
+    }
+}
+
+fn is_sqlite_contention_error(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(error) = error else {
+        return false;
+    };
+    matches!(
+        error.code().as_deref(),
+        Some("5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
+    )
 }
 
 pub(crate) async fn process_available_trades_for_chains(
@@ -167,11 +219,16 @@ pub(crate) async fn process_available_trades_for_chains(
 ) -> Result<u64, AttributionReportingError> {
     let start_block =
         i64::try_from(start_block).map_err(|_| AttributionReportingError::StartBlockOverflow)?;
-    attribution_db::record_signer(app_pool, signer).await?;
+    attribution_db::record_signer(app_pool, signer)
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
     let mut targets = Vec::new();
     for chain_id in chain_ids {
         match source::list_targets(source_pool, *chain_id).await {
             Ok(chain_targets) => targets.extend(chain_targets),
+            Err(error) if is_sqlite_contention_error(&error) => {
+                return Err(AttributionReportingError::RaindexDatabase(error));
+            }
             Err(error) => {
                 tracing::error!(
                     chain_id = *chain_id,
@@ -181,21 +238,34 @@ pub(crate) async fn process_available_trades_for_chains(
             }
         }
     }
-    attribution_db::snapshot_current_api_keys(app_pool).await?;
-    let identities = attribution_db::load_api_key_identities(app_pool).await?;
+    attribution_db::snapshot_current_api_keys(app_pool)
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
+    let identities = attribution_db::load_api_key_identities(app_pool)
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
     let identity_by_hash: HashMap<B256, attribution_db::ApiKeyIdentity> = identities
         .into_iter()
         .map(|identity| (compute_api_key_hash(&identity.key_id), identity))
         .collect();
 
     let mut attributed_count = 0;
-    let trusted_signers = attribution_db::load_signers(app_pool).await?;
+    let trusted_signers = attribution_db::load_signers(app_pool)
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
     for mut target in targets {
-        let mut source_transaction = source_pool.begin().await?;
-        let Some(last_indexed_block) =
-            source::refresh_watermark(&mut source_transaction, &target).await?
+        let mut source_transaction = source_pool
+            .begin()
+            .await
+            .map_err(AttributionReportingError::RaindexDatabase)?;
+        let Some(last_indexed_block) = source::refresh_watermark(&mut source_transaction, &target)
+            .await
+            .map_err(AttributionReportingError::RaindexDatabase)?
         else {
-            source_transaction.commit().await?;
+            source_transaction
+                .commit()
+                .await
+                .map_err(AttributionReportingError::RaindexDatabase)?;
             continue;
         };
         target.last_indexed_block = last_indexed_block;
@@ -209,7 +279,10 @@ pub(crate) async fn process_available_trades_for_chains(
             &identity_by_hash,
         )
         .await?;
-        source_transaction.commit().await?;
+        source_transaction
+            .commit()
+            .await
+            .map_err(AttributionReportingError::RaindexDatabase)?;
     }
     Ok(attributed_count)
 }
@@ -244,10 +317,14 @@ async fn process_target(
 ) -> Result<u64, AttributionReportingError> {
     // The cursor read, attributed-trade upserts, and cursor update share one transaction.
     // A concurrent worker therefore cannot commit a cursor derived from stale progress.
-    let mut transaction = app_pool.begin().await?;
+    let mut transaction = app_pool
+        .begin()
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
     let mut stored_cursor =
         attribution_db::load_cursor(&mut transaction, target.chain_id, &target.raindex_address)
-            .await?;
+            .await
+            .map_err(AttributionReportingError::AppDatabase)?;
 
     let start_block_reset = stored_cursor
         .as_ref()
@@ -259,7 +336,8 @@ async fn process_target(
             &target.raindex_address,
             configured_start_block,
         )
-        .await?;
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
         stored_cursor = None;
     }
     let batch_cursor = stored_cursor.as_ref().map(|cursor| BatchCursor {
@@ -274,7 +352,8 @@ async fn process_target(
         batch_cursor,
         batch_size,
     )
-    .await?;
+    .await
+    .map_err(AttributionReportingError::RaindexDatabase)?;
     // Raindex materializes all derived rows through a target's watermark before advancing
     // target_watermarks in the same source transaction. Because this function rereads the
     // watermark and the rows from one source snapshot, a partial batch proves that every
@@ -282,9 +361,9 @@ async fn process_target(
     let next_cursor = if trades.len() < batch_size as usize {
         (target.last_indexed_block, i64::MAX, String::new())
     } else {
-        let last_trade = trades
-            .last()
-            .ok_or_else(|| sqlx::Error::Protocol("non-empty attribution batch expected".into()))?;
+        let last_trade = trades.last().ok_or(AttributionReportingError::Protocol(
+            "non-empty attribution batch expected",
+        ))?;
         (
             last_trade.block_number,
             last_trade.log_index,
@@ -319,8 +398,9 @@ async fn process_target(
             output_amount: trade.output_delta,
         });
     }
-    let attributed_count = u64::try_from(attributed_trades.len())
-        .map_err(|_| sqlx::Error::Protocol("attributed trade count does not fit u64".into()))?;
+    let attributed_count = u64::try_from(attributed_trades.len()).map_err(|_| {
+        AttributionReportingError::Protocol("attributed trade count does not fit u64")
+    })?;
     attribution_db::store_batch(
         &mut transaction,
         target.chain_id,
@@ -333,8 +413,12 @@ async fn process_target(
         },
         &attributed_trades,
     )
-    .await?;
-    transaction.commit().await?;
+    .await
+    .map_err(AttributionReportingError::AppDatabase)?;
+    transaction
+        .commit()
+        .await
+        .map_err(AttributionReportingError::AppDatabase)?;
 
     if start_block_reset {
         tracing::warn!(
@@ -448,6 +532,41 @@ mod tests {
         )
         .await
         .expect("app pool")
+    }
+
+    #[tokio::test]
+    async fn identifies_sqlite_writer_contention_for_retry() {
+        let file = NamedTempFile::new().expect("database file");
+        let options = SqliteConnectOptions::new()
+            .filename(file.path())
+            .create_if_missing(true)
+            .busy_timeout(Duration::ZERO);
+        let first_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("first pool");
+        let second_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("second pool");
+        sqlx::query("CREATE TABLE items (value INTEGER NOT NULL)")
+            .execute(&first_pool)
+            .await
+            .expect("create table");
+
+        let mut first_writer = first_pool.begin().await.expect("first transaction");
+        sqlx::query("INSERT INTO items (value) VALUES (1)")
+            .execute(&mut *first_writer)
+            .await
+            .expect("first write");
+        let error = sqlx::query("INSERT INTO items (value) VALUES (2)")
+            .execute(&second_pool)
+            .await
+            .expect_err("second writer should encounter contention");
+
+        assert!(is_sqlite_contention_error(&error));
     }
 
     #[tokio::test]
