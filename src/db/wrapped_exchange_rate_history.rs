@@ -91,6 +91,27 @@ pub(crate) async fn list_wrapped_exchange_rate_snapshots_for_share(
     .await
 }
 
+pub(crate) async fn find_latest_wrapped_exchange_rate_snapshot_at_or_before(
+    pool: &DbPool,
+    chain_id: u32,
+    share_token_address: &str,
+    block_timestamp: i64,
+) -> Result<Option<WrappedExchangeRateSnapshot>, sqlx::Error> {
+    sqlx::query_as::<_, WrappedExchangeRateSnapshot>(
+        "SELECT chain_id, share_token_address, asset_token_address, assets_per_share, block_number, block_timestamp, captured_at \
+         FROM wrapped_exchange_rate_snapshots \
+         WHERE chain_id = ? AND share_token_address = ? \
+           AND block_timestamp IS NOT NULL AND block_timestamp <= ? \
+         ORDER BY block_timestamp DESC, block_number DESC, captured_at DESC \
+         LIMIT 1",
+    )
+    .bind(i64::from(chain_id))
+    .bind(share_token_address)
+    .bind(block_timestamp)
+    .fetch_optional(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +290,61 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].block_number, 101);
         assert_eq!(rows[1].block_number, 100);
+    }
+
+    #[tokio::test]
+    async fn finds_latest_snapshot_for_token_at_or_before_timestamp() {
+        let pool = test_pool().await;
+        let mut snapshots = vec![
+            snapshot("0xshare", "0xasset", "1.0", 100, "1000"),
+            snapshot("0xshare", "0xasset", "1.1", 200, "1100"),
+            snapshot("0xother", "0xasset", "2.0", 150, "1050"),
+        ];
+        snapshots[0].block_timestamp = Some(1_100);
+        snapshots[1].block_timestamp = Some(1_200);
+        snapshots[2].block_timestamp = Some(1_150);
+
+        let mut other_chain = snapshot("0xshare", "0xasset", "3.0", 50, "1025");
+        other_chain.chain_id = 4663;
+        other_chain.block_timestamp = Some(1_125);
+        snapshots.push(other_chain);
+
+        let mut missing_timestamp = snapshot("0xmissing", "0xasset", "9.0", 1, "900");
+        missing_timestamp.block_timestamp = None;
+        snapshots.push(missing_timestamp);
+
+        insert_wrapped_exchange_rate_snapshots(&pool, &snapshots)
+            .await
+            .expect("insert snapshots");
+
+        let base_share =
+            find_latest_wrapped_exchange_rate_snapshot_at_or_before(&pool, 8453, "0xshare", 1_175)
+                .await
+                .expect("find Base share snapshot")
+                .expect("Base share snapshot exists");
+        let base_other =
+            find_latest_wrapped_exchange_rate_snapshot_at_or_before(&pool, 8453, "0xother", 1_175)
+                .await
+                .expect("find Base other snapshot")
+                .expect("Base other snapshot exists");
+        let other_chain =
+            find_latest_wrapped_exchange_rate_snapshot_at_or_before(&pool, 4663, "0xshare", 1_175)
+                .await
+                .expect("find other-chain snapshot")
+                .expect("other-chain snapshot exists");
+        let missing = find_latest_wrapped_exchange_rate_snapshot_at_or_before(
+            &pool,
+            8453,
+            "0xmissing",
+            1_175,
+        )
+        .await
+        .expect("find missing snapshot");
+
+        assert_eq!(base_share.assets_per_share, "1.0");
+        assert_eq!(base_other.assets_per_share, "2.0");
+        assert_eq!(other_chain.assets_per_share, "3.0");
+        assert!(missing.is_none());
     }
 
     async fn list_snapshots_for_share(

@@ -1,6 +1,7 @@
 use crate::auth::AuthenticatedKey;
 use crate::db::wrapped_exchange_rate_history::{
     count_wrapped_exchange_rate_snapshots_for_share,
+    find_latest_wrapped_exchange_rate_snapshot_at_or_before,
     list_wrapped_exchange_rate_snapshots_for_share, WrappedExchangeRateSnapshot,
 };
 use crate::db::DbPool;
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
+use time::{macros::format_description, Date};
 use tracing::Instrument;
 use utoipa::{IntoParams, ToSchema};
 
@@ -62,6 +64,18 @@ pub struct TokenListParams {
     #[field(name = "chainId")]
     #[param(example = 8453)]
     chain_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, FromForm, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct WrapRatioListParams {
+    #[field(name = "chainId")]
+    #[param(example = 8453)]
+    chain_id: Option<u32>,
+    /// UTC calendar date. Returns the latest stored ratio at or before 23:59:59 UTC.
+    #[param(example = "2026-09-24")]
+    date: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -295,6 +309,118 @@ pub(super) async fn registry_tokens(
 
 fn normalize_address(address: Address) -> String {
     format!("{address:#x}").to_ascii_lowercase()
+}
+
+fn wrap_ratio_date_cutoff(date: &str) -> Result<i64, ApiError> {
+    let date = Date::parse(date, format_description!("[year]-[month]-[day]"))
+        .map_err(|_| ApiError::BadRequest("date must use YYYY-MM-DD format".into()))?;
+    let end_of_day = date
+        .with_hms(23, 59, 59)
+        .map_err(|_| ApiError::BadRequest("date must use YYYY-MM-DD format".into()))?;
+    Ok(end_of_day.assume_utc().unix_timestamp())
+}
+
+fn wrap_ratio_response_from_snapshot(
+    token: &TokenCfg,
+    snapshot: WrappedExchangeRateSnapshot,
+) -> Result<WrapRatioResponse, String> {
+    let chain_id = u32::try_from(snapshot.chain_id)
+        .map_err(|_| "stored wrapped token ratio has an invalid chain ID".to_string())?;
+    if chain_id != token.network.chain_id {
+        return Err("stored wrapped token ratio has an unexpected chain ID".to_string());
+    }
+
+    let share_address = snapshot
+        .share_token_address
+        .parse::<Address>()
+        .map_err(|_| "stored wrapped token ratio has an invalid share address".to_string())?;
+    if share_address != token.address {
+        return Err("stored wrapped token ratio has an unexpected share address".to_string());
+    }
+
+    let asset_address = snapshot
+        .asset_token_address
+        .parse::<Address>()
+        .map_err(|_| "stored wrapped token ratio has an invalid asset address".to_string())?;
+    let expected_asset_address = unwrapped_address(token).map_err(|error| error.batch_message())?;
+    if asset_address != expected_asset_address {
+        return Err("stored wrapped token ratio does not match registry asset".to_string());
+    }
+
+    Ok(WrapRatioResponse {
+        chain_id,
+        share_address,
+        asset_address,
+        assets_per_share: snapshot.assets_per_share,
+        block_number: snapshot
+            .block_number
+            .try_into()
+            .map_err(|_| "stored wrapped token ratio has an invalid block number".to_string())?,
+        block_timestamp: snapshot
+            .block_timestamp
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| "stored wrapped token ratio has an invalid block timestamp".to_string())?,
+        captured_at: snapshot.captured_at,
+    })
+}
+
+async fn historical_wrap_ratios(
+    pool: &DbPool,
+    tokens: &[&TokenCfg],
+    cutoff: i64,
+) -> Result<WrapRatioBatchResponse, ApiError> {
+    let mut data = Vec::new();
+    let mut errors = Vec::new();
+
+    for token in tokens {
+        let share_token_address = normalize_address(token.address);
+        let snapshot = find_latest_wrapped_exchange_rate_snapshot_at_or_before(
+            pool,
+            token.network.chain_id,
+            &share_token_address,
+            cutoff,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                error = %error,
+                cutoff,
+                chain_id = token.network.chain_id,
+                share_address = %token.address,
+                "failed to query dated wrapped token ratio"
+            );
+            ApiError::Internal("failed to query wrapped token ratios".into())
+        })?;
+        let Some(snapshot) = snapshot else {
+            errors.push(WrapRatioErrorResponse {
+                chain_id: token.network.chain_id,
+                share_address: token.address,
+                message: "no wrapped token ratio snapshot available at or before requested date"
+                    .into(),
+            });
+            continue;
+        };
+
+        match wrap_ratio_response_from_snapshot(token, snapshot) {
+            Ok(response) => data.push(response),
+            Err(message) => {
+                tracing::error!(
+                    chain_id = token.network.chain_id,
+                    share_address = %token.address,
+                    reason = %message,
+                    "invalid stored wrapped token ratio"
+                );
+                errors.push(WrapRatioErrorResponse {
+                    chain_id: token.network.chain_id,
+                    share_address: token.address,
+                    message: "invalid stored wrapped token ratio".into(),
+                });
+            }
+        }
+    }
+
+    Ok(WrapRatioBatchResponse { data, errors })
 }
 
 fn wrap_ratio_history_pagination_params(
@@ -878,10 +1004,10 @@ pub async fn get_tokens(
     path = "/v2/tokens/wrap-ratio",
     tag = "Tokens",
     security(("basicAuth" = [])),
-    params(TokenListParams),
+    params(WrapRatioListParams),
     responses(
         (status = 200, description = "Wrapped ST0x token ratios", body = WrapRatioBatchResponse),
-        (status = 400, description = "Unsupported chainId", body = ApiErrorResponse),
+        (status = 400, description = "Unsupported chainId or invalid date", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -894,9 +1020,14 @@ pub async fn get_wrap_ratios(
     span: TracingSpan,
     shared_raindex: &State<SharedRaindexProvider>,
     pool: &State<DbPool>,
-    params: TokenListParams,
+    params: WrapRatioListParams,
 ) -> Result<Json<WrapRatioBatchResponse>, ApiError> {
     let chain_id = crate::routes::compatibility_chain_id(span.api_version(), params.chain_id);
+    let cutoff = params
+        .date
+        .as_deref()
+        .map(wrap_ratio_date_cutoff)
+        .transpose()?;
     async move {
         tracing::info!(params = ?params, "request received");
 
@@ -914,6 +1045,22 @@ pub async fn get_wrap_ratios(
                         .is_none_or(|chain_ids| chain_ids.contains(&token.network.chain_id))
             })
             .collect();
+
+        if let Some(cutoff) = cutoff {
+            tracing::info!(
+                count = st0x_tokens.len(),
+                cutoff,
+                "reading dated wrapped token ratios"
+            );
+            let response = historical_wrap_ratios(pool.inner(), &st0x_tokens, cutoff).await?;
+            tracing::info!(
+                data_count = response.data.len(),
+                error_count = response.errors.len(),
+                "returning dated wrapped token ratios"
+            );
+            return Ok(Json(response));
+        }
+
         tracing::info!(count = st0x_tokens.len(), "reading wrapped token ratios");
 
         let mut data = Vec::new();
@@ -3332,6 +3479,76 @@ using-tokens-from:
         assert_eq!(errors[0]["chainId"], 137);
         assert_eq!(errors[0]["shareAddress"], format!("{WT_SECOND:#x}"));
         assert_eq!(errors[0]["message"], "failed to read ERC4626 ratio");
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratios_by_date_returns_latest_snapshot_before_utc_cutoff() {
+        let client = wrap_ratio_client("http://127.0.0.1:1/unavailable").await;
+        seed_history_snapshots(
+            &client,
+            &[
+                history_snapshot(
+                    WT_MSTR,
+                    T_MSTR,
+                    "1.1",
+                    100,
+                    Some(1_790_208_000),
+                    "1790208001",
+                ),
+                history_snapshot(
+                    WT_MSTR,
+                    T_MSTR,
+                    "1.2",
+                    101,
+                    Some(1_790_294_400),
+                    "1790294401",
+                ),
+            ],
+        )
+        .await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/v2/tokens/wrap-ratio?date=2026-09-24")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let data = body["data"].as_array().expect("data is an array");
+        let errors = body["errors"].as_array().expect("errors is an array");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["shareAddress"], format!("{WT_MSTR:#x}"));
+        assert_eq!(data[0]["assetsPerShare"], "1.1");
+        assert_eq!(data[0]["blockNumber"], 100);
+        assert_eq!(data[0]["blockTimestamp"], 1_790_208_000u64);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["shareAddress"], format!("{WT_BAD:#x}"));
+        assert_eq!(
+            errors[0]["message"],
+            "no wrapped token ratio snapshot available at or before requested date"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn test_get_wrap_ratios_rejects_invalid_date() {
+        let client = wrap_ratio_client("http://127.0.0.1:1/unavailable").await;
+        let (key_id, secret) = seed_api_key(&client).await;
+        let header = basic_auth_header(&key_id, &secret);
+
+        let response = client
+            .get("/v2/tokens/wrap-ratio?date=09-24-2026")
+            .header(Header::new("Authorization", header))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::BadRequest);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["message"], "date must use YYYY-MM-DD format");
     }
 
     #[rocket::async_test]

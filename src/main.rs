@@ -988,11 +988,19 @@ mod tests {
     fn test_openapi_documents_multichain_list_validation_errors() {
         let openapi = serde_json::to_value(super::ApiDoc::openapi()).expect("serialize openapi");
 
-        for path in [
-            "/v2/tokens/wrap-ratio",
-            "/v2/tokens/details",
-            "/v2/vaults/totals",
-        ] {
+        assert_eq!(
+            openapi["paths"]["/v2/tokens/wrap-ratio"]["get"]["responses"]["400"]["description"],
+            "Unsupported chainId or invalid date"
+        );
+        assert!(
+            openapi["paths"]["/v2/tokens/wrap-ratio"]["get"]["parameters"]
+                .as_array()
+                .expect("wrap ratio parameters are an array")
+                .iter()
+                .any(|parameter| parameter["name"] == "date")
+        );
+
+        for path in ["/v2/tokens/details", "/v2/vaults/totals"] {
             assert_eq!(
                 openapi["paths"][path]["get"]["responses"]["400"]["description"],
                 "Unsupported chainId"

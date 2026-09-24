@@ -93,8 +93,22 @@ GET /v2/tokens/wrap-ratio/{address}/history
 Returns ERC4626 wrapped-token ratios for registry tokens where
 `extensions.category` is `ST0x`. For the single-token endpoint, `{address}` must
 be the wrapped token / ERC4626 vault address. Symbol lookup is not supported.
-The batch endpoint accepts optional `chainId`; address and history endpoints
-require it when the address exists on multiple registry networks.
+The batch endpoint accepts optional `chainId` and `date`; address and history
+endpoints require `chainId` when the address exists on multiple registry
+networks.
+
+When `date` is omitted, the batch endpoint reads the latest ratios from each
+network. Pass a UTC calendar date in `YYYY-MM-DD` format to return the latest
+stored snapshot at or before 23:59:59 UTC on that date:
+
+```bash
+curl "https://api.st0x.io/v2/tokens/wrap-ratio?date=2026-09-24" \
+  -H "Authorization: Basic <credentials>"
+```
+
+Dated results come from snapshots previously observed by the API; they are not
+historical RPC reads or a complete event log. Tokens without an eligible
+snapshot are returned individually in `errors`.
 
 ### Batch Response
 
