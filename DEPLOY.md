@@ -78,7 +78,7 @@ Optional overrides (defaults shown):
 ssh_key_name   = "st0x-op"   # Name of your SSH key in DigitalOcean
 region         = "nyc3"       # DigitalOcean region slug
 droplet_size   = "s-2vcpu-4gb"
-volume_size_gb = 5
+volume_size_gb = 50
 ```
 
 Save and exit — the file is automatically re-encrypted with `rage` using the keys
@@ -101,7 +101,7 @@ nix develop -c tf-apply
 
 This provisions:
 - Ubuntu 24.04 droplet (`st0x-rest-api-nixos`) in the chosen region
-- 5 GB block storage volume (`st0x-rest-api-data`) mounted at `/mnt/data`
+- 50 GB block storage volume (`st0x-rest-api-data`) mounted at `/mnt/data`
 - A reserved IP attached to the droplet
 
 The Terraform state is encrypted with `rage` and committed as
@@ -333,7 +333,7 @@ nix develop -c remote
 # on server:
 journalctl -u rest-api -f
 # or log files:
-ls /mnt/data/st0x-rest-api/logs/
+ls /var/log/st0x-rest-api/
 ```
 
 ### Check service status
@@ -362,7 +362,7 @@ Your machine
 Server (NixOS on DigitalOcean)
   ├─ Nginx (443)  → reverse proxy → Rocket API (127.0.0.1:8000)
   ├─ SQLite DB    → /mnt/data/st0x-rest-api/st0x.db
-  ├─ Logs         → /mnt/data/st0x-rest-api/logs/
+  ├─ Logs         → /var/log/st0x-rest-api/
   └─ /mnt/data    → DigitalOcean block volume (persists across reboots)
 ```
 
