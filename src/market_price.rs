@@ -1,7 +1,8 @@
 use crate::atomic_liquidity::has_executable_atomic_amounts;
 use crate::cache::RouteResponseCaches;
 use crate::db::market_price_history::{
-    delete_market_price_snapshots_before, replace_market_price_sample, NewMarketPriceSnapshot,
+    delete_market_price_snapshots_before, replace_market_price_sample_with_books,
+    NewMarketBookSnapshot, NewMarketPriceSnapshot,
 };
 use crate::db::DbPool;
 use crate::error::ApiError;
@@ -166,6 +167,8 @@ enum MarketSide {
 #[derive(Debug, Clone, Copy)]
 struct ObservedQuote {
     asset_address: Address,
+    // Normalization changes price units, not which token the order can execute.
+    source_asset_address: Address,
     side: MarketSide,
     price: Float,
 }
@@ -180,6 +183,26 @@ struct MarketVariant {
 struct Book {
     best_bid: Option<Float>,
     best_ask: Option<Float>,
+}
+
+impl Book {
+    fn observe(&mut self, observation: &ObservedQuote) -> Result<(), ApiError> {
+        match observation.side {
+            MarketSide::Bid => {
+                self.best_bid = Some(match self.best_bid {
+                    Some(current) => current.max(observation.price).map_err(float_error)?,
+                    None => observation.price,
+                });
+            }
+            MarketSide::Ask => {
+                self.best_ask = Some(match self.best_ask {
+                    Some(current) => current.min(observation.price).map_err(float_error)?,
+                    None => observation.price,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -274,9 +297,13 @@ impl MarketPriceSampler {
         .await;
 
         let mut snapshots = Vec::new();
+        let mut books = Vec::new();
         for (market, result) in results {
             match result {
-                Ok(mut market_snapshots) => snapshots.append(&mut market_snapshots),
+                Ok(mut sample) => {
+                    snapshots.append(&mut sample.snapshots);
+                    books.append(&mut sample.books);
+                }
                 Err(error) => {
                     tracing::error!(
                         chain_id = market.chain_id,
@@ -305,17 +332,22 @@ impl MarketPriceSampler {
                 tracing::error!(error = %error, "failed to prune market price snapshots");
                 ApiError::Internal("failed to prune market price snapshots".into())
             })?;
-        let (replaced, inserted) =
-            replace_market_price_sample(&self.state.pool, observed_at, &snapshots)
-                .await
-                .map_err(|error| {
-                    tracing::error!(error = %error, "failed to persist market price snapshots");
-                    ApiError::Internal("failed to persist market price snapshots".into())
-                })?;
+        let (replaced, inserted) = replace_market_price_sample_with_books(
+            &self.state.pool,
+            observed_at,
+            &snapshots,
+            &books,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to persist market price snapshots");
+            ApiError::Internal("failed to persist market price snapshots".into())
+        })?;
 
         tracing::info!(
             market_count,
             snapshot_count = snapshots.len(),
+            book_count = books.len(),
             inserted,
             replaced,
             deleted,
@@ -329,7 +361,7 @@ impl MarketPriceSampler {
         client: &RaindexClient,
         market: &PriceMarket,
         observed_at: i64,
-    ) -> Result<Vec<NewMarketPriceSnapshot>, ApiError> {
+    ) -> Result<MarketPriceSample, ApiError> {
         tracing::info!(
             chain_id = market.chain_id,
             quote_token = %market.quote_token_address,
@@ -379,7 +411,7 @@ impl MarketPriceSampler {
                 &token_decimals,
             )?);
         }
-        let snapshots = aggregate_observations(
+        let sample = aggregate_market_prices(
             &market.tokens,
             &observations,
             market.chain_id,
@@ -391,10 +423,11 @@ impl MarketPriceSampler {
             chain_id = market.chain_id,
             order_count = orders.len(),
             observation_count = observations.len(),
-            snapshot_count = snapshots.len(),
+            snapshot_count = sample.snapshots.len(),
+            book_count = sample.books.len(),
             "price market sampling complete"
         );
-        Ok(snapshots)
+        Ok(sample)
     }
 }
 
@@ -946,6 +979,7 @@ fn observed_quotes_from_decoded_order(
             match variant_map.get(&output_address) {
                 Some(variant) => Some(ObservedQuote {
                     asset_address: variant.canonical_address,
+                    source_asset_address: output_address,
                     side: MarketSide::Ask,
                     price: normalize_variant_price(data.ratio, *variant)?,
                 }),
@@ -955,6 +989,7 @@ fn observed_quotes_from_decoded_order(
             match variant_map.get(&input_address) {
                 Some(variant) => Some(ObservedQuote {
                     asset_address: variant.canonical_address,
+                    source_asset_address: input_address,
                     side: MarketSide::Bid,
                     price: normalize_variant_price(data.inverse_ratio, *variant)?,
                 }),
@@ -993,54 +1028,69 @@ fn normalize_variant_price(price: Float, variant: MarketVariant) -> Result<Float
     })
 }
 
-fn aggregate_observations(
+#[derive(Debug)]
+struct MarketPriceSample {
+    snapshots: Vec<NewMarketPriceSnapshot>,
+    books: Vec<NewMarketBookSnapshot>,
+}
+
+fn aggregate_market_prices(
     tokens: &[MarketToken],
     observations: &[ObservedQuote],
     chain_id: u32,
     quote_token: Address,
     observed_at: i64,
     wrap_ratios: &HashMap<Address, WrapRatioValue>,
-) -> Result<Vec<NewMarketPriceSnapshot>, ApiError> {
+) -> Result<MarketPriceSample, ApiError> {
     let mut books = BTreeMap::<Address, Book>::new();
+    let mut executable_books = BTreeMap::<Address, Book>::new();
     for observation in observations {
-        let book = books.entry(observation.asset_address).or_default();
-        match observation.side {
-            MarketSide::Bid => {
-                book.best_bid = Some(match book.best_bid {
-                    Some(current) => current.max(observation.price).map_err(float_error)?,
-                    None => observation.price,
-                });
-            }
-            MarketSide::Ask => {
-                book.best_ask = Some(match book.best_ask {
-                    Some(current) => current.min(observation.price).map_err(float_error)?,
-                    None => observation.price,
-                });
-            }
+        books
+            .entry(observation.asset_address)
+            .or_default()
+            .observe(observation)?;
+        // The swap endpoint matches exact token addresses. Underlying/legacy
+        // orders contribute to display prices but cannot anchor a canonical swap.
+        if observation.source_asset_address == observation.asset_address {
+            executable_books
+                .entry(observation.asset_address)
+                .or_default()
+                .observe(observation)?;
         }
     }
 
     let two = Float::parse("2".to_string()).map_err(float_error)?;
     let quote_token_address = normalize_address(quote_token);
-    let mut snapshots = Vec::new();
+    let mut sample = MarketPriceSample {
+        snapshots: Vec::new(),
+        books: Vec::with_capacity(tokens.len()),
+    };
     for token in tokens {
-        let Some(book) = books.get(&token.canonical_address) else {
-            continue;
-        };
-        let (Some(best_bid), Some(best_ask)) = (book.best_bid, book.best_ask) else {
-            continue;
-        };
-        if best_bid.gt(best_ask).map_err(float_error)? {
-            tracing::warn!(
-                asset_token = %token.canonical_address,
-                "ignoring crossed market price book"
-            );
-            continue;
+        let book = books.remove(&token.canonical_address).unwrap_or_default();
+        let mut executable_book = executable_books
+            .remove(&token.canonical_address)
+            .unwrap_or_default();
+        let (mut best_bid, mut best_ask) = (book.best_bid, book.best_ask);
+        if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+            if bid.gt(ask).map_err(float_error)? {
+                tracing::warn!(
+                    asset_token = %token.canonical_address,
+                    "ignoring crossed market price book"
+                );
+                best_bid = None;
+                best_ask = None;
+            }
         }
-        let midpoint = best_bid
-            .add(best_ask)
-            .and_then(|sum| sum.div(two))
-            .map_err(float_error)?;
+        if let (Some(bid), Some(ask)) = (executable_book.best_bid, executable_book.best_ask) {
+            if bid.gt(ask).map_err(float_error)? {
+                tracing::warn!(
+                    asset_token = %token.canonical_address,
+                    "ignoring crossed canonical executable book"
+                );
+                executable_book.best_bid = None;
+                executable_book.best_ask = None;
+            }
+        }
         let assets_per_share = wrap_ratios
             .get(&token.canonical_address)
             .ok_or_else(|| {
@@ -1052,18 +1102,65 @@ fn aggregate_observations(
             })?
             .assets_per_share
             .clone();
-        snapshots.push(NewMarketPriceSnapshot {
+        let best_bid_string = executable_book
+            .best_bid
+            .map(Float::format)
+            .transpose()
+            .map_err(float_error)?;
+        let best_ask_string = executable_book
+            .best_ask
+            .map(Float::format)
+            .transpose()
+            .map_err(float_error)?;
+        if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+            let midpoint = bid
+                .add(ask)
+                .and_then(|sum| sum.div(two))
+                .map_err(float_error)?;
+            sample.snapshots.push(NewMarketPriceSnapshot {
+                chain_id: i64::from(chain_id),
+                asset_token_address: normalize_address(token.canonical_address),
+                quote_token_address: quote_token_address.clone(),
+                best_bid: bid.format().map_err(float_error)?,
+                best_ask: ask.format().map_err(float_error)?,
+                midpoint: midpoint.format().map_err(float_error)?,
+                assets_per_share: assets_per_share.clone(),
+                observed_at,
+            });
+        }
+        // Include empty books so a completed sample clears previously available
+        // sides rather than accidentally carrying them forward as current.
+        sample.books.push(NewMarketBookSnapshot {
             chain_id: i64::from(chain_id),
             asset_token_address: normalize_address(token.canonical_address),
             quote_token_address: quote_token_address.clone(),
-            best_bid: best_bid.format().map_err(float_error)?,
-            best_ask: best_ask.format().map_err(float_error)?,
-            midpoint: midpoint.format().map_err(float_error)?,
+            best_bid: best_bid_string,
+            best_ask: best_ask_string,
             assets_per_share,
             observed_at,
         });
     }
-    Ok(snapshots)
+    Ok(sample)
+}
+
+#[cfg(test)]
+fn aggregate_observations(
+    tokens: &[MarketToken],
+    observations: &[ObservedQuote],
+    chain_id: u32,
+    quote_token: Address,
+    observed_at: i64,
+    wrap_ratios: &HashMap<Address, WrapRatioValue>,
+) -> Result<Vec<NewMarketPriceSnapshot>, ApiError> {
+    aggregate_market_prices(
+        tokens,
+        observations,
+        chain_id,
+        quote_token,
+        observed_at,
+        wrap_ratios,
+    )
+    .map(|sample| sample.snapshots)
 }
 
 fn float_error(error: rain_math_float::FloatError) -> ApiError {
@@ -1160,6 +1257,7 @@ mod tests {
     fn observation(side: MarketSide, price: &str) -> ObservedQuote {
         ObservedQuote {
             asset_address: ASSET,
+            source_asset_address: ASSET,
             side,
             price: Float::parse(price.to_string()).expect("valid test price"),
         }
@@ -1235,6 +1333,236 @@ mod tests {
         )
         .expect("aggregate crossed book");
         assert!(crossed.is_empty());
+    }
+
+    #[test]
+    fn keeps_each_executable_side_without_fabricating_a_midpoint() {
+        for (side, price, bid, ask) in [
+            (MarketSide::Bid, "0.5109", Some("0.5109"), None),
+            (MarketSide::Ask, "1.1921", None, Some("1.1921")),
+        ] {
+            let sample = aggregate_market_prices(
+                &[token()],
+                &[observation(side, price)],
+                4663,
+                QUOTE,
+                120,
+                &wrap_ratios(),
+            )
+            .expect("aggregate one-sided executable book");
+            assert!(sample.snapshots.is_empty());
+            assert_eq!(sample.books.len(), 1);
+            assert_eq!(sample.books[0].best_bid.as_deref(), bid);
+            assert_eq!(sample.books[0].best_ask.as_deref(), ask);
+            assert_eq!(sample.books[0].observed_at, 120);
+        }
+    }
+
+    #[test]
+    fn empty_and_crossed_samples_explicitly_clear_executable_sides() {
+        for observations in [
+            vec![],
+            vec![
+                observation(MarketSide::Bid, "12"),
+                observation(MarketSide::Ask, "11"),
+            ],
+        ] {
+            let sample = aggregate_market_prices(
+                &[token()],
+                &observations,
+                4663,
+                QUOTE,
+                120,
+                &wrap_ratios(),
+            )
+            .expect("aggregate unavailable book");
+            assert!(sample.snapshots.is_empty());
+            assert_eq!(sample.books.len(), 1);
+            assert!(sample.books[0].best_bid.is_none());
+            assert!(sample.books[0].best_ask.is_none());
+        }
+    }
+
+    #[test]
+    fn unfunded_snes_ask_is_excluded_while_funded_bid_is_published() {
+        let ratio = "1.957330201605010765316108827559209238598551575650812292033666079467";
+        let variant_map = HashMap::from([(
+            ASSET,
+            MarketVariant {
+                canonical_address: ASSET,
+                price_multiplier: Float::parse("1".into()).expect("identity"),
+            },
+        )]);
+        let funded_bid = crate::test_helpers::wtmstr_quote("10560", "20669", ratio, "0.5109");
+        let empty_ask = crate::test_helpers::wtmstr_quote("0", "0", "1.1921", "0.83885");
+        let mut observations = observed_quotes_from_decoded_order(
+            &single_pair_order(ASSET, QUOTE),
+            &[funded_bid],
+            QUOTE,
+            &variant_map,
+            &token_decimals(),
+            alloy::primitives::B256::ZERO,
+        )
+        .expect("funded sell quote");
+        observations.extend(
+            observed_quotes_from_decoded_order(
+                &single_pair_order(QUOTE, ASSET),
+                &[empty_ask],
+                QUOTE,
+                &variant_map,
+                &token_decimals(),
+                alloy::primitives::B256::ZERO,
+            )
+            .expect("unfunded ask excluded"),
+        );
+        let sample =
+            aggregate_market_prices(&[token()], &observations, 4663, QUOTE, 120, &wrap_ratios())
+                .expect("one-sided SNES sample");
+        assert!(sample.snapshots.is_empty());
+        assert_eq!(sample.books[0].best_bid.as_deref(), Some("0.5109"));
+        assert!(sample.books[0].best_ask.is_none());
+    }
+
+    #[test]
+    fn wide_spread_keeps_real_side_prices_and_exact_display_midpoint() {
+        let sample = aggregate_market_prices(
+            &[token()],
+            &[
+                observation(MarketSide::Bid, "0.5109"),
+                observation(MarketSide::Ask, "1.1921"),
+            ],
+            4663,
+            QUOTE,
+            120,
+            &wrap_ratios(),
+        )
+        .expect("wide-spread book");
+        assert_eq!(sample.snapshots[0].midpoint, "0.8515");
+        assert_eq!(sample.books[0].best_bid.as_deref(), Some("0.5109"));
+        assert_eq!(sample.books[0].best_ask.as_deref(), Some("1.1921"));
+    }
+
+    #[test]
+    fn better_variant_prices_do_not_anchor_canonical_executable_sides() {
+        for variant in [
+            address!("4444444444444444444444444444444444444444"),
+            ASSET_TWO,
+        ] {
+            let mut variant_bid = observation(MarketSide::Bid, "11");
+            variant_bid.source_asset_address = variant;
+            let mut variant_ask = observation(MarketSide::Ask, "12");
+            variant_ask.source_asset_address = variant;
+            let sample = aggregate_market_prices(
+                &[token()],
+                &[
+                    observation(MarketSide::Bid, "10"),
+                    observation(MarketSide::Ask, "13"),
+                    variant_bid,
+                    variant_ask,
+                ],
+                8453,
+                QUOTE,
+                120,
+                &wrap_ratios(),
+            )
+            .expect("aggregate canonical and variant prices");
+            assert_eq!(sample.snapshots[0].best_bid, "11");
+            assert_eq!(sample.snapshots[0].best_ask, "12");
+            assert_eq!(sample.snapshots[0].midpoint, "11.5");
+            assert_eq!(sample.books[0].best_bid.as_deref(), Some("10"));
+            assert_eq!(sample.books[0].best_ask.as_deref(), Some("13"));
+        }
+    }
+
+    #[test]
+    fn variant_only_sample_preserves_display_midpoint_and_clears_canonical_book() {
+        let mut variant_bid = observation(MarketSide::Bid, "11");
+        variant_bid.source_asset_address = ASSET_TWO;
+        let mut variant_ask = observation(MarketSide::Ask, "12");
+        variant_ask.source_asset_address = ASSET_TWO;
+        let sample = aggregate_market_prices(
+            &[token()],
+            &[variant_bid, variant_ask],
+            8453,
+            QUOTE,
+            120,
+            &wrap_ratios(),
+        )
+        .expect("aggregate variant-only display prices");
+        assert_eq!(sample.snapshots[0].midpoint, "11.5");
+        assert_eq!(sample.books.len(), 1);
+        assert!(sample.books[0].best_bid.is_none());
+        assert!(sample.books[0].best_ask.is_none());
+    }
+
+    #[test]
+    fn crossed_variant_display_book_does_not_clear_valid_canonical_liquidity() {
+        let mut variant_bid = observation(MarketSide::Bid, "14");
+        variant_bid.source_asset_address = ASSET_TWO;
+        let sample = aggregate_market_prices(
+            &[token()],
+            &[
+                observation(MarketSide::Bid, "10"),
+                observation(MarketSide::Ask, "13"),
+                variant_bid,
+            ],
+            8453,
+            QUOTE,
+            120,
+            &wrap_ratios(),
+        )
+        .expect("independent crossed-book handling");
+        assert!(sample.snapshots.is_empty());
+        assert_eq!(sample.books[0].best_bid.as_deref(), Some("10"));
+        assert_eq!(sample.books[0].best_ask.as_deref(), Some("13"));
+    }
+
+    #[test]
+    fn decoded_observations_preserve_actual_asset_token_after_normalization() {
+        for source_asset in [ASSET, ASSET_TWO] {
+            let variant_map = HashMap::from([(
+                source_asset,
+                MarketVariant {
+                    canonical_address: ASSET,
+                    price_multiplier: Float::parse("2".into()).expect("test multiplier"),
+                },
+            )]);
+            let decimals = HashMap::from([(source_asset, 18), (QUOTE, 6)]);
+            let quote = crate::test_helpers::wtmstr_quote("100", "1000", "2", "0.5");
+            for (input, output, side, price) in [
+                (QUOTE, source_asset, MarketSide::Ask, "4"),
+                (source_asset, QUOTE, MarketSide::Bid, "1"),
+            ] {
+                let observations = observed_quotes_from_decoded_order(
+                    &single_pair_order(input, output),
+                    std::slice::from_ref(&quote),
+                    QUOTE,
+                    &variant_map,
+                    &decimals,
+                    alloy::primitives::B256::ZERO,
+                )
+                .expect("decode funded order observation");
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].asset_address, ASSET);
+                assert_eq!(observations[0].source_asset_address, source_asset);
+                assert_eq!(observations[0].side, side);
+                assert_eq!(observations[0].price.format().expect("format"), price);
+                let sample = aggregate_market_prices(
+                    &[token()],
+                    &observations,
+                    8453,
+                    QUOTE,
+                    120,
+                    &wrap_ratios(),
+                )
+                .expect("aggregate decoded source token");
+                let reference = match side {
+                    MarketSide::Bid => sample.books[0].best_bid.as_deref(),
+                    MarketSide::Ask => sample.books[0].best_ask.as_deref(),
+                };
+                assert_eq!(reference, (source_asset == ASSET).then_some(price));
+            }
+        }
     }
 
     #[test]
