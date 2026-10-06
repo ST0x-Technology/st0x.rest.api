@@ -94,13 +94,17 @@ sides means no executable side was observed, not a tradable price.
 Trading clients should use a fresh positive `executableBook.bestAsk` for a buy
 reference and the reciprocal of fresh positive `executableBook.bestBid` for a
 sell reference (the API swap IO ratio is input tokens per output token). Both
-values are quote units per canonical wrapped share. This accounts for each
-market's actual spread; the display midpoint is not a directional trade price.
-Do not use cached, future-dated, or missing sides as trading references. A book
-price does not guarantee a requested trade size can fill, and a directional
-reference protects against worsening execution rather than independently
-validating fair market value. Normal quote limits and execution slippage still
-apply.
+book prices are quote units per canonical wrapped share; the sell reference is
+the reciprocal bid, in wrapped shares per quote unit. Submit these references as
+`referenceIoRatio` with `denomination: "wrapped"`. For
+`denomination: "unwrapped"`, convert the reference first:
+`unwrappedReference = wrappedReference * inputAssetsPerShare / outputAssetsPerShare`
+(use 1 for a token without a wrapper). This accounts for each market's actual
+spread; the display midpoint is not a directional trade price. Do not use
+cached, future-dated, or missing sides as trading references. A book price does
+not guarantee a requested trade size can fill, and a directional reference
+protects against worsening execution rather than independently validating fair
+market value. Normal quote limits and execution slippage still apply.
 
 `change24hPercent` is null until a sample at least 24 hours older exists.
 
