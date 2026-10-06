@@ -1,6 +1,6 @@
 use crate::auth::AuthenticatedKey;
 use crate::db::market_price_history::{
-    list_current_and_previous_market_prices, list_market_price_history,
+    list_current_and_previous_market_prices, list_market_books, list_market_price_history,
     list_market_prices_at_or_before, MarketPriceSnapshot,
 };
 use crate::error::{ApiError, ApiErrorResponse};
@@ -69,6 +69,24 @@ pub enum MarketPriceSource {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutableBookSource {
+    Live,
+    Cached,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableBookResponse {
+    #[schema(nullable = true, example = "0.5109")]
+    best_bid: Option<String>,
+    #[schema(nullable = true, example = "1.1921")]
+    best_ask: Option<String>,
+    observed_at: i64,
+    source: ExecutableBookSource,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketPriceResponse {
     #[schema(example = 8453)]
@@ -90,6 +108,7 @@ pub struct MarketPriceResponse {
     observed_at: Option<i64>,
     #[schema(nullable = true, example = "1.42")]
     change_24h_percent: Option<String>,
+    executable_book: Option<ExecutableBookResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -272,6 +291,22 @@ async fn price_responses_for_market(
     )
     .await?;
 
+    let books_by_asset = if historical {
+        HashMap::new()
+    } else {
+        list_market_books(
+            &state.pool,
+            i64::from(market.chain_id),
+            &normalize_address(market.quote_token_address),
+            retained_start,
+        )
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|book| (book.asset_token_address.clone(), book))
+        .collect::<HashMap<_, _>>()
+    };
+
     market
         .tokens
         .iter()
@@ -303,7 +338,7 @@ async fn price_responses_for_market(
                     _ => None,
                 }
             };
-            price_response(
+            let mut response = price_response(
                 config,
                 market,
                 token,
@@ -311,7 +346,25 @@ async fn price_responses_for_market(
                 historical,
                 now,
                 change_24h_percent,
-            )
+            )?;
+            if let Some(book) = books_by_asset.get(&normalize_address(token.canonical_address)) {
+                let live_window = duration_seconds_i64(config.sample_interval, "sample interval")?
+                    .saturating_mul(2);
+                response.executable_book = Some(ExecutableBookResponse {
+                    best_bid: book.best_bid.clone(),
+                    best_ask: book.best_ask.clone(),
+                    observed_at: book.observed_at,
+                    source: if book.observed_at > 0
+                        && book.observed_at <= now
+                        && now.saturating_sub(book.observed_at) <= live_window
+                    {
+                        ExecutableBookSource::Live
+                    } else {
+                        ExecutableBookSource::Cached
+                    },
+                });
+            }
+            Ok(response)
         })
         .collect()
 }
@@ -494,6 +547,7 @@ fn price_response(
         source,
         observed_at: row.map(|row| row.observed_at),
         change_24h_percent,
+        executable_book: None,
     })
 }
 
@@ -931,6 +985,7 @@ using-tokens-from:
         assert!(body["data"][0].get("observedAt").is_some());
         assert!(body["data"][0].get("change24hPercent").is_some());
         assert!(body["data"][0].get("asset_address").is_none());
+        assert!(body["data"][0]["executableBook"].is_null());
     }
 
     #[rocket::async_test]
@@ -1099,5 +1154,128 @@ using-tokens-from:
         let path = format!("/v2/prices/{ASSET:#x}/history");
         let response = authorized_get(&client, &path).await;
         assert_eq!(response.status(), Status::BadRequest);
+    }
+    async fn seed_book(
+        client: &rocket::local::asynchronous::Client,
+        bid: Option<&str>,
+        ask: Option<&str>,
+        observed_at: i64,
+        asset: Address,
+    ) {
+        let pool = client.rocket().state::<DbPool>().expect("pool");
+        crate::db::market_price_history::replace_market_price_sample_with_books(
+            pool,
+            observed_at,
+            &[],
+            &[crate::db::market_price_history::NewMarketBookSnapshot {
+                chain_id: 8453,
+                asset_token_address: normalize_address(asset),
+                quote_token_address: normalize_address(QUOTE),
+                best_bid: bid.map(str::to_string),
+                best_ask: ask.map(str::to_string),
+                assets_per_share: "1".into(),
+                observed_at,
+            }],
+        )
+        .await
+        .expect("seed book");
+    }
+
+    #[rocket::async_test]
+    async fn retained_midpoint_and_one_sided_book_survive_restart_independently() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("books.db").display());
+        let client = price_client_with_database_url(Some(database_url.clone())).await;
+        let now = unix_now().expect("time");
+        seed_price(&client, now - 3600, "0.8395").await;
+        seed_book(&client, Some("0.5109"), None, now, ASSET).await;
+        drop(client);
+        let client = price_client_with_database_url(Some(database_url)).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        let price = &body["data"][0];
+        assert_eq!(price["source"], "cached");
+        assert_eq!(price["midpoint"], "0.8395");
+        assert_eq!(price["executableBook"]["source"], "live");
+        assert_eq!(price["executableBook"]["bestBid"], "0.5109");
+        assert!(price["executableBook"]["bestAsk"].is_null());
+        assert_eq!(price["executableBook"]["observedAt"], now);
+        let path = format!("/v1/prices?chainId=8453&at={now}");
+        let historical: serde_json::Value = authorized_get(&client, &path)
+            .await
+            .into_json()
+            .await
+            .expect("historical");
+        assert!(historical["data"][0]["executableBook"].is_null());
+    }
+
+    #[rocket::async_test]
+    async fn executable_book_available_without_midpoint_and_empty_sample_clears_liquidity() {
+        let client = price_client().await;
+        let now = unix_now().expect("time");
+        seed_book(&client, None, Some("1.1921"), now - 60, ASSET).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        assert_eq!(body["data"][0]["source"], "unavailable");
+        assert!(body["data"][0]["midpoint"].is_null());
+        assert_eq!(body["data"][0]["executableBook"]["bestAsk"], "1.1921");
+        seed_book(&client, None, None, now, ASSET).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        let book = &body["data"][0]["executableBook"];
+        assert_eq!(book["source"], "live");
+        assert!(book["bestBid"].is_null());
+        assert!(book["bestAsk"].is_null());
+    }
+
+    #[rocket::async_test]
+    async fn books_fail_closed_for_expired_future_and_rotated_canonical_tokens() {
+        let client = price_client().await;
+        let now = unix_now().expect("time");
+        // Legacy token observations are never reused as canonical executable liquidity.
+        seed_book(&client, Some("9"), Some("11"), now, LEGACY).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        assert!(body["data"][0]["executableBook"].is_null());
+        seed_book(&client, Some("9"), None, now - 121, ASSET).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        assert_eq!(body["data"][0]["executableBook"]["source"], "cached");
+        seed_book(&client, Some("9"), None, now + 60, ASSET).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        assert_eq!(body["data"][0]["executableBook"]["source"], "cached");
+    }
+    #[rocket::async_test]
+    async fn executable_book_outside_retention_is_unavailable() {
+        let client = price_client().await;
+        let now = unix_now().expect("time");
+        let state = client.rocket().state::<MarketPriceState>().expect("state");
+        let retention = i64::try_from(state.config.retention.as_secs()).expect("retention");
+        seed_book(&client, Some("9"), None, now - retention - 1, ASSET).await;
+        let body: serde_json::Value = authorized_get(&client, "/v1/prices?chainId=8453")
+            .await
+            .into_json()
+            .await
+            .expect("response");
+        assert!(body["data"][0]["executableBook"].is_null());
     }
 }

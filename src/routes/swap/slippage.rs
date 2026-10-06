@@ -323,6 +323,78 @@ mod tests {
     }
 
     #[test]
+    fn directional_references_handle_different_spreads_without_widening_guards() {
+        let one = Float::parse("1".into()).unwrap();
+        let multiplier = Float::parse("1.01".into()).unwrap();
+        for (bid, ask) in [
+            ("0.99", "1.01"),
+            ("0.96", "1.04"),
+            ("0.8", "1.2"),
+            ("0.6", "1.4"),
+        ] {
+            for (mode, reference) in [
+                (TakeOrdersMode::BuyUpTo, Float::parse(ask.into()).unwrap()),
+                (
+                    TakeOrdersMode::SpendUpTo,
+                    one.div(Float::parse(bid.into()).unwrap()).unwrap(),
+                ),
+            ] {
+                let ratio = reference.format().unwrap();
+                let cap = resolve_slippage_price_cap(
+                    vec![candidate(1, "10", &ratio)],
+                    mode,
+                    "1",
+                    100,
+                    Some(reference),
+                )
+                .unwrap();
+                assert!(cap.eq(reference.mul(multiplier).unwrap()).unwrap());
+                let worse = reference.mul(Float::parse("1.06".into()).unwrap()).unwrap();
+                assert!(
+                    resolve_slippage_price_cap(
+                        vec![candidate(1, "10", &worse.format().unwrap())],
+                        mode,
+                        "1",
+                        100,
+                        Some(reference),
+                    )
+                    .is_err(),
+                    "the five-percent guard must still reject worse prices"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_snes_midpoint_still_rejects_sell_but_current_bid_succeeds() {
+        let ratio = "1.957330201605010765316108827559209238598551575650812292033666079467";
+        let one = Float::parse("1".into()).unwrap();
+        let midpoint_reference = one.div(Float::parse("0.8515".into()).unwrap()).unwrap();
+        assert!(resolve_slippage_price_cap(
+            vec![candidate(1, "10560", ratio)],
+            TakeOrdersMode::SpendUpTo,
+            "3.401414549816231653",
+            100,
+            Some(midpoint_reference),
+        )
+        .is_err());
+        let bid_reference = Float::parse(ratio.into()).unwrap();
+        let cap = resolve_slippage_price_cap(
+            vec![candidate(1, "10560", ratio)],
+            TakeOrdersMode::SpendUpTo,
+            "3.401414549816231653",
+            100,
+            Some(bid_reference),
+        )
+        .unwrap();
+        assert!(cap
+            .eq(bid_reference
+                .mul(Float::parse("1.01".into()).unwrap())
+                .unwrap())
+            .unwrap());
+    }
+
+    #[test]
     fn rejects_non_positive_reference_price() {
         let result = resolve_slippage_price_cap(
             vec![candidate(1, "5", "1")],

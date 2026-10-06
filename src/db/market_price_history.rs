@@ -13,6 +13,28 @@ pub(crate) struct NewMarketPriceSnapshot {
     pub observed_at: i64,
 }
 
+/// Latest complete executable-book observation; absent sides clear earlier liquidity.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(crate) struct NewMarketBookSnapshot {
+    pub chain_id: i64,
+    pub asset_token_address: String,
+    pub quote_token_address: String,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
+    pub assets_per_share: String,
+    pub observed_at: i64,
+}
+
+pub(crate) async fn list_market_books(
+    pool: &DbPool,
+    chain_id: i64,
+    quote_token_address: &str,
+    retained_start: i64,
+) -> Result<Vec<NewMarketBookSnapshot>, sqlx::Error> {
+    sqlx::query_as("SELECT chain_id, asset_token_address, quote_token_address, best_bid, best_ask, assets_per_share, observed_at FROM market_books WHERE chain_id = ? AND quote_token_address = ? AND observed_at >= ?")
+        .bind(chain_id).bind(quote_token_address).bind(retained_start).fetch_all(pool).await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(crate) struct MarketPriceSnapshot {
     pub chain_id: i64,
@@ -81,10 +103,20 @@ pub(crate) async fn insert_market_price_snapshots(
     Ok(rows_affected)
 }
 
+#[cfg(test)]
 pub(crate) async fn replace_market_price_sample(
     pool: &DbPool,
     observed_at: i64,
     snapshots: &[NewMarketPriceSnapshot],
+) -> Result<(u64, u64), sqlx::Error> {
+    replace_market_price_sample_with_books(pool, observed_at, snapshots, &[]).await
+}
+
+pub(crate) async fn replace_market_price_sample_with_books(
+    pool: &DbPool,
+    observed_at: i64,
+    snapshots: &[NewMarketPriceSnapshot],
+    books: &[NewMarketBookSnapshot],
 ) -> Result<(u64, u64), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let deleted = sqlx::query("DELETE FROM market_price_snapshots WHERE observed_at = ?")
@@ -93,7 +125,24 @@ pub(crate) async fn replace_market_price_sample(
         .await?
         .rows_affected();
     let inserted = insert_market_price_snapshots_in_transaction(&mut tx, snapshots).await?;
+    let mut skipped_books = 0;
+    for book in books {
+        let result = sqlx::query("INSERT INTO market_books (chain_id, asset_token_address, quote_token_address, best_bid, best_ask, assets_per_share, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (chain_id, asset_token_address, quote_token_address) DO UPDATE SET best_bid = excluded.best_bid, best_ask = excluded.best_ask, assets_per_share = excluded.assets_per_share, observed_at = excluded.observed_at WHERE excluded.observed_at >= market_books.observed_at")
+            .bind(book.chain_id).bind(&book.asset_token_address).bind(&book.quote_token_address)
+            .bind(&book.best_bid).bind(&book.best_ask).bind(&book.assets_per_share).bind(book.observed_at)
+            .execute(&mut *tx).await?;
+        skipped_books += usize::from(result.rows_affected() == 0);
+    }
     tx.commit().await?;
+    if skipped_books > 0 {
+        tracing::warn!(
+            observed_at,
+            produced_book_count = books.len(),
+            written_book_count = books.len() - skipped_books,
+            skipped_book_count = skipped_books,
+            "older executable book observations were skipped to preserve newer observations"
+        );
+    }
     Ok((deleted, inserted))
 }
 
@@ -178,6 +227,10 @@ pub(crate) async fn delete_market_price_snapshots_before(
     pool: &DbPool,
     cutoff: i64,
 ) -> Result<u64, sqlx::Error> {
+    sqlx::query("DELETE FROM market_books WHERE observed_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
     sqlx::query("DELETE FROM market_price_snapshots WHERE observed_at < ?")
         .bind(cutoff)
         .execute(pool)
@@ -406,5 +459,101 @@ mod tests {
         assert_eq!(previous.len(), 2);
         assert_eq!(previous[0].midpoint, "10");
         assert_eq!(previous[1].midpoint, "20");
+    }
+    fn book(bid: Option<&str>, ask: Option<&str>, observed_at: i64) -> NewMarketBookSnapshot {
+        NewMarketBookSnapshot {
+            chain_id: 8453,
+            asset_token_address: "0xasset".into(),
+            quote_token_address: "0xquote".into(),
+            best_bid: bid.map(str::to_string),
+            best_ask: ask.map(str::to_string),
+            assets_per_share: "1".into(),
+            observed_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn executable_book_replacement_clears_missing_sides_and_rejects_older_samples() {
+        let pool = test_pool().await;
+        for sample in [
+            book(Some("0.51"), Some("1.19"), 100),
+            book(Some("0.52"), None, 160),
+            book(None, None, 180),
+        ] {
+            replace_market_price_sample_with_books(
+                &pool,
+                sample.observed_at,
+                &[],
+                std::slice::from_ref(&sample),
+            )
+            .await
+            .expect("replace book");
+            let rows = list_market_books(&pool, 8453, "0xquote", 0)
+                .await
+                .expect("read book");
+            assert_eq!(rows, vec![sample]);
+        }
+        replace_market_price_sample_with_books(&pool, 160, &[], &[book(Some("0.52"), None, 160)])
+            .await
+            .expect("older sample");
+        assert_eq!(
+            list_market_books(&pool, 8453, "0xquote", 0)
+                .await
+                .expect("read book"),
+            vec![book(None, None, 180)]
+        );
+        replace_market_price_sample_with_books(&pool, 180, &[], &[book(None, Some("1.2"), 180)])
+            .await
+            .expect("same bucket replacement");
+        assert_eq!(
+            list_market_books(&pool, 8453, "0xquote", 0)
+                .await
+                .expect("read book"),
+            vec![book(None, Some("1.2"), 180)]
+        );
+        delete_market_price_snapshots_before(&pool, 181)
+            .await
+            .expect("prune books");
+        assert!(list_market_books(&pool, 8453, "0xquote", 0)
+            .await
+            .expect("read book")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn books_and_midpoints_commit_atomically() {
+        let pool = test_pool().await;
+        replace_market_price_sample_with_books(
+            &pool,
+            100,
+            &[snapshot("0xasset", "10", 100)],
+            &[book(Some("9"), Some("11"), 100)],
+        )
+        .await
+        .expect("initial sample");
+        sqlx::query("CREATE TRIGGER reject_book BEFORE UPDATE ON market_books BEGIN SELECT RAISE(ABORT, 'test rollback'); END").execute(&pool).await.expect("trigger");
+        assert!(replace_market_price_sample_with_books(
+            &pool,
+            100,
+            &[snapshot("0xasset", "20", 100)],
+            &[book(Some("19"), Some("21"), 100)]
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            list_market_prices_at_or_before(&pool, 8453, "0xquote", 0, 100)
+                .await
+                .expect("read midpoint")[0]
+                .midpoint,
+            "10"
+        );
+        assert_eq!(
+            list_market_books(&pool, 8453, "0xquote", 0)
+                .await
+                .expect("read book")[0]
+                .best_bid
+                .as_deref(),
+            Some("9")
+        );
     }
 }
