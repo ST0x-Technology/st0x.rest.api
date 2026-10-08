@@ -25,7 +25,7 @@ variable "droplet_size" {
 variable "volume_size_gb" {
   description = "Block storage volume size in GB"
   type        = number
-  default     = 5
+  default     = 50
 }
 
 variable "preview_enabled" {

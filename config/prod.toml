@@ -1,4 +1,4 @@
-log_dir = "/mnt/data/st0x-rest-api/logs"
+log_dir = "/var/log/st0x-rest-api"
 database_url = "sqlite:///mnt/data/st0x-rest-api/st0x.db"
 database_max_connections = 20
 usage_log_max_concurrency = 2
