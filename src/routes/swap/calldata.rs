@@ -733,44 +733,38 @@ async fn process_swap_calldata_build(
 
     // A failed order must not veto a complete healthy route. Preserve the quote
     // policy for incomplete mixed books, using the same normalized price cap.
-    let mixed_route = if let Some(oracle_error) =
-        candidate_build.failures.oracle_unavailable_error()
-    {
-        let mode = ParsedTakeOrdersMode::parse(req.mode, &amount)
-            .map_err(super::map_raindex_error)
-            .map_err(map_calldata_boundary_error)?;
-        let cap = Float::parse(price_cap.clone()).map_err(|error| {
-            tracing::error!(%error, "failed to parse normalized calldata price cap");
-            ApiError::coded(
-                ApiErrorCode::SwapCalldataFailed,
-                "swap calldata could not be generated",
-            )
-        })?;
-        let simulation =
-            super::slippage::select_best_raindex_simulation(candidate_build.candidates, mode, cap)
-                .map_err(|error| candidate_build.failures.map_no_liquidity_error(error))
+    let mixed_route =
+        if let Some(oracle_error) = candidate_build.failures.oracle_unavailable_error() {
+            let mode = ParsedTakeOrdersMode::parse(req.mode, &amount)
+                .map_err(super::map_raindex_error)
                 .map_err(map_calldata_boundary_error)?;
-        let achieved = if mode.is_buy_mode() {
-            simulation.total_output
+            let cap = Float::parse(price_cap.clone()).map_err(|error| {
+                tracing::warn!(%error, "swap calldata rejected for invalid price_cap");
+                ApiError::BadRequest("invalid price_cap".into())
+            })?;
+            let zero = Float::zero().map_err(|error| super::map_raindex_error(error.into()))?;
+            if cap
+                .lt(zero)
+                .map_err(|error| super::map_raindex_error(error.into()))?
+            {
+                return Err(super::map_raindex_error(
+                    super::RaindexError::NegativePriceCap,
+                ));
+            }
+            let (_, fully_filled) =
+                super::slippage::simulate_request_fill(candidate_build.candidates, mode, cap)
+                    .map_err(|error| candidate_build.failures.map_no_liquidity_error(error))
+                    .map_err(map_calldata_boundary_error)?;
+            if !fully_filled {
+                tracing::warn!(
+                    "healthy swap candidates cannot fill request while an oracle is unavailable"
+                );
+                return Err(oracle_error);
+            }
+            Some((mode, oracle_error))
         } else {
-            simulation.total_input
+            None
         };
-        if !super::quote::is_quote_fully_filled(
-            achieved,
-            mode.target_amount(),
-            mode.is_exact_mode(),
-        )
-        .map_err(map_calldata_boundary_error)?
-        {
-            tracing::warn!(
-                "healthy swap candidates cannot fill request while an oracle is unavailable"
-            );
-            return Err(oracle_error);
-        }
-        Some((mode, oracle_error))
-    } else {
-        None
-    };
 
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
@@ -2189,6 +2183,27 @@ mod tests {
                 expected,
             );
             assert!(captured.lock().unwrap().is_some());
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_mixed_book_calldata_invalid_explicit_cap_is_bad_request() {
+        for mode in [
+            SwapCalldataMode::SpendUpTo,
+            SwapCalldataMode::SpendExact,
+            SwapCalldataMode::BuyUpTo,
+        ] {
+            for cap in ["abc", "-1"] {
+                let (ds, captured) = capture_candidate_outcome_ds(
+                    vec![mock_candidate("100", "2")],
+                    vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                );
+                let result =
+                    process_swap_calldata_v2(&ds, calldata_v2_request(mode, "10", cap)).await;
+
+                assert!(matches!(result, Err(ApiError::BadRequest(_))));
+                no_take_orders_request_was_made(&captured);
+            }
         }
     }
 

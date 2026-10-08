@@ -491,15 +491,14 @@ pub(super) async fn process_swap_quote_v2(
     let is_buy_mode = parsed_mode.is_buy_mode();
     let is_exact_mode = parsed_mode.is_exact_mode();
     let target_amount = parsed_mode.target_amount();
-    let simulation =
-        super::slippage::select_best_raindex_simulation(candidates, parsed_mode, price_cap)
+    let (simulation, fully_filled) =
+        super::slippage::simulate_request_fill(candidates, parsed_mode, price_cap)
             .map_err(|error| failures.map_no_liquidity_error(error))?;
     let achieved_amount = if is_buy_mode {
         simulation.total_output
     } else {
         simulation.total_input
     };
-    let fully_filled = is_quote_fully_filled(achieved_amount, target_amount, is_exact_mode)?;
     if !fully_filled {
         let requested = target_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format requested quote amount");
