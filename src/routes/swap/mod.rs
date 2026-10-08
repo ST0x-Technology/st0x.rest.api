@@ -126,6 +126,20 @@ impl SwapQuoteFailures {
             )
         })
     }
+
+    pub(crate) fn map_no_liquidity_error(&self, error: ApiError) -> ApiError {
+        if matches!(
+            &error,
+            ApiError::Coded {
+                code: ApiErrorCode::SwapNoLiquidity,
+                ..
+            }
+        ) {
+            self.oracle_unavailable_error().unwrap_or(error)
+        } else {
+            error
+        }
+    }
 }
 
 impl FromIterator<SwapQuoteFailure> for SwapQuoteFailures {

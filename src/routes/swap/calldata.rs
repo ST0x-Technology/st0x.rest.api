@@ -29,7 +29,7 @@ use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::{takeOrders4Call, OrderV4};
 use rain_orderbook_common::oracle::{encode_oracle_body_batch, fetch_signed_context_batch};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
-use rain_orderbook_common::take_orders::TakeOrdersMode;
+use rain_orderbook_common::take_orders::{ParsedTakeOrdersMode, TakeOrdersMode};
 use rocket::serde::json::Json;
 use rocket::State;
 use std::collections::BTreeMap;
@@ -588,11 +588,11 @@ async fn build_calldata_candidates(
         .build_candidates_for_pair(&orders, input_token, output_token, taker)
         .await
         .map_err(map_calldata_boundary_error)?;
-    if let Some(error) = candidate_build.failures.oracle_unavailable_error() {
-        return Err(error);
-    }
     if candidate_build.candidates.is_empty() {
-        return Err(no_liquidity_error());
+        return Err(candidate_build
+            .failures
+            .oracle_unavailable_error()
+            .unwrap_or_else(no_liquidity_error));
     }
     Ok(candidate_build)
 }
@@ -607,114 +607,164 @@ async fn process_swap_calldata_build(
         .await
         .map_err(map_calldata_boundary_error)?;
 
-    let (amount, price_cap, resolved_price_cap, wrap_ratios) = match req.price_limit {
-        SwapCalldataPriceLimit::Explicit { value, field } => {
-            let resolved_price_cap = value.clone();
-            let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
-                ds,
-                CalldataRequestNormalization {
-                    chain_id: req.chain_id,
-                    denomination: req.denomination,
-                    input_token: req.input_token,
-                    output_token: req.output_token,
-                    mode: req.mode,
-                    amount: req.amount,
-                    amount_field: req.amount_field,
-                    price_cap: value,
-                    price_cap_field: field,
-                },
-            )
-            .await
-            .map_err(map_calldata_boundary_error)?;
-            build_calldata_candidates(
-                ds,
-                req.chain_id,
-                req.input_token,
-                req.output_token,
-                req.taker,
-            )
-            .await?;
-            (amount, price_cap, resolved_price_cap, wrap_ratios)
-        }
-        SwapCalldataPriceLimit::SlippageBps {
-            slippage_bps,
-            reference_io_ratio,
-        } => {
-            let (amount, wrap_ratios) = normalize_calldata_request_amount(
-                ds,
-                CalldataAmountNormalization {
-                    chain_id: req.chain_id,
-                    denomination: req.denomination,
-                    input_token: req.input_token,
-                    output_token: req.output_token,
-                    mode: req.mode,
-                    amount: req.amount,
-                    amount_field: req.amount_field,
-                },
-            )
-            .await
-            .map_err(map_calldata_boundary_error)?;
-            let reference_io_ratio = reference_io_ratio
-                .map(|reference_io_ratio| {
-                    normalize_calldata_price_cap(
-                        reference_io_ratio,
-                        "reference_io_ratio",
-                        req.denomination,
-                        req.input_token,
-                        req.output_token,
-                        &wrap_ratios,
-                    )
-                    .and_then(|reference_io_ratio| {
-                        Float::parse(reference_io_ratio).map_err(|error| {
-                            tracing::warn!(
-                                %error,
-                                "swap calldata rejected for invalid reference_io_ratio"
-                            );
-                            ApiError::BadRequest("invalid reference_io_ratio".into())
-                        })
-                    })
-                })
-                .transpose()?;
-            let candidate_build = build_calldata_candidates(
-                ds,
-                req.chain_id,
-                req.input_token,
-                req.output_token,
-                req.taker,
-            )
-            .await?;
-            let price_cap = super::slippage::resolve_slippage_price_cap(
-                candidate_build.candidates,
-                req.mode,
-                &amount,
+    let (amount, price_cap, resolved_price_cap, wrap_ratios, candidate_build) =
+        match req.price_limit {
+            SwapCalldataPriceLimit::Explicit { value, field } => {
+                let resolved_price_cap = value.clone();
+                let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
+                    ds,
+                    CalldataRequestNormalization {
+                        chain_id: req.chain_id,
+                        denomination: req.denomination,
+                        input_token: req.input_token,
+                        output_token: req.output_token,
+                        mode: req.mode,
+                        amount: req.amount,
+                        amount_field: req.amount_field,
+                        price_cap: value,
+                        price_cap_field: field,
+                    },
+                )
+                .await
+                .map_err(map_calldata_boundary_error)?;
+                let candidate_build = build_calldata_candidates(
+                    ds,
+                    req.chain_id,
+                    req.input_token,
+                    req.output_token,
+                    req.taker,
+                )
+                .await?;
+                (
+                    amount,
+                    price_cap,
+                    resolved_price_cap,
+                    wrap_ratios,
+                    candidate_build,
+                )
+            }
+            SwapCalldataPriceLimit::SlippageBps {
                 slippage_bps,
                 reference_io_ratio,
-            )
-            .map_err(map_calldata_boundary_error)?;
-            let resolved_price_cap = denormalize_calldata_price_cap(
-                price_cap,
-                req.denomination,
-                req.input_token,
-                req.output_token,
-                &wrap_ratios,
-            )
-            .map_err(map_calldata_boundary_error)?;
-            tracing::info!(
-                slippage_bps,
-                resolved_price_cap = %resolved_price_cap,
-                denomination = ?req.denomination,
-                "resolved swap slippage price cap"
-            );
-            let price_cap = price_cap.format().map_err(|error| {
-                tracing::error!(%error, "failed to format resolved slippage price cap");
-                ApiError::coded(
-                    ApiErrorCode::SwapCalldataFailed,
-                    "swap calldata could not be generated",
+            } => {
+                let (amount, wrap_ratios) = normalize_calldata_request_amount(
+                    ds,
+                    CalldataAmountNormalization {
+                        chain_id: req.chain_id,
+                        denomination: req.denomination,
+                        input_token: req.input_token,
+                        output_token: req.output_token,
+                        mode: req.mode,
+                        amount: req.amount,
+                        amount_field: req.amount_field,
+                    },
                 )
-            })?;
-            (amount, price_cap, resolved_price_cap, wrap_ratios)
+                .await
+                .map_err(map_calldata_boundary_error)?;
+                let reference_io_ratio = reference_io_ratio
+                    .map(|reference_io_ratio| {
+                        normalize_calldata_price_cap(
+                            reference_io_ratio,
+                            "reference_io_ratio",
+                            req.denomination,
+                            req.input_token,
+                            req.output_token,
+                            &wrap_ratios,
+                        )
+                        .and_then(|reference_io_ratio| {
+                            Float::parse(reference_io_ratio).map_err(|error| {
+                                tracing::warn!(
+                                    %error,
+                                    "swap calldata rejected for invalid reference_io_ratio"
+                                );
+                                ApiError::BadRequest("invalid reference_io_ratio".into())
+                            })
+                        })
+                    })
+                    .transpose()?;
+                let candidate_build = build_calldata_candidates(
+                    ds,
+                    req.chain_id,
+                    req.input_token,
+                    req.output_token,
+                    req.taker,
+                )
+                .await?;
+                let price_cap = super::slippage::resolve_slippage_price_cap(
+                    candidate_build.candidates.clone(),
+                    req.mode,
+                    &amount,
+                    slippage_bps,
+                    reference_io_ratio,
+                )
+                .map_err(|error| candidate_build.failures.map_no_liquidity_error(error))
+                .map_err(map_calldata_boundary_error)?;
+                let resolved_price_cap = denormalize_calldata_price_cap(
+                    price_cap,
+                    req.denomination,
+                    req.input_token,
+                    req.output_token,
+                    &wrap_ratios,
+                )
+                .map_err(map_calldata_boundary_error)?;
+                tracing::info!(
+                    slippage_bps,
+                    resolved_price_cap = %resolved_price_cap,
+                    denomination = ?req.denomination,
+                    "resolved swap slippage price cap"
+                );
+                let price_cap = price_cap.format().map_err(|error| {
+                    tracing::error!(%error, "failed to format resolved slippage price cap");
+                    ApiError::coded(
+                        ApiErrorCode::SwapCalldataFailed,
+                        "swap calldata could not be generated",
+                    )
+                })?;
+                (
+                    amount,
+                    price_cap,
+                    resolved_price_cap,
+                    wrap_ratios,
+                    candidate_build,
+                )
+            }
+        };
+
+    // A failed order must not veto a complete healthy route. Preserve the quote
+    // policy for incomplete mixed books, using the same normalized price cap.
+    if let Some(oracle_error) = candidate_build.failures.oracle_unavailable_error() {
+        let mode = ParsedTakeOrdersMode::parse(req.mode, &amount)
+            .map_err(super::map_raindex_error)
+            .map_err(map_calldata_boundary_error)?;
+        let cap = Float::parse(price_cap.clone()).map_err(|error| {
+            tracing::error!(%error, "failed to parse normalized calldata price cap");
+            ApiError::coded(
+                ApiErrorCode::SwapCalldataFailed,
+                "swap calldata could not be generated",
+            )
+        })?;
+        let simulation =
+            super::slippage::select_best_raindex_simulation(candidate_build.candidates, mode, cap)
+                .map_err(|error| candidate_build.failures.map_no_liquidity_error(error))
+                .map_err(map_calldata_boundary_error)?;
+        let achieved = if mode.is_buy_mode() {
+            simulation.total_output
+        } else {
+            simulation.total_input
+        };
+        if !super::quote::is_quote_fully_filled(
+            achieved,
+            mode.target_amount(),
+            mode.is_exact_mode(),
+        )
+        .map_err(map_calldata_boundary_error)?
+        {
+            tracing::warn!(
+                "healthy swap candidates cannot fill request while an oracle is unavailable"
+            );
+            return Err(oracle_error);
         }
-    };
+    }
 
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
@@ -729,6 +779,7 @@ async fn process_swap_calldata_build(
     let response = ds
         .get_calldata_on_chain(req.chain_id, take_req)
         .await
+        .map_err(|error| candidate_build.failures.map_no_liquidity_error(error))
         .map_err(map_calldata_boundary_error)?;
     let mut calldata =
         normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
@@ -1967,20 +2018,168 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_calldata_v2_slippage_rejects_incomplete_price_basis() {
-        let (ds, captured_request) = capture_candidate_outcome_ds(
-            vec![mock_candidate("100", "2")],
+    async fn test_slippage_calldata_ignores_unrelated_oracle_failure() {
+        for mode in [
+            SwapCalldataMode::SpendUpTo,
+            SwapCalldataMode::SpendExact,
+            SwapCalldataMode::BuyUpTo,
+        ] {
+            for explicit_cap in [false, true] {
+                let (ds, captured_request) = capture_candidate_outcome_ds(
+                    vec![mock_candidate("100", "2")],
+                    vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                );
+                let request = if explicit_cap {
+                    calldata_v2_request(mode, "10", "2.01")
+                } else {
+                    slippage_v2_request(mode, "10", 50)
+                };
+                let result = process_swap_calldata_v2(&ds, request).await.unwrap();
+
+                assert_eq!(result.resolved_price_cap, "2.01");
+                let captured = captured_take_orders_request(&captured_request);
+                assert_eq!(captured.price_cap, "2.01");
+                assert_eq!(captured.amount, "10");
+            }
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_calldata_preserves_mixed_book_failure_boundaries() {
+        for mode in [
+            SwapCalldataMode::SpendUpTo,
+            SwapCalldataMode::SpendExact,
+            SwapCalldataMode::BuyUpTo,
+        ] {
+            for explicit_cap in [false, true] {
+                for capacity in ["0", "3"] {
+                    let candidates = if capacity == "0" {
+                        Vec::new()
+                    } else {
+                        vec![mock_candidate(capacity, "2")]
+                    };
+                    let (ds, captured) = capture_candidate_outcome_ds(
+                        candidates,
+                        vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                    );
+                    let request = if explicit_cap {
+                        calldata_v2_request(mode, "10", "2.01")
+                    } else {
+                        slippage_v2_request(mode, "10", 50)
+                    };
+
+                    assert_error_code(
+                        process_swap_calldata_v2(&ds, request).await,
+                        ApiErrorCode::SwapOracleUnavailable,
+                    );
+                    no_take_orders_request_was_made(&captured);
+                }
+            }
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_calldata_preserves_price_guards_with_unavailable_orders() {
+        for explicit_cap in [false, true] {
+            let (ds, captured) = capture_candidate_outcome_ds(
+                vec![mock_candidate("100", "2")],
+                vec![super::super::SwapQuoteFailure::OracleUnavailable],
+            );
+            let request = if explicit_cap {
+                calldata_v2_request(SwapCalldataMode::SpendUpTo, "10", "1")
+            } else {
+                let mut request = slippage_v2_request(SwapCalldataMode::SpendUpTo, "10", 100);
+                request.reference_io_ratio = Some("1".to_string());
+                request
+            };
+
+            assert_error_code(
+                process_swap_calldata_v2(&ds, request).await,
+                ApiErrorCode::SwapOracleUnavailable,
+            );
+            no_take_orders_request_was_made(&captured);
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_calldata_preserves_oracle_failure_when_sdk_liquidity_changes() {
+        for code in [
+            ApiErrorCode::SwapNoLiquidity,
+            ApiErrorCode::SwapCalldataFailed,
+        ] {
+            let (mut ds, captured) = capture_candidate_outcome_ds(
+                vec![mock_candidate("100", "2")],
+                vec![super::super::SwapQuoteFailure::OracleUnavailable],
+            );
+            ds.base.calldata_result = Err(ApiError::coded(code, "SDK evaluation failed"));
+            let expected = if code == ApiErrorCode::SwapNoLiquidity {
+                ApiErrorCode::SwapOracleUnavailable
+            } else {
+                code
+            };
+
+            assert_error_code(
+                process_swap_calldata_v2(
+                    &ds,
+                    slippage_v2_request(SwapCalldataMode::SpendUpTo, "10", 100),
+                )
+                .await,
+                expected,
+            );
+            assert!(captured.lock().unwrap().is_some());
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_mixed_book_calldata_checks_capacity_in_wrapped_units() {
+        for (input, output, mode, amount, cap) in [
+            (WT_MSTR, WETH, SwapCalldataMode::SpendExact, "5", "4.04"),
+            (USDC, WT_COIN, SwapCalldataMode::BuyUpTo, "2.5", "0.505"),
+        ] {
+            for explicit_cap in [false, true] {
+                let (mut ds, captured) = capture_candidate_outcome_ds(
+                    vec![mock_candidate("3", "2")],
+                    vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                );
+                ds.wrap_ratios = Ok(HashMap::from([
+                    (WT_MSTR, wrap_ratio(WT_MSTR, "2")),
+                    (WT_COIN, wrap_ratio(WT_COIN, "4")),
+                ]));
+                let mut request = unwrapped_calldata_v2_request(input, output, mode, "10", cap);
+                if !explicit_cap {
+                    request.price_cap = None;
+                    request.slippage_bps = Some(100);
+                }
+
+                let result = process_swap_calldata_v2(&ds, request).await.unwrap();
+
+                assert_eq!(result.resolved_price_cap, cap);
+                let captured = captured_take_orders_request(&captured);
+                assert_eq!(captured.amount, amount);
+                assert_eq!(captured.price_cap, "2.02");
+            }
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_mixed_book_calldata_does_not_combine_raindex_deployments() {
+        let first = mock_candidate("3", "2");
+        let mut second = first.clone();
+        second.raindex = address!("2222222222222222222222222222222222222222");
+        let (ds, captured) = capture_candidate_outcome_ds(
+            vec![first, second],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
         );
 
-        let result = process_swap_calldata_v2(
-            &ds,
-            slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
-        )
-        .await;
-
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
-        no_take_orders_request_was_made(&captured_request);
+        assert_error_code(
+            process_swap_calldata_v2(
+                &ds,
+                slippage_v2_request(SwapCalldataMode::SpendExact, "10", 100),
+            )
+            .await,
+            ApiErrorCode::SwapOracleUnavailable,
+        );
+        no_take_orders_request_was_made(&captured);
     }
 
     #[rocket::async_test]

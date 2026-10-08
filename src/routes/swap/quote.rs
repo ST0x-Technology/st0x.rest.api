@@ -381,7 +381,7 @@ async fn process_swap_quote(
     })
 }
 
-async fn process_swap_quote_v2(
+pub(super) async fn process_swap_quote_v2(
     ds: &dyn SwapDataSource,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
@@ -456,9 +456,6 @@ async fn process_swap_quote_v2(
             slippage_bps,
             reference_io_ratio,
         } => {
-            if let Some(error) = failures.oracle_unavailable_error() {
-                return Err(error);
-            }
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
@@ -486,7 +483,8 @@ async fn process_swap_quote_v2(
                 &amount,
                 slippage_bps,
                 reference_io_ratio,
-            )?
+            )
+            .map_err(|error| failures.map_no_liquidity_error(error))?
         }
     };
 
@@ -495,19 +493,7 @@ async fn process_swap_quote_v2(
     let target_amount = parsed_mode.target_amount();
     let simulation =
         super::slippage::select_best_raindex_simulation(candidates, parsed_mode, price_cap)
-            .map_err(|error| {
-                if matches!(
-                    &error,
-                    ApiError::Coded {
-                        code: ApiErrorCode::SwapNoLiquidity,
-                        ..
-                    }
-                ) {
-                    failures.oracle_unavailable_error().unwrap_or(error)
-                } else {
-                    error
-                }
-            })?;
+            .map_err(|error| failures.map_no_liquidity_error(error))?;
     let achieved_amount = if is_buy_mode {
         simulation.total_output
     } else {
@@ -578,7 +564,7 @@ async fn process_swap_quote_v2(
     })
 }
 
-fn is_quote_fully_filled(
+pub(super) fn is_quote_fully_filled(
     achieved: Float,
     target: Float,
     is_exact_mode: bool,
@@ -1537,6 +1523,70 @@ mod tests {
 
         assert_eq!(result.estimated_input, "150");
         assert_eq!(result.estimated_output, "100");
+    }
+
+    #[rocket::async_test]
+    async fn test_slippage_quote_ignores_unrelated_oracle_failure() {
+        for mode in [
+            SwapCalldataMode::SpendUpTo,
+            SwapCalldataMode::SpendExact,
+            SwapCalldataMode::BuyUpTo,
+        ] {
+            for reference in [None, Some("2".to_string())] {
+                let ds = candidate_outcome_data_source(
+                    vec![mock_candidate("100", "2")],
+                    vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                );
+                let mut request = quote_v2_request(mode, "10");
+                request.price_cap = None;
+                request.slippage_bps = Some(100);
+                request.reference_io_ratio = reference;
+
+                let result = process_swap_quote_v2(&ds, request).await.unwrap();
+
+                assert_eq!(result.resolved_price_cap, "2.02");
+                if matches!(
+                    mode,
+                    SwapCalldataMode::SpendUpTo | SwapCalldataMode::SpendExact
+                ) {
+                    assert_eq!(result.estimated_input, "10");
+                    assert_eq!(result.estimated_output, "5");
+                } else {
+                    assert_eq!(result.estimated_input, "20");
+                    assert_eq!(result.estimated_output, "10");
+                }
+            }
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_slippage_quote_preserves_mixed_book_failure_boundaries() {
+        for mode in [
+            SwapCalldataMode::SpendUpTo,
+            SwapCalldataMode::SpendExact,
+            SwapCalldataMode::BuyUpTo,
+        ] {
+            for (capacity, reference) in [("0", None), ("3", None), ("100", Some("1"))] {
+                let candidates = if capacity == "0" {
+                    Vec::new()
+                } else {
+                    vec![mock_candidate(capacity, "2")]
+                };
+                let ds = candidate_outcome_data_source(
+                    candidates,
+                    vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                );
+                let mut request = quote_v2_request(mode, "10");
+                request.price_cap = None;
+                request.slippage_bps = Some(100);
+                request.reference_io_ratio = reference.map(str::to_string);
+
+                assert_error_code(
+                    process_swap_quote_v2(&ds, request).await,
+                    ApiErrorCode::SwapOracleUnavailable,
+                );
+            }
+        }
     }
 
     #[rocket::async_test]

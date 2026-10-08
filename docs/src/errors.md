@@ -61,9 +61,11 @@ provider failures in one error variant, so the API conservatively emits
 
 `SWAP_ORACLE_UNAVAILABLE` does not assert that a market is closed. It means an
 oracle-backed order could not be evaluated because its external context endpoint
-was unavailable. Individual order reverts that are not identified as oracle
-fetch failures are treated as non-executable liquidity; failures of the overall
-quote operation remain `SWAP_QUOTE_FAILED`.
+was unavailable and the surviving healthy orders could not fully serve the
+request within its price limits. An unavailable order does not block an
+otherwise complete healthy route. Individual order reverts that are not
+identified as oracle fetch failures are treated as non-executable liquidity;
+failures of the overall quote operation remain `SWAP_QUOTE_FAILED`.
 
 Domain codes are assigned at the boundary where the failure is understood.
 Detailed dependency logs and the coded response event share the same
