@@ -80,6 +80,24 @@ fn basis_points_multiplier(bps: u16) -> Result<Float, ApiError> {
         })
 }
 
+/// Select one deployment and apply the shared exact/up-to fill comparison in
+/// orderbook token units so quote and calldata enforce the same capacity policy.
+pub(crate) fn simulate_request_fill(
+    candidates: Vec<TakeOrderCandidate>,
+    mode: ParsedTakeOrdersMode,
+    price_cap: Float,
+) -> Result<(SimulationResult, bool), ApiError> {
+    let simulation = select_best_raindex_simulation(candidates, mode, price_cap)?;
+    let achieved = if mode.is_buy_mode() {
+        simulation.total_output
+    } else {
+        simulation.total_input
+    };
+    let fully_filled =
+        super::quote::is_quote_fully_filled(achieved, mode.target_amount(), mode.is_exact_mode())?;
+    Ok((simulation, fully_filled))
+}
+
 pub(crate) fn select_best_raindex_simulation(
     candidates: Vec<TakeOrderCandidate>,
     mode: ParsedTakeOrdersMode,

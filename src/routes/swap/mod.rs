@@ -17,6 +17,7 @@ use crate::wrap_ratio::{
 };
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use rain_math_float::Float;
 use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch_with_injector, RaindexOrderQuote,
 };
@@ -45,6 +46,11 @@ struct SwapAnalyticsContext {
     api_version: ApiVersion,
     mode: Option<serde_json::Value>,
     taker: Option<Address>,
+}
+
+pub(crate) struct SwapCalldataOutcome {
+    pub response: SwapCalldataResponse,
+    pub effective_price: Option<Float>,
 }
 
 impl SwapAnalyticsContext {
@@ -125,6 +131,20 @@ impl SwapQuoteFailures {
                 "the oracle required to evaluate this swap is temporarily unavailable",
             )
         })
+    }
+
+    pub(crate) fn map_no_liquidity_error(&self, error: ApiError) -> ApiError {
+        if matches!(
+            &error,
+            ApiError::Coded {
+                code: ApiErrorCode::SwapNoLiquidity,
+                ..
+            }
+        ) {
+            self.oracle_unavailable_error().unwrap_or(error)
+        } else {
+            error
+        }
     }
 }
 
@@ -340,6 +360,17 @@ pub(crate) trait SwapDataSource: Send + Sync {
         let mut response = self.get_calldata(request).await?;
         response.chain_id = chain_id;
         Ok(response)
+    }
+
+    async fn get_calldata_outcome_on_chain(
+        &self,
+        chain_id: u32,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataOutcome, ApiError> {
+        Ok(SwapCalldataOutcome {
+            response: self.get_calldata_on_chain(chain_id, request).await?,
+            effective_price: None,
+        })
     }
 
     async fn get_wrap_ratios_for_tokens(
@@ -602,6 +633,17 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         chain_id: u32,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError> {
+        Ok(self
+            .get_calldata_outcome_on_chain(chain_id, request)
+            .await?
+            .response)
+    }
+
+    async fn get_calldata_outcome_on_chain(
+        &self,
+        chain_id: u32,
+        request: TakeOrdersRequest,
+    ) -> Result<SwapCalldataOutcome, ApiError> {
         let result = self
             .client
             .get_take_orders_calldata(request)
@@ -610,23 +652,26 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
 
         if let Some(approval_info) = result.approval_info() {
             let formatted_amount = approval_info.formatted_amount().to_string();
-            Ok(SwapCalldataResponse {
-                chain_id,
-                to: approval_info.spender(),
-                data: alloy::primitives::Bytes::new(),
-                value: alloy::primitives::U256::ZERO,
-                estimated_input: formatted_amount.clone(),
-                denomination: SwapDenomination::Wrapped,
-                approvals: vec![crate::types::common::Approval {
-                    token: approval_info.token(),
-                    spender: approval_info.spender(),
-                    amount: formatted_amount,
-                    symbol: String::new(),
-                    approval_data: approval_info.calldata().clone(),
-                }],
+            Ok(SwapCalldataOutcome {
+                effective_price: None,
+                response: SwapCalldataResponse {
+                    chain_id,
+                    to: approval_info.spender(),
+                    data: alloy::primitives::Bytes::new(),
+                    value: alloy::primitives::U256::ZERO,
+                    estimated_input: formatted_amount.clone(),
+                    denomination: SwapDenomination::Wrapped,
+                    approvals: vec![crate::types::common::Approval {
+                        token: approval_info.token(),
+                        spender: approval_info.spender(),
+                        amount: formatted_amount,
+                        symbol: String::new(),
+                        approval_data: approval_info.calldata().clone(),
+                    }],
+                },
             })
         } else if let Some(take_orders_info) = result.take_orders_info() {
-            swap_calldata_response_from_take_orders_info(chain_id, &take_orders_info)
+            swap_calldata_outcome_from_take_orders_info(chain_id, &take_orders_info)
         } else {
             tracing::error!("calldata provider returned an unexpected result state");
             Err(ApiError::coded(
@@ -681,6 +726,16 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
         Ok(wrap_ratio_values_from_responses(responses))
     }
+}
+
+fn swap_calldata_outcome_from_take_orders_info(
+    chain_id: u32,
+    take_orders_info: &TakeOrdersInfo,
+) -> Result<SwapCalldataOutcome, ApiError> {
+    Ok(SwapCalldataOutcome {
+        response: swap_calldata_response_from_take_orders_info(chain_id, take_orders_info)?,
+        effective_price: Some(take_orders_info.effective_price()),
+    })
 }
 
 fn swap_calldata_response_from_take_orders_info(
@@ -832,7 +887,7 @@ mod tests {
     use super::{
         build_swap_candidates_from_quotes, classify_quote_failure, configured_token_decimals,
         ensure_distinct_tokens, map_raindex_error, snapshot_swap_context,
-        swap_calldata_response_from_take_orders_info, swap_candidates_cache_key, SwapQuoteFailure,
+        swap_calldata_outcome_from_take_orders_info, swap_candidates_cache_key, SwapQuoteFailure,
     };
     use crate::analytics::Analytics;
     use crate::error::{ApiError, ApiErrorCode};
@@ -1031,8 +1086,14 @@ mod tests {
         }))
         .expect("deserialize SDK take-orders result");
 
-        let response = swap_calldata_response_from_take_orders_info(8453, &take_orders_info)
+        let outcome = swap_calldata_outcome_from_take_orders_info(8453, &take_orders_info)
             .expect("map ready SDK result");
+        assert!(outcome
+            .effective_price
+            .expect("executable result preserves its effective price")
+            .eq(effective_price)
+            .expect("compare effective prices"));
+        let response = outcome.response;
 
         assert_eq!(response.estimated_input, expected_sell);
         assert_eq!(

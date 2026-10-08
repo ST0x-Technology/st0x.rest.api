@@ -3,9 +3,10 @@ use crate::attribution::{
     address_to_b256, u64_to_b256, AttributionSigner, AttributionState, ATTRIBUTION_SCHEMA_VERSION,
 };
 use crate::cache::RouteResponseCaches;
-use crate::types::swap::SwapCalldataMode;
+use crate::routes::swap::quote::process_swap_quote_v2;
+use crate::types::swap::{SwapCalldataMode, SwapQuoteV2Request};
 use alloy::hex::encode_prefixed;
-use alloy::network::TransactionBuilder;
+use alloy::network::{ReceiptResponse, TransactionBuilder};
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::serde::WithOtherFields;
@@ -25,7 +26,7 @@ use tokio::sync::RwLock;
 
 struct MockSwapServices {
     base_url: String,
-    subgraph_order: Arc<RwLock<Option<Value>>>,
+    subgraph_orders: Arc<RwLock<Vec<Value>>>,
     oracle_available: Arc<AtomicBool>,
     oracle_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     oracle_paths: Arc<Mutex<Vec<String>>>,
@@ -40,14 +41,14 @@ impl MockSwapServices {
     async fn start_sequence(oracle_responses: Vec<Value>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let subgraph_order = Arc::new(RwLock::new(None));
+        let subgraph_orders = Arc::new(RwLock::new(Vec::new()));
         let oracle_available = Arc::new(AtomicBool::new(true));
         let oracle_bodies = Arc::new(Mutex::new(Vec::new()));
         let oracle_paths = Arc::new(Mutex::new(Vec::new()));
         let oracle_responses = Arc::new(Mutex::new(oracle_responses));
         let oracle_call_index = Arc::new(AtomicUsize::new(0));
 
-        let orders = Arc::clone(&subgraph_order);
+        let orders = Arc::clone(&subgraph_orders);
         let available = Arc::clone(&oracle_available);
         let bodies = Arc::clone(&oracle_bodies);
         let paths = Arc::clone(&oracle_paths);
@@ -89,10 +90,13 @@ impl MockSwapServices {
                                 json!({"error": "offline"}).to_string(),
                             )
                         }
+                        "/retired-oracle" => {
+                            paths.lock().unwrap().push(path);
+                            ("404 Not Found", json!({"error": "not found"}).to_string())
+                        }
                         "/sg" => {
                             let orders = orders.read().await;
-                            let values = orders.iter().cloned().collect::<Vec<_>>();
-                            ("200 OK", json!({"data": {"orders": values}}).to_string())
+                            ("200 OK", json!({"data": {"orders": *orders}}).to_string())
                         }
                         _ => ("404 Not Found", json!({"error": "not found"}).to_string()),
                     };
@@ -103,7 +107,7 @@ impl MockSwapServices {
 
         Self {
             base_url: format!("http://{address}"),
-            subgraph_order,
+            subgraph_orders,
             oracle_available,
             oracle_bodies,
             oracle_paths,
@@ -352,6 +356,15 @@ fn subgraph_order_json(order: &OrderV4, order_hash: B256, meta: &[u8], raindex: 
 
 #[rocket::async_test]
 async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution() {
+    assert_oracle_calldata(false).await;
+}
+
+#[rocket::async_test]
+async fn test_mixed_oracle_book_quotes_and_executes_with_healthy_liquidity() {
+    assert_oracle_calldata(true).await;
+}
+
+async fn assert_oracle_calldata(mixed_book: bool) {
     let mut local_evm = LocalEvm::new().await;
     let oracle_signer = PrivateKeySigner::from(local_evm.anvil.keys()[0].clone());
     let stale_oracle_context = B256::from(U256::from(42));
@@ -440,8 +453,43 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         .await
         .unwrap();
 
-    *services.subgraph_order.write().await =
-        Some(subgraph_order_json(&order, event.orderHash, &meta, raindex));
+    let mut subgraph_orders = vec![subgraph_order_json(&order, event.orderHash, &meta, raindex)];
+    if mixed_book {
+        // Reproduce a stale order pointing at a removed oracle while the other
+        // order has a working oracle and enough funded liquidity for the swap.
+        let retired_dotrain = oracle_order_dotrain(
+            &local_evm.url(),
+            &format!("{}/retired-oracle", services.base_url),
+            local_evm.rainlang,
+            input_address,
+            output_address,
+        );
+        let retired_order = DotrainOrder::create(retired_dotrain.clone(), None)
+            .await
+            .unwrap();
+        let retired_deployment = retired_order
+            .dotrain_yaml()
+            .get_deployment("test-deployment")
+            .unwrap();
+        let retired_args =
+            AddOrderArgs::new_from_deployment(retired_dotrain, retired_deployment, None)
+                .await
+                .unwrap();
+        let retired_call = retired_args
+            .try_into_call(vec![local_evm.url()])
+            .await
+            .unwrap();
+        let (retired_event, _) = local_evm.add_order(&retired_call.abi_encode(), owner).await;
+        let retired_order = OrderV4::abi_decode(&retired_event.order.abi_encode()).unwrap();
+        assert_ne!(retired_event.orderHash, event.orderHash);
+        subgraph_orders.push(subgraph_order_json(
+            &retired_order,
+            retired_event.orderHash,
+            &retired_call.config.meta,
+            raindex,
+        ));
+    }
+    *services.subgraph_orders.write().await = subgraph_orders;
     let client = RaindexClient::new(
         vec![client_yaml(
             &local_evm.url(),
@@ -487,6 +535,8 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         .await
         .unwrap();
     let decoded = takeOrders4Call::abi_decode(&response.data).unwrap();
+    assert_eq!(decoded.config.orders.len(), 1);
+    assert_eq!(decoded.config.orders[0].order, order);
     assert_eq!(decoded.config.orders[0].signedContext.len(), 2);
     let signed_context = &decoded.config.orders[0].signedContext[0];
     assert_eq!(signed_context.signer, oracle_signer_address);
@@ -523,7 +573,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         keccak256(decoded.config.orders[0].order.abi_encode())
     );
 
-    local_evm
+    let receipt = local_evm
         .send_transaction(WithOtherFields::new(
             TransactionRequest::default()
                 .with_input(response.data.clone())
@@ -532,6 +582,31 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         ))
         .await
         .unwrap();
+    assert!(receipt.status(), "V1 calldata must execute successfully");
+
+    if mixed_book {
+        let quote = process_swap_quote_v2(
+            &data_source,
+            SwapQuoteV2Request {
+                chain_id: Some(8453),
+                taker: Some(owner),
+                input_token: input_address,
+                output_token: output_address,
+                mode: SwapCalldataMode::SpendUpTo,
+                amount: "10".to_string(),
+                price_cap: None,
+                slippage_bps: Some(100),
+                reference_io_ratio: None,
+                denomination: crate::types::swap::SwapDenomination::Wrapped,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(quote.fully_filled);
+        assert_eq!(quote.estimated_input, "10");
+        assert_eq!(quote.estimated_output, "5");
+        assert_eq!(quote.resolved_price_cap, "2.02");
+    }
 
     let v2_attribution = attribution_state.for_api_key("customer-key", owner);
     let v2_request = SwapCalldataV2Request {
@@ -539,17 +614,24 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         taker: owner,
         input_token: input_address,
         output_token: output_address,
-        mode: SwapCalldataMode::BuyUpTo,
+        mode: if mixed_book {
+            SwapCalldataMode::SpendUpTo
+        } else {
+            SwapCalldataMode::BuyUpTo
+        },
         amount: "10".to_string(),
         price_cap: None,
-        slippage_bps: Some(50),
-        reference_io_ratio: Some("2".to_string()),
+        slippage_bps: Some(if mixed_book { 100 } else { 50 }),
+        reference_io_ratio: (!mixed_book).then(|| "2".to_string()),
         denomination: crate::types::swap::SwapDenomination::Wrapped,
     };
     let mut v2_response = process_swap_calldata_v2(&data_source, v2_request)
         .await
         .unwrap();
-    assert_eq!(v2_response.resolved_price_cap, "2.01");
+    assert_eq!(
+        v2_response.resolved_price_cap,
+        if mixed_book { "2.02" } else { "2.01" }
+    );
     embed_and_validate_attribution(
         &mut v2_response.calldata,
         &attribution_state.signer,
@@ -558,7 +640,21 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     .await
     .unwrap();
     let v2_decoded = takeOrders4Call::abi_decode(&v2_response.calldata.data).unwrap();
+    assert_eq!(v2_decoded.config.orders.len(), 1);
+    assert_eq!(v2_decoded.config.orders[0].order, order);
     assert_eq!(v2_decoded.config.orders[0].signedContext.len(), 2);
+    if mixed_book {
+        assert_eq!(v2_response.calldata.estimated_input, "10");
+        assert!(
+            services
+                .oracle_paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.starts_with("/retired-oracle")),
+            "the second order must actually attempt its retired oracle"
+        );
+    }
     let v2_oracle_context = &v2_decoded.config.orders[0].signedContext[0];
     assert_eq!(v2_oracle_context.signer, oracle_signer_address);
     assert_eq!(v2_oracle_context.context[0], fresh_oracle_context);
@@ -566,7 +662,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     let v2_context = &v2_decoded.config.orders[0].signedContext[1];
     assert_eq!(v2_context.context[1], v2_attribution.api_key_hash);
 
-    local_evm
+    let receipt = local_evm
         .send_transaction(WithOtherFields::new(
             TransactionRequest::default()
                 .with_input(v2_response.calldata.data.clone())
@@ -575,6 +671,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
         ))
         .await
         .unwrap();
+    assert!(receipt.status(), "V2 calldata must execute successfully");
 
     let oracle_body = services.oracle_bodies.lock().unwrap()[0].clone();
     let oracle_request = <Vec<(OrderV4, U256, U256, Address)>>::abi_decode(&oracle_body).unwrap();
