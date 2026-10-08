@@ -33,6 +33,7 @@ use rain_orderbook_common::take_orders::{ParsedTakeOrdersMode, TakeOrdersMode};
 use rocket::serde::json::Json;
 use rocket::State;
 use std::collections::BTreeMap;
+use std::ops::Div;
 use tracing::Instrument;
 
 const ORACLE_REFRESH_CONCURRENCY_LIMIT: usize = 8;
@@ -732,7 +733,9 @@ async fn process_swap_calldata_build(
 
     // A failed order must not veto a complete healthy route. Preserve the quote
     // policy for incomplete mixed books, using the same normalized price cap.
-    if let Some(oracle_error) = candidate_build.failures.oracle_unavailable_error() {
+    let mixed_route = if let Some(oracle_error) =
+        candidate_build.failures.oracle_unavailable_error()
+    {
         let mode = ParsedTakeOrdersMode::parse(req.mode, &amount)
             .map_err(super::map_raindex_error)
             .map_err(map_calldata_boundary_error)?;
@@ -764,7 +767,10 @@ async fn process_swap_calldata_build(
             );
             return Err(oracle_error);
         }
-    }
+        Some((mode, oracle_error))
+    } else {
+        None
+    };
 
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
@@ -776,11 +782,52 @@ async fn process_swap_calldata_build(
         price_cap,
     };
 
-    let response = ds
-        .get_calldata_on_chain(req.chain_id, take_req)
+    let outcome = ds
+        .get_calldata_outcome_on_chain(req.chain_id, take_req)
         .await
         .map_err(|error| candidate_build.failures.map_no_liquidity_error(error))
         .map_err(map_calldata_boundary_error)?;
+    let response = outcome.response;
+    // The SDK requotes and can fall back to a smaller up-to route. Exact modes
+    // enforce their minimum fill in the SDK; approval-only responses do not yet
+    // contain executable calldata. Check fresh up-to fills in wrapped units.
+    if let Some((mode, oracle_error)) = mixed_route {
+        if !mode.is_exact_mode() && response.approvals.is_empty() && !response.data.is_empty() {
+            let input = Float::parse(response.estimated_input.clone()).map_err(|error| {
+                tracing::error!(%error, "failed to read fresh SDK swap input");
+                ApiError::coded(
+                    ApiErrorCode::SwapCalldataFailed,
+                    "swap calldata could not be generated",
+                )
+            })?;
+            let achieved = if mode.is_buy_mode() {
+                let price = outcome.effective_price.ok_or_else(|| {
+                    tracing::error!("SDK omitted effective price for mixed-book buy fill check");
+                    ApiError::coded(
+                        ApiErrorCode::SwapCalldataFailed,
+                        "swap calldata could not be generated",
+                    )
+                })?;
+                input.div(price).map_err(|error| {
+                    tracing::error!(%error, "failed to read fresh SDK swap fill");
+                    ApiError::coded(
+                        ApiErrorCode::SwapCalldataFailed,
+                        "swap calldata could not be generated",
+                    )
+                })?
+            } else {
+                input
+            };
+            if !super::quote::is_quote_fully_filled(achieved, mode.target_amount(), false)
+                .map_err(map_calldata_boundary_error)?
+            {
+                tracing::warn!(
+                    "fresh SDK route no longer fills request while an oracle is unavailable"
+                );
+                return Err(oracle_error);
+            }
+        }
+    }
     let mut calldata =
         normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
             .map_err(map_calldata_boundary_error)?;
@@ -1463,6 +1510,7 @@ mod tests {
                     calldata_result: Ok(response),
                 },
                 failures: super::super::SwapQuoteFailures::default(),
+                effective_price: Some(Float::parse("1.5".to_string()).unwrap()),
                 wrap_ratios,
                 captured_request: Arc::clone(&captured_request),
                 captured_counterparty: Arc::new(Mutex::new(None)),
@@ -1489,6 +1537,7 @@ mod tests {
                     calldata_result: Ok(ready_response()),
                 },
                 failures: super::super::SwapQuoteFailures::default(),
+                effective_price: Some(Float::parse("2".to_string()).unwrap()),
                 wrap_ratios: Ok(wrap_ratios),
                 captured_request: Arc::clone(&captured_request),
                 captured_counterparty: Arc::clone(&captured_counterparty),
@@ -1511,6 +1560,7 @@ mod tests {
     struct MockCalldataDataSource {
         base: MockSwapDataSource,
         failures: super::super::SwapQuoteFailures,
+        effective_price: Option<Float>,
         wrap_ratios: Result<HashMap<Address, WrapRatioValue>, ApiError>,
         captured_request: CapturedTakeOrdersRequest,
         captured_counterparty: CapturedCounterparty,
@@ -1561,6 +1611,18 @@ mod tests {
         ) -> Result<SwapCalldataResponse, ApiError> {
             *self.captured_request.lock().unwrap() = Some(request);
             self.base.calldata_result.clone()
+        }
+
+        async fn get_calldata_outcome_on_chain(
+            &self,
+            chain_id: u32,
+            request: TakeOrdersRequest,
+        ) -> Result<super::super::SwapCalldataOutcome, ApiError> {
+            let response = self.get_calldata_on_chain(chain_id, request).await?;
+            Ok(super::super::SwapCalldataOutcome {
+                response,
+                effective_price: self.effective_price,
+            })
         }
 
         async fn get_wrap_ratios_for_tokens(
@@ -2127,6 +2189,99 @@ mod tests {
                 expected,
             );
             assert!(captured.lock().unwrap().is_some());
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_mixed_book_calldata_checks_fresh_sdk_up_to_fill() {
+        for mode in [SwapCalldataMode::SpendUpTo, SwapCalldataMode::BuyUpTo] {
+            for explicit_cap in [false, true] {
+                for fully_filled in [false, true] {
+                    let (mut ds, captured) = capture_candidate_outcome_ds(
+                        vec![mock_candidate("100", "2")],
+                        vec![super::super::SwapQuoteFailure::OracleUnavailable],
+                    );
+                    let estimated_input = match (mode, fully_filled) {
+                        (SwapCalldataMode::BuyUpTo, true) => "20",
+                        (SwapCalldataMode::BuyUpTo, false) => "6",
+                        (_, true) => "10",
+                        (_, false) => "3",
+                    };
+                    ds.base.calldata_result = Ok(SwapCalldataResponse {
+                        estimated_input: estimated_input.to_string(),
+                        ..ready_response()
+                    });
+                    let request = if explicit_cap {
+                        calldata_v2_request(mode, "10", "2.02")
+                    } else {
+                        slippage_v2_request(mode, "10", 100)
+                    };
+                    let result = process_swap_calldata_v2(&ds, request).await;
+
+                    if fully_filled {
+                        assert!(result.is_ok());
+                    } else {
+                        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+                    }
+                    assert!(captured.lock().unwrap().is_some());
+                }
+            }
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_healthy_book_calldata_preserves_fresh_sdk_partial_fill() {
+        for mode in [SwapCalldataMode::SpendUpTo, SwapCalldataMode::BuyUpTo] {
+            let (mut ds, _) =
+                capture_candidate_outcome_ds(vec![mock_candidate("100", "2")], Vec::new());
+            ds.effective_price = None;
+            ds.base.calldata_result = Ok(SwapCalldataResponse {
+                estimated_input: "3".to_string(),
+                ..ready_response()
+            });
+
+            assert!(
+                process_swap_calldata_v2(&ds, slippage_v2_request(mode, "10", 100))
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_mixed_book_calldata_approval_does_not_require_fill_metadata() {
+        for mode in [SwapCalldataMode::SpendUpTo, SwapCalldataMode::BuyUpTo] {
+            let (mut ds, _) = capture_candidate_outcome_ds(
+                vec![mock_candidate("100", "2")],
+                vec![super::super::SwapQuoteFailure::OracleUnavailable],
+            );
+            ds.effective_price = None;
+            ds.base.calldata_result = Ok(approval_response());
+
+            let response = process_swap_calldata_v2(&ds, slippage_v2_request(mode, "10", 100))
+                .await
+                .unwrap();
+            assert!(!response.calldata.approvals.is_empty());
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_mixed_book_buy_calldata_requires_fresh_sdk_price() {
+        for price in [None, Some(Float::parse("0".to_string()).unwrap())] {
+            let (mut ds, _) = capture_candidate_outcome_ds(
+                vec![mock_candidate("100", "2")],
+                vec![super::super::SwapQuoteFailure::OracleUnavailable],
+            );
+            ds.effective_price = price;
+
+            assert_error_code(
+                process_swap_calldata_v2(
+                    &ds,
+                    slippage_v2_request(SwapCalldataMode::BuyUpTo, "10", 100),
+                )
+                .await,
+                ApiErrorCode::SwapCalldataFailed,
+            );
         }
     }
 

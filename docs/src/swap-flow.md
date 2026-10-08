@@ -94,6 +94,9 @@ including for up-to modes. Without oracle failures, up-to modes still allow
 partial fills. This is distinct from HTTP 404 `SWAP_NO_LIQUIDITY`, which means
 the evaluated order set has no executable capacity for the request. Selected
 orders still require valid oracle context and calldata preflight checks.
+Calldata also checks the SDK's fresh up-to fill before returning an executable
+mixed-book route; an approval-only response does not yet contain an executable
+fill.
 
 ### Understanding Price Limits
 
